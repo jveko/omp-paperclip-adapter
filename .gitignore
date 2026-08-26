@@ -1,0 +1,15 @@
+# Internal working documents — never published
+docs/
+
+# Build & deps
+node_modules/
+dist/
+
+# Env & secrets
+.env
+.env.*
+*.key
+
+# OS / editor noise
+.DS_Store
+*.log
