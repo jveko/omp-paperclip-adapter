@@ -1,27 +1,70 @@
 import { parseAcpxStdoutLine } from "@paperclipai/adapter-utils/acpx-engine/ui";
 import type { TranscriptEntry } from "@paperclipai/adapter-utils";
 
-/** Tool-call statuses omp splices into its display text. */
-const STATUS = "pending|in_progress|completed|failed|cancelled";
-const STATUS_PREFIX_RE = new RegExp(`^tool call \\((?:${STATUS})\\):\\s*`, "i");
-const STATUS_SUFFIX_RE = new RegExp(`\\s+\\((?:${STATUS})\\):[\\s\\S]*$`, "i");
-
 /**
- * Strip the redundant status prefix/suffix omp injects into tool_call text.
- * omp emits two shapes: "tool call (pending): $ cmd ..." and "$ cmd ... (pending): cmd".
- * We want the bare command for both. `[\s\S]*$` (not `.*$`) so the suffix form is
- * still recognised when the echoed command spans multiple lines.
+ * omp packs everything into one display string, in two shapes:
+ *
+ *   announce (status=pending) "<name> (pending): <argument>"
+ *   update   (status=*)       "tool call (<status>): <payload>"
+ *
+ * For a shell tool the announce argument just repeats the command in `name`
+ * and the update payload is `<command>\n<output>`. For every other tool the
+ * announce argument is the real target (a path, a glob, a skill:// ref) and
+ * the update payload is the result. So the interesting half is the tail in
+ * both cases; `detail` peels off whichever head is present.
  */
-function cleanToolText(text: string): string {
-  return text.replace(STATUS_PREFIX_RE, "").replace(STATUS_SUFFIX_RE, "").trim();
+const STATUS = "pending|in_progress|completed|failed|cancelled";
+const UPDATE_HEAD_RE = new RegExp(`^tool call \\((?:${STATUS})\\):[ \\t]*`, "i");
+const ANNOUNCE_HEAD_RE = new RegExp(`^[\\s\\S]*?\\s+\\((?:${STATUS})\\):[ \\t]*`, "i");
+
+function toolDetail(text: string): string {
+  const update = text.match(UPDATE_HEAD_RE);
+  if (update) return text.slice(update[0].length);
+  const announce = text.match(ANNOUNCE_HEAD_RE);
+  return announce ? text.slice(announce[0].length) : text;
+}
+
+/** The bare command for a shell tool call, or null if `name` is not one. */
+function shellCommand(name: string): string | null {
+  const trimmed = name.trim();
+  return trimmed.startsWith("$") ? trimmed.slice(1).trim() || null : null;
 }
 
 /**
- * tool_result content is `text` too, so it carries the same "tool call (status):"
- * prefix — but its tail is real command output, which must never be stripped.
+ * omp closes command output with the ACP terminal handle, which means nothing
+ * to a reader. The "Wall time" line above it is worth keeping.
  */
-function cleanToolResultContent(content: string): string {
-  return content.replace(STATUS_PREFIX_RE, "");
+const TERMINAL_FOOTER_RE = /\s*\n\[terminal\][^\n]*$/;
+
+/**
+ * A shell update payload re-echoes the command before the output. The command
+ * is already the card's headline, so drop the echo and keep only the output.
+ */
+function stripCommandEcho(payload: string, name: string): string {
+  const echo = name.trim();
+  if (payload === echo) return "";
+  if (payload.startsWith(echo)) {
+    return payload.slice(echo.length).replace(/^\r?\n/, "").replace(TERMINAL_FOOTER_RE, "");
+  }
+  // omp caps the display text at ~500 chars, so for a command longer than that
+  // the payload is a cut-off echo carrying no output at all.
+  const cut = payload.replace(/…$/, "");
+  if (cut && echo.startsWith(cut)) return "";
+  return payload.replace(TERMINAL_FOOTER_RE, "");
+}
+
+/**
+ * True when `input` is the record the upstream parser synthesizes from omp's
+ * flat event ({text, status}) rather than a real structured tool input, which
+ * must be passed through untouched.
+ */
+function isSynthesizedInput(record: Record<string, unknown>): boolean {
+  return Object.keys(record).every((key) => key === "text" || key === "status");
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
 }
 
 /** Wrappers to skip when looking for the real command in a shell line. */
@@ -155,32 +198,56 @@ function isPlumbingStatus(text: string): boolean {
   return PLUMBING_STATUS_RE.test(text.trim());
 }
 
+/**
+ * Reshape a tool_call so the board renders it well.
+ *
+ * The board decides between its terminal-style command renderer and the generic
+ * tool card on `input.command`/`input.cmd` being a string, so a shell call must
+ * expose the command under `command` — `text` gets the wrench card and a
+ * capitalized command as the title. Everything else gets its target under
+ * `target`, which the board's input summarizer also looks for.
+ *
+ * The board folds later events for the same toolUseId into the first card by
+ * shallow-merging their `input`, and skips an empty record. So a status update
+ * (whose payload is the result, not the input) deliberately carries no keys for
+ * a non-shell tool: that keeps the target captured at announce time instead of
+ * overwriting the Input pane with the result.
+ */
+function polishToolCall(entry: Extract<TranscriptEntry, { kind: "tool_call" }>): TranscriptEntry {
+  const name = toolDisplayName(entry.name);
+  const record = asRecord(entry.input);
+  if (!record || !isSynthesizedInput(record)) return { ...entry, name };
+
+  const command = shellCommand(entry.name);
+  if (command) return { ...entry, name, input: { command } };
+
+  const status = typeof record.status === "string" ? record.status : "";
+  const announced = status === "" || status === "pending";
+  const text = typeof record.text === "string" ? record.text : "";
+  const target = announced ? toolDetail(text).trim() : "";
+  return { ...entry, name, input: target ? { target } : {} };
+}
+
+/**
+ * The result pane should hold the output alone: the command (or target) is
+ * already the headline right above it, and omp repeats it in the payload.
+ */
+function polishToolResult(entry: Extract<TranscriptEntry, { kind: "tool_result" }>): TranscriptEntry {
+  const raw = entry.toolName ?? "";
+  const command = shellCommand(raw);
+  const payload = toolDetail(entry.content);
+  return {
+    ...entry,
+    toolName: entry.toolName === undefined ? undefined : toolDisplayName(entry.toolName),
+    content: command ? stripCommandEcho(payload, raw) : payload,
+  };
+}
+
 /** Tidy a single entry for display; returns [] to drop it. */
 function polish(entry: TranscriptEntry): TranscriptEntry[] {
-  if (entry.kind === "tool_call") {
-    let input = entry.input;
-    const record =
-      input && typeof input === "object" && !Array.isArray(input)
-        ? (input as Record<string, unknown>)
-        : null;
-    if (record && typeof record.text === "string") {
-      input = { ...record, text: cleanToolText(record.text) };
-    }
-    return [{ ...entry, name: toolDisplayName(entry.name), input }];
-  }
-
-  if (entry.kind === "tool_result") {
-    return [
-      {
-        ...entry,
-        toolName: entry.toolName === undefined ? undefined : toolDisplayName(entry.toolName),
-        content: cleanToolResultContent(entry.content),
-      },
-    ];
-  }
-
+  if (entry.kind === "tool_call") return [polishToolCall(entry)];
+  if (entry.kind === "tool_result") return [polishToolResult(entry)];
   if (entry.kind === "system" && isPlumbingStatus(entry.text)) return [];
-
   return [entry];
 }
 

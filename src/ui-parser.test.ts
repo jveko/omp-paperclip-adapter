@@ -1,15 +1,32 @@
 import { describe, it, expect } from "vitest";
 import { parseStdoutLine } from "./ui-parser";
 
-const toolCall = (entries: ReturnType<typeof parseStdoutLine>) =>
+type Entries = ReturnType<typeof parseStdoutLine>;
+
+const toolCall = (entries: Entries) =>
   entries.find((e) => e.kind === "tool_call") as
-    | { name: string; input?: { text?: string }; toolUseId?: string }
+    | { name: string; input?: Record<string, unknown>; toolUseId?: string }
     | undefined;
 
-const toolResult = (entries: ReturnType<typeof parseStdoutLine>) =>
+const toolResult = (entries: Entries) =>
   entries.find((e) => e.kind === "tool_result") as
     | { toolName?: string; content: string; toolUseId: string; isError: boolean }
     | undefined;
+
+/**
+ * The board picks its terminal-style command renderer over the generic tool
+ * card when `input.command` (or `.cmd`) is a string — see isCommandTool in
+ * paperclip/ui/src/components/transcript/RunTranscriptView.tsx.
+ */
+const rendersAsCommand = (input: unknown): boolean => {
+  const record = input && typeof input === "object" && !Array.isArray(input)
+    ? (input as Record<string, unknown>)
+    : null;
+  return Boolean(record && (typeof record.command === "string" || typeof record.cmd === "string"));
+};
+
+const ompToolCall = (fields: Record<string, unknown>) =>
+  JSON.stringify({ type: "acpx.tool_call", toolCallId: "call_1", ...fields });
 
 describe("parseStdoutLine", () => {
   it("passes through a normal text_delta as assistant", () => {
@@ -19,121 +36,146 @@ describe("parseStdoutLine", () => {
     expect(entries[0].kind).toBe("assistant");
   });
 
-  describe("tool_call display", () => {
-    it("collapses the full shell command to a short label in the name", () => {
-      const line = JSON.stringify({
-        type: "acpx.tool_call",
-        name: '$ ls -la /home/dimaz/foo 2>/dev/null | head -50; echo "---"; pwd',
-        status: "pending",
-        text: '$ ls -la /home/dimaz/foo 2>/dev/null | head -50; echo "---"; pwd',
-      });
-      expect(toolCall(parseStdoutLine(line, "t0"))?.name).toBe("ls");
+  describe("shell tool calls", () => {
+    const cmd = '$ ls -la /home/dimaz/foo 2>/dev/null | head -50; echo "---"; pwd';
+
+    it("exposes the command so the board uses its terminal renderer", () => {
+      const call = toolCall(parseStdoutLine(
+        ompToolCall({ name: cmd, status: "pending", text: `${cmd} (pending): ${cmd.slice(2)}` }),
+        "t0",
+      ));
+      expect(rendersAsCommand(call?.input)).toBe(true);
+      expect(call?.input?.command).toBe(cmd.slice(2));
     });
 
-    it("skips leading VAR=/export/$(...) noise when picking the label", () => {
-      const line = JSON.stringify({
-        type: "acpx.tool_call",
-        name: '$ JWT=$(cat /tmp/jwt) curl -s -H "Authorization: Bearer $JWT" http://codan:3100/api/issues',
-        status: "pending",
-        text: "$ JWT=$(cat /tmp/jwt) curl -s http://codan:3100/api/issues",
-      });
-      expect(toolCall(parseStdoutLine(line, "t0"))?.name).toBe("curl");
+    it("keeps the command identical across status updates so the merge is a no-op", () => {
+      const announce = toolCall(parseStdoutLine(
+        ompToolCall({ name: cmd, status: "pending", text: `${cmd} (pending): ${cmd.slice(2)}` }),
+        "t0",
+      ));
+      const update = toolCall(parseStdoutLine(
+        ompToolCall({ name: cmd, status: "in_progress", text: `tool call (in_progress): ${cmd}\n[terminal] abc` }),
+        "t1",
+      ));
+      expect(update?.input).toEqual(announce?.input);
     });
 
-    it("skips `cd <dir>` and wrapper commands to reach the real command", () => {
-      const line = JSON.stringify({
-        type: "acpx.tool_call",
-        name: '$ cd /home/dimaz/ws\nsudo /usr/bin/python3 -c "import json"',
-        status: "pending",
-      });
-      expect(toolCall(parseStdoutLine(line, "t0"))?.name).toBe("python3");
+    it("returns only the output as the result, not the echoed command", () => {
+      const result = toolResult(parseStdoutLine(
+        ompToolCall({
+          name: "$ env | grep -i paperclip",
+          status: "completed",
+          text: "tool call (completed): $ env | grep -i paperclip\nPAPERCLIP_RUN_ID=abc\nWall time: 0.07 seconds\n[terminal] 2466bd20-e29f-4180",
+        }),
+        "t0",
+      ));
+      expect(result?.content).toBe("PAPERCLIP_RUN_ID=abc\nWall time: 0.07 seconds");
+    });
+
+    it("reports no output when omp truncated the payload to a cut-off command echo", () => {
+      // omp caps display text at ~500 chars; a longer command leaves no room
+      // for output, so the payload is just the command, cut short.
+      const long = `$ ${"echo ".repeat(120)}done`;
+      const result = toolResult(parseStdoutLine(
+        ompToolCall({ name: long, status: "completed", text: `tool call (completed): ${long.slice(0, 300)}…` }),
+        "t0",
+      ));
+      expect(result?.content).toBe("");
+    });
+
+    it("does not mistake real output for an echo", () => {
+      const result = toolResult(parseStdoutLine(
+        ompToolCall({ name: "$ pwd", status: "completed", text: "tool call (completed): $ pwd\n/home/dimaz" }),
+        "t0",
+      ));
+      expect(result?.content).toBe("/home/dimaz");
+    });
+  });
+
+  describe("non-shell tool calls", () => {
+    it("puts the target in the input, not the tool's own label", () => {
+      const call = toolCall(parseStdoutLine(
+        ompToolCall({
+          name: "Reading JWT API access skill",
+          status: "pending",
+          text: "Reading JWT API access skill (pending): skill://paperclip-agent-jwt-api-access",
+        }),
+        "t0",
+      ));
+      expect(call?.input).toEqual({ target: "skill://paperclip-agent-jwt-api-access" });
+      expect(rendersAsCommand(call?.input)).toBe(false);
+    });
+
+    it("sends an empty input on updates so the board keeps the announced target", () => {
+      // The board shallow-merges later inputs for the same toolUseId and skips
+      // an empty record — otherwise the result would overwrite the Input pane.
+      const call = toolCall(parseStdoutLine(
+        ompToolCall({
+          name: "Searching for cross-issue write error",
+          status: "completed",
+          text: "tool call (completed): No matches found",
+        }),
+        "t0",
+      ));
+      expect(call?.input).toEqual({});
+    });
+
+    it("keeps the payload as the result", () => {
+      const result = toolResult(parseStdoutLine(
+        ompToolCall({
+          name: "Glob for Paperclip server source",
+          status: "completed",
+          text: "tool call (completed): No files found matching pattern",
+        }),
+        "t0",
+      ));
+      expect(result?.content).toBe("No files found matching pattern");
+    });
+
+    it("leaves a real structured input from omp untouched", () => {
+      const call = toolCall(parseStdoutLine(
+        ompToolCall({
+          name: "Read",
+          status: "pending",
+          input: { path: "/tmp/a.txt", limit: 10 },
+        }),
+        "t0",
+      ));
+      expect(call?.input).toMatchObject({ path: "/tmp/a.txt", limit: 10 });
+    });
+  });
+
+  describe("tool display label", () => {
+    const labelOf = (name: string) =>
+      toolCall(parseStdoutLine(ompToolCall({ name, status: "pending" }), "t0"))?.name;
+
+    it("collapses a full shell command to the command word", () => {
+      expect(labelOf('$ ls -la /home 2>/dev/null | head -50; echo "---"; pwd')).toBe("ls");
+    });
+
+    it("skips VAR=/export/$(...) noise", () => {
+      expect(labelOf('$ JWT=$(cat /tmp/jwt) curl -s -H "Authorization: Bearer $JWT" http://x')).toBe("curl");
+    });
+
+    it("skips `cd <dir>` and wrapper commands", () => {
+      expect(labelOf('$ cd /home/dimaz/ws\nsudo /usr/bin/python3 -c "import json"')).toBe("python3");
     });
 
     it("keeps a bare command that happens to look like a wrapper", () => {
-      const line = JSON.stringify({
-        type: "acpx.tool_call",
-        name: "$ env | grep -i paperclip | sort",
-        status: "pending",
-      });
-      expect(toolCall(parseStdoutLine(line, "t0"))?.name).toBe("env");
+      expect(labelOf("$ env | grep -i paperclip | sort")).toBe("env");
     });
 
     it("skips command-substitution debris left behind by redaction", () => {
       // Redaction ate the "$(cat" of JWT=$(cat /tmp/jwt2.txt).
-      const line = JSON.stringify({
-        type: "acpx.tool_call",
-        name: '$ JWT=***REDACTED*** /tmp/jwt2.txt); RUN="a096f2f2"\ncurl -s http://codan:3100/api',
-        status: "pending",
-      });
-      expect(toolCall(parseStdoutLine(line, "t0"))?.name).toBe("curl");
+      expect(labelOf('$ JWT=***REDACTED*** /tmp/jwt2.txt); RUN="a09"\ncurl -s http://x')).toBe("curl");
     });
 
     it("falls back to 'shell' when no command token is recoverable", () => {
-      const line = JSON.stringify({ type: "acpx.tool_call", name: "$ | grep foo", status: "pending" });
-      expect(toolCall(parseStdoutLine(line, "t0"))?.name).toBe("shell");
+      expect(labelOf("$ | grep foo")).toBe("shell");
     });
 
-    it("leaves a human-authored (non-shell) tool label untouched", () => {
-      const line = JSON.stringify({
-        type: "acpx.tool_call",
-        name: "Reading JWT API access skill",
-        status: "pending",
-        text: "Reading JWT API access skill (pending): skill://paperclip-agent-jwt-api-access",
-      });
-      expect(toolCall(parseStdoutLine(line, "t0"))?.name).toBe("Reading JWT API access skill");
-    });
-
-    it("strips the leading 'tool call (status):' prefix from text", () => {
-      const line = JSON.stringify({
-        type: "acpx.tool_call",
-        name: "$ ls -la",
-        status: "completed",
-        text: "tool call (completed): $ ls -la",
-      });
-      expect(toolCall(parseStdoutLine(line, "t0"))?.input?.text).toBe("$ ls -la");
-    });
-
-    it("strips the trailing ' (pending): cmd' suffix from text", () => {
-      const line = JSON.stringify({
-        type: "acpx.tool_call",
-        name: "$ env | grep -i paperclip | sort",
-        status: "pending",
-        text: "$ env | grep -i paperclip | sort (pending): env | grep -i paperclip | sort",
-      });
-      expect(toolCall(parseStdoutLine(line, "t0"))?.input?.text).toBe("$ env | grep -i paperclip | sort");
-    });
-
-    it("strips the trailing suffix when the echoed command spans lines", () => {
-      const cmd = '$ LOG=/tmp/run.ndjson\ngrep -o \'"runId"\' "$LOG" | head';
-      const line = JSON.stringify({
-        type: "acpx.tool_call",
-        name: cmd,
-        status: "pending",
-        text: `${cmd} (pending): ${cmd.slice(2)}`,
-      });
-      expect(toolCall(parseStdoutLine(line, "t0"))?.input?.text).toBe(cmd);
-    });
-
-    it("labels the tool_result toolName the same way", () => {
-      const line = JSON.stringify({
-        type: "acpx.tool_call",
-        name: '$ python3 -c "import json"',
-        status: "completed",
-        text: 'tool call (completed): $ python3 -c "import json"',
-      });
-      expect(toolResult(parseStdoutLine(line, "t0"))?.toolName).toBe("python3");
-    });
-
-    it("strips the status prefix from tool_result content but keeps the output", () => {
-      const line = JSON.stringify({
-        type: "acpx.tool_call",
-        name: "$ env | grep -i paperclip",
-        status: "completed",
-        text: "tool call (completed): $ env | grep -i paperclip\nPAPERCLIP_RUN_ID=abc (pending): leave me",
-      });
-      expect(toolResult(parseStdoutLine(line, "t0"))?.content).toBe(
-        "$ env | grep -i paperclip\nPAPERCLIP_RUN_ID=abc (pending): leave me",
-      );
+    it("leaves a human-authored tool label untouched", () => {
+      expect(labelOf("Reading JWT API access skill")).toBe("Reading JWT API access skill");
     });
   });
 
@@ -144,11 +186,10 @@ describe("parseStdoutLine", () => {
       '{"type":"acpx.tool_call","name":"$ JWT=***REDACTED***"***REDACTED***\\"\\ncurl -s -H \\"Authorization: Bearer ***REDACTED***" http://codan:3100/api/issues","toolCallId":"call_999bc2b3","status":"completed","text":"tool call (completed): $ JWT=***REDACTED***"***REDACTED***\\"\\ncurl","tag":"tool_call_update"}';
 
     it("repairs the JSON and recovers a real tool_call instead of a placeholder", () => {
-      const entries = parseStdoutLine(mangled, "t0");
-      const call = toolCall(entries);
+      const call = toolCall(parseStdoutLine(mangled, "t0"));
       expect(call?.name).toBe("curl");
       expect(call?.toolUseId).toBe("call_999bc2b3");
-      expect(call?.input?.text).toContain("***REDACTED***");
+      expect(call?.input?.command).toContain("***REDACTED***");
     });
 
     it("still pairs the recovered result with its call", () => {
@@ -158,8 +199,7 @@ describe("parseStdoutLine", () => {
     });
 
     it("recovers a mangled status event as a readable system line", () => {
-      const line =
-        '{"type":"acpx.status","text":"session updated for ***REDACTED***"***REDACTED***\\" ok"}';
+      const line = '{"type":"acpx.status","text":"session updated for ***REDACTED***"***REDACTED***\\" ok"}';
       const entries = parseStdoutLine(line, "t0");
       expect(entries).toHaveLength(1);
       expect(entries[0].kind).toBe("system");
