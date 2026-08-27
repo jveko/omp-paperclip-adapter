@@ -13,3 +13,6 @@ dist/
 # OS / editor noise
 .DS_Store
 *.log
+
+# Adapter runtime skill materialization
+.omp-adapter-skills/
