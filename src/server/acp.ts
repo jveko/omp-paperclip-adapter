@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { promises as fs } from "node:fs";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
@@ -6,6 +7,11 @@ import type {
   AdapterExecutionContext,
   AdapterExecutionResult,
 } from "@paperclipai/adapter-utils";
+import {
+  readPaperclipRuntimeSkillEntries,
+  readPaperclipSkillMarkdown,
+  readPaperclipSkillSyncPreference,
+} from "@paperclipai/adapter-utils/server-utils";
 import type {
   AcpxEngineBillingIdentity,
   AcpxEngineExecutorOptions,
@@ -21,6 +27,8 @@ import {
   normalizeOmpModelId,
   type OmpModelCost,
 } from "./models.js";
+import { isFreeCost } from "./models.js";
+import { buildSkillsInstructions, skillsDir } from "./skills.js";
 
 export const DEFAULT_OMP_COMMAND = "omp";
 
@@ -48,9 +56,7 @@ export function resolveOmpAgentCommand(config: Record<string, unknown>): string 
  */
 export function deriveDefaultTimeoutSec(cost: OmpModelCost | null | undefined): number {
   if (!cost) return 0;
-  return cost.input === 0 && cost.output === 0 && cost.cacheRead === 0 && cost.cacheWrite === 0
-    ? 1800
-    : 0;
+  return isFreeCost(cost) ? 1800 : 0;
 }
 
 /**
@@ -213,6 +219,46 @@ export function probeOmpAcpSession(omp: {
   });
 }
 
+/**
+ * Materialize the ephemeral skills instructions file for a run.
+ *
+ * Reads the persisted Paperclip skill preference and merges each desired
+ * skill's SKILL.md (resolved from the runtime skill entry's source directory
+ * on disk; adapter-local skills fall back to the package-dir scan) with the
+ * user's instructions file, if any. Returns null when no skill is desired or
+ * none could be loaded — the caller then leaves instructionsFilePath alone.
+ */
+async function materializeSkillsInstructions(config: Record<string, unknown>): Promise<string | null> {
+  const preference = readPaperclipSkillSyncPreference(config);
+  if (preference.desiredSkills.length === 0) return null;
+  const entries = await readPaperclipRuntimeSkillEntries(config, moduleDir);
+  const byKey = new Map(entries.map((entry) => [entry.key, entry]));
+  const skills: Array<{ key: string; markdown: string }> = [];
+  for (const key of preference.desiredSkills) {
+    const entry = byKey.get(key);
+    if (entry) {
+      // entry.source is the skill directory on disk (Paperclip's runtime
+      // mount); read its SKILL.md directly.
+      const content = await fs
+        .readFile(path.join(entry.source, "SKILL.md"), "utf8")
+        .catch(() => null);
+      if (content) {
+        skills.push({ key, markdown: content });
+        continue;
+      }
+    }
+    // Adapter-local skills: scan the adapter package's own skills dir.
+    const fallback = await readPaperclipSkillMarkdown(moduleDir, key);
+    if (fallback) skills.push({ key, markdown: fallback });
+  }
+  if (skills.length === 0) return null;
+  return buildSkillsInstructions(
+    skills,
+    firstNonEmptyString(config.instructionsFilePath) ?? null,
+    skillsDir,
+  );
+}
+
 type OmpAcpExecutorOptions = Omit<
   AcpxEngineExecutorOptions,
   "adapterType" | "moduleDir" | "packageRootDir"
@@ -245,9 +291,14 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     const resolveModel = (model: string): string | null => normalizeOmpModelId(model, models);
     const resolveCost = (model: string): OmpModelCost | null =>
       models.find((m) => m.id === model)?.cost ?? null;
-    return executor({
-      ...ctx,
-      config: buildOmpAcpConfig(ctx.config, resolveModel, resolveCost),
-    });
+    const config = buildOmpAcpConfig(ctx.config, resolveModel, resolveCost);
+    // Ephemeral skills: materialize the merged instructions file (skills +
+    // user instructions) so the engine injects it into this run. The merged
+    // file always carries the user's content when present, so the path is set
+    // unconditionally whenever any skill is desired; null leaves any existing
+    // instructionsFilePath untouched.
+    const instructionsFile = await materializeSkillsInstructions(ctx.config);
+    if (instructionsFile) config.instructionsFilePath = instructionsFile;
+    return executor({ ...ctx, config });
   };
 }

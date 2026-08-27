@@ -15,6 +15,19 @@ export interface OmpModelInfo {
   priced: boolean;
 }
 
+/**
+ * Returns true when the cost card is present and all four fields are zero
+ * (missing/undefined fields are treated as zero). Returns false for absent
+ * cost (null/undefined) or any nonzero field.
+ */
+export function isFreeCost(cost: OmpModelCost | null | undefined): boolean {
+  if (!cost) return false;
+  return (cost.input ?? 0) === 0 &&
+    (cost.output ?? 0) === 0 &&
+    (cost.cacheRead ?? 0) === 0 &&
+    (cost.cacheWrite ?? 0) === 0;
+}
+
 export function parseOmpModelsJson(stdout: string): OmpModelInfo[] {
   let parsed: unknown;
   try {
@@ -40,7 +53,7 @@ export function parseOmpModelsJson(stdout: string): OmpModelInfo[] {
       id: `${provider}/${id}`,
       label: typeof rec.name === "string" && rec.name ? rec.name : `${provider}/${id}`,
       contextWindow: typeof rec.contextWindow === "number" ? rec.contextWindow : undefined,
-      priced: cost != null && (cost.input !== 0 || cost.output !== 0),
+      priced: cost != null && !isFreeCost(cost),
       cost,
     });
   }

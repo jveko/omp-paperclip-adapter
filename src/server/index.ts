@@ -2,6 +2,7 @@ import type { ServerAdapterModule } from "@paperclipai/adapter-utils";
 import { sessionCodec } from "@paperclipai/adapter-utils/acpx-engine/session-codec";
 import { execute } from "./execute.js";
 import { listOmpModels } from "./models.js";
+import { listOmpSkillsSnapshot, syncOmpSkills } from "./skills.js";
 import { probeOmpAcpSession, resolveOmpAgentCommand } from "./acp.js";
 import { testEnvironment } from "./test.js";
 import { agentConfigurationDoc, type } from "../index.js";
@@ -54,6 +55,8 @@ export function createServerAdapter(): ServerAdapterModule {
     execute,
     testEnvironment,
     agentConfigurationDoc,
+    listSkills: (ctx) => listOmpSkillsSnapshot(ctx),
+    syncSkills: (ctx, desiredSkills) => syncOmpSkills(ctx, desiredSkills),
     // ACP capability descriptor: skills are delivered via instructions-file
     // injection (ephemeral), nodeRange mirrors engines.node in package.json.
     acp: {

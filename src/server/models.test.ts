@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { normalizeOmpModelId, parseOmpModelsJson, type OmpModelInfo } from "./models.js";
+import { deriveDefaultTimeoutSec } from "./acp.js";
 
 vi.mock("node:child_process", () => ({ execFile: vi.fn() }));
 
@@ -55,6 +56,38 @@ describe("parseOmpModelsJson", () => {
     expect(parseOmpModelsJson("garbage")).toEqual([]);
     expect(parseOmpModelsJson("{}")).toEqual([]);
     expect(parseOmpModelsJson("null")).toEqual([]);
+  });
+});
+
+describe("parseOmpModelsJson priced flag", () => {
+  it("marks a model with all-zero cost as free (priced=false)", () => {
+    const parsed = parseOmpModelsJson(JSON.stringify({
+      models: [{ provider: "openrouter", id: "free-model", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
+    }));
+    expect(parsed[0].priced).toBe(false);
+  });
+
+  it("marks a model with nonzero input/output cost as priced", () => {
+    const parsed = parseOmpModelsJson(JSON.stringify({
+      models: [{ provider: "openrouter", id: "paid-model", cost: { input: 3, output: 15 } }],
+    }));
+    expect(parsed[0].priced).toBe(true);
+  });
+
+  it("marks a model priced via cache-only cost as priced", () => {
+    const parsed = parseOmpModelsJson(JSON.stringify({
+      models: [{ provider: "openrouter", id: "cache-model", cost: { input: 0, output: 0, cacheRead: 0.0028, cacheWrite: 0.0028 } }],
+    }));
+    expect(parsed[0].priced).toBe(true);
+  });
+
+  it("treats a partial zero card (cache fields omitted) as free in both priced and timeout derivation", () => {
+    const partial = { input: 0, output: 0 };
+    const parsed = parseOmpModelsJson(JSON.stringify({
+      models: [{ provider: "openrouter", id: "partial-free-model", cost: partial }],
+    }));
+    expect(parsed[0].priced).toBe(false);
+    expect(deriveDefaultTimeoutSec(parsed[0].cost)).toBe(1800);
   });
 });
 

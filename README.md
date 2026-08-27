@@ -58,6 +58,33 @@ Hot-registers — no service restart needed (`requiresRestart` only on reinstall
 
 Permissions are owned by these engine knobs — the adapter never passes `--auto-approve`.
 
+## Cost transparency
+
+Cost originates from the model's rate card (`omp models ls --json`), parsed into
+`OmpModelInfo.cost` (input, output, cacheRead, cacheWrite in USD per token) and
+the `priced` boolean. The Paperclip engine accumulates cost as cumulative USD
+through `usage_update` heartbeats; the adapter never computes cost itself.
+
+**Three-way `priced` distinction:**
+
+| `priced` | `cost` | Interpretation |
+|---|---|---|
+| `true` | nonzero card | Real cost — server reports `costStatus: "reported"` |
+| `false` | all-zero `{input:0, output:0, cacheRead:0, cacheWrite:0}` | Declared-free model |
+| `false` | undefined | Unpriced / unknown — no rate card available |
+
+Models with cache-only costs (nonzero `cacheRead`/`cacheWrite` but zero
+`input`/`output`) are correctly flagged `priced: true`.
+
+**Billing identity** is reported as `billingType: "api"` by default. Override
+per agent via `OMP_PAPERCLIP_BILLING_TYPE` in the `env` map:
+
+```env
+OMP_PAPERCLIP_BILLING_TYPE=subscription   # only "api" | "subscription" valid
+```
+
+Unknown values fall back to `"api"` with a warning.
+
 ## Development
 
 ```sh
