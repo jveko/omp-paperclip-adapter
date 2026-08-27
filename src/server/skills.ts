@@ -20,8 +20,13 @@ export const skillsDir = path.resolve(moduleDir, "../..", ".omp-adapter-skills")
 const skillsCache = new Map<string, string>();
 const SKILLS_CACHE_MAX = 50;
 
+export interface SkillMarkdownSource {
+  key: string;
+  markdown: string;
+}
+
 export async function buildSkillsInstructions(
-  skills: Array<{ key: string; markdown: string }>,
+  skills: SkillMarkdownSource[],
   existingInstructionsPath: string | null,
   outputDir: string = skillsDir,
 ): Promise<string | null> {
@@ -71,7 +76,7 @@ export async function listOmpSkillsSnapshot(ctx: AdapterSkillContext): Promise<A
     adapterType: ctx.adapterType,
     availableEntries: entries,
     desiredSkills: names,
-    configuredDetail: "Will be injected into the per-run instructions file on the next heartbeat.",
+    configuredDetail: "Injected into the run prompt on cold-start heartbeats; warm-resume runs keep prior context.",
   });
 }
 
@@ -92,6 +97,6 @@ export async function syncOmpSkills(
     adapterType: ctx.adapterType,
     availableEntries: entries,
     desiredSkills: names,
-    configuredDetail: "Will be injected into the per-run instructions file on the next heartbeat.",
+    configuredDetail: "Injected into the run prompt on cold-start heartbeats; warm-resume runs keep prior context.",
   });
 }

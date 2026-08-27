@@ -11,6 +11,7 @@ import {
   readPaperclipRuntimeSkillEntries,
   readPaperclipSkillMarkdown,
   readPaperclipSkillSyncPreference,
+  resolvePaperclipDesiredSkillNames,
 } from "@paperclipai/adapter-utils/server-utils";
 import type {
   AcpxEngineBillingIdentity,
@@ -23,12 +24,12 @@ import {
   DEFAULT_ACP_ENGINE_WARM_HANDLE_IDLE_MS,
 } from "@paperclipai/adapter-utils/acpx-engine/constants";
 import {
+  isFreeCost,
   listOmpModels,
   normalizeOmpModelId,
   type OmpModelCost,
 } from "./models.js";
-import { isFreeCost } from "./models.js";
-import { buildSkillsInstructions, skillsDir } from "./skills.js";
+import { buildSkillsInstructions, skillsDir, type SkillMarkdownSource } from "./skills.js";
 
 export const DEFAULT_OMP_COMMAND = "omp";
 
@@ -232,9 +233,13 @@ async function materializeSkillsInstructions(config: Record<string, unknown>): P
   const preference = readPaperclipSkillSyncPreference(config);
   if (preference.desiredSkills.length === 0) return null;
   const entries = await readPaperclipRuntimeSkillEntries(config, moduleDir);
+  // Canonicalize runtime-name/slug references to keys first — an exact-key
+  // lookup on the raw preference would silently drop name-based refs even
+  // though the snapshot functions report them as configured.
+  const desiredKeys = resolvePaperclipDesiredSkillNames(config, entries);
   const byKey = new Map(entries.map((entry) => [entry.key, entry]));
-  const skills: Array<{ key: string; markdown: string }> = [];
-  for (const key of preference.desiredSkills) {
+  const skills: SkillMarkdownSource[] = [];
+  for (const key of desiredKeys) {
     const entry = byKey.get(key);
     if (entry) {
       // entry.source is the skill directory on disk (Paperclip's runtime

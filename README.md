@@ -83,7 +83,7 @@ per agent via `OMP_PAPERCLIP_BILLING_TYPE` in the `env` map:
 OMP_PAPERCLIP_BILLING_TYPE=subscription   # only "api" | "subscription" valid
 ```
 
-Unknown values fall back to `"api"` with a warning.
+Unknown values fall back to `"api"`; the environment check flags unknown `OMP_PAPERCLIP_BILLING_TYPE` values.
 
 ## Development
 
