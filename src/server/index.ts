@@ -54,5 +54,12 @@ export function createServerAdapter(): ServerAdapterModule {
     execute,
     testEnvironment,
     agentConfigurationDoc,
+    // ACP capability descriptor: skills are delivered via instructions-file
+    // injection (ephemeral), nodeRange mirrors engines.node in package.json.
+    acp: {
+      agentId: "omp",
+      skillsMode: "ephemeral",
+      prerequisites: { nodeRange: ">=24.11.0" },
+    },
   };
 }

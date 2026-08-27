@@ -42,6 +42,28 @@ export function parseOmpModelsJson(stdout: string): OmpModelInfo[] {
   return out;
 }
 
+/**
+ * Resolve a possibly-fuzzy model reference to the exact `provider/id` form
+ * omp's ACP `set_config_option` requires. Matches exact id, label (ignoring
+ * case), the bare id suffix, or the bare id prefix (handles versioned ids).
+ * Returns null when unresolvable (pass-through).
+ */
+export function normalizeOmpModelId(model: string, models: OmpModelInfo[]): string | null {
+  const candidate = model.trim();
+  if (!candidate) return null;
+  for (const m of models) {
+    if (m.id === candidate) return m.id;
+  }
+  for (const m of models) {
+    if (m.label.toLowerCase() === candidate.toLowerCase()) return m.id;
+    if (m.id.split("/").pop() === candidate) return m.id;
+  }
+  for (const m of models) {
+    if (m.id.split("/").pop()?.startsWith(candidate) === true) return m.id;
+  }
+  return null;
+}
+
 let cache: { at: number; models: OmpModelInfo[] } | null = null;
 const CACHE_TTL_MS = 5 * 60 * 1000;
 

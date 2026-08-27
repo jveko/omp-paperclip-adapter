@@ -15,5 +15,9 @@ describe("createServerAdapter", () => {
     expect((mod as Record<string, unknown>).label).toBeUndefined();
     expect(typeof mod.agentConfigurationDoc).toBe("string");
     expect(mod.agentConfigurationDoc!.length).toBeGreaterThan(50);
+    expect(mod.acp).toBeDefined();
+    expect(mod.acp?.agentId).toBe("omp");
+    expect(mod.acp?.skillsMode).toBe("ephemeral");
+    expect(mod.acp?.prerequisites?.nodeRange).toBe(">=24.11.0");
   });
 });

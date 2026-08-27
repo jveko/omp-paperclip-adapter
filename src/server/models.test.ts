@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { parseOmpModelsJson } from "./models.js";
+import { normalizeOmpModelId, parseOmpModelsJson, type OmpModelInfo } from "./models.js";
 
 vi.mock("node:child_process", () => ({ execFile: vi.fn() }));
 
@@ -95,5 +95,61 @@ describe("listOmpModels", () => {
     execFileMock.mockImplementation(spawnResult(SAMPLE));
     expect(await listOmpModels()).toHaveLength(3);
     expect(execFileMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("normalizeOmpModelId", () => {
+  const models: OmpModelInfo[] = [
+    { id: "zai/glm-5.2", label: "GLM 5.2", priced: true },
+    { id: "anthropic/claude-sonnet-4-20250514", label: "Claude Sonnet 4", priced: true },
+    { id: "openrouter/auto", label: "OpenRouter Auto", priced: false },
+  ];
+
+  it("passes an exact provider/id through unchanged", () => {
+    expect(normalizeOmpModelId("zai/glm-5.2", models)).toBe("zai/glm-5.2");
+  });
+
+  it("resolves a bare id suffix to its full provider/id", () => {
+    expect(normalizeOmpModelId("glm-5.2", models)).toBe("zai/glm-5.2");
+  });
+
+  it("resolves by label", () => {
+    expect(normalizeOmpModelId("Claude Sonnet 4", models)).toBe("anthropic/claude-sonnet-4-20250514");
+  });
+
+  it("returns null for an unknown model", () => {
+    expect(normalizeOmpModelId("nonexistent-model", models)).toBeNull();
+  });
+
+  it("returns null for empty input", () => {
+    expect(normalizeOmpModelId("", models)).toBeNull();
+  });
+
+  it("resolves a bare id prefix to its full provider/id", () => {
+    expect(normalizeOmpModelId("claude-sonnet-4", models)).toBe(
+      "anthropic/claude-sonnet-4-20250514",
+    );
+  });
+
+  it("returns null for whitespace-only input", () => {
+    expect(normalizeOmpModelId("   ", models)).toBeNull();
+  });
+
+  it("trims surrounding whitespace before matching", () => {
+    expect(normalizeOmpModelId("  glm-5.2  ", models)).toBe("zai/glm-5.2");
+  });
+
+  it("matches labels case-insensitively", () => {
+    expect(normalizeOmpModelId("claude sonnet 4", models)).toBe(
+      "anthropic/claude-sonnet-4-20250514",
+    );
+  });
+
+  it("gives exact id precedence over an earlier label match", () => {
+    const precedence: OmpModelInfo[] = [
+      { id: "a/x", label: "y", priced: true },
+      { id: "b/y", label: "z", priced: true },
+    ];
+    expect(normalizeOmpModelId("b/y", precedence)).toBe("b/y");
   });
 });
