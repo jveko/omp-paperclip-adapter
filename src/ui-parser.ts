@@ -31,26 +31,48 @@ function shellCommand(name: string): string | null {
 }
 
 /**
- * omp closes command output with the ACP terminal handle, which means nothing
- * to a reader. The "Wall time" line above it is worth keeping.
+ * Shown instead of an empty result when omp's display cap left no room for the
+ * output. Without it a card that captured nothing is indistinguishable from a
+ * command that genuinely printed nothing.
  */
-const TERMINAL_FOOTER_RE = /\s*\n\[terminal\][^\n]*$/;
+const OUTPUT_OMITTED = "[output not captured — omp truncated this event]";
+
+/**
+ * Drop omp's trailing ACP terminal handle, then tighten the blank run it
+ * leaves in front of the wall-time footer.
+ */
+function stripTerminalFooter(output: string): string {
+  const at = output.lastIndexOf("\n[");
+  if (at === -1) return tidyWallTime(output);
+  const last = output.slice(at + 1);
+  const cut = last.replace(/…$/, "");
+  const isFooter =
+    last.startsWith("[terminal]") ||
+    // The handle line can itself be cut off by omp's cap, leaving "[t…".
+    (last.endsWith("…") && cut.length > 1 && "[terminal] ".startsWith(cut));
+  return tidyWallTime(isFooter ? output.slice(0, at).replace(/\s+$/, "") : output);
+}
+
+function tidyWallTime(output: string): string {
+  return output.replace(/\n{3,}(?=Wall time:)/, "\n\n");
+}
 
 /**
  * A shell update payload re-echoes the command before the output. The command
  * is already the card's headline, so drop the echo and keep only the output.
  */
-function stripCommandEcho(payload: string, name: string): string {
+function commandOutput(payload: string, name: string): string {
   const echo = name.trim();
+  // A payload that is exactly the echo means the command really printed nothing.
   if (payload === echo) return "";
   if (payload.startsWith(echo)) {
-    return payload.slice(echo.length).replace(/^\r?\n/, "").replace(TERMINAL_FOOTER_RE, "");
+    return stripTerminalFooter(payload.slice(echo.length).replace(/^\r?\n/, ""));
   }
-  // omp caps the display text at ~500 chars, so for a command longer than that
-  // the payload is a cut-off echo carrying no output at all.
+  // omp caps the display text at ~500 chars, so a command longer than that
+  // consumes the whole budget and the payload is a cut-off echo.
   const cut = payload.replace(/…$/, "");
-  if (cut && echo.startsWith(cut)) return "";
-  return payload.replace(TERMINAL_FOOTER_RE, "");
+  if (cut && echo.startsWith(cut)) return OUTPUT_OMITTED;
+  return stripTerminalFooter(payload);
 }
 
 /**
@@ -239,7 +261,7 @@ function polishToolResult(entry: Extract<TranscriptEntry, { kind: "tool_result" 
   return {
     ...entry,
     toolName: entry.toolName === undefined ? undefined : toolDisplayName(entry.toolName),
-    content: command ? stripCommandEcho(payload, raw) : payload,
+    content: command ? commandOutput(payload, raw) : payload,
   };
 }
 

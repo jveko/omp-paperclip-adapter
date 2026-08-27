@@ -72,15 +72,36 @@ describe("parseStdoutLine", () => {
       expect(result?.content).toBe("PAPERCLIP_RUN_ID=abc\nWall time: 0.07 seconds");
     });
 
-    it("reports no output when omp truncated the payload to a cut-off command echo", () => {
+    it("says so when omp truncated the payload to a cut-off command echo", () => {
       // omp caps display text at ~500 chars; a longer command leaves no room
-      // for output, so the payload is just the command, cut short.
+      // for output, so the payload is just the command, cut short. That is not
+      // the same as a command printing nothing, so say which it was.
       const long = `$ ${"echo ".repeat(120)}done`;
       const result = toolResult(parseStdoutLine(
         ompToolCall({ name: long, status: "completed", text: `tool call (completed): ${long.slice(0, 300)}…` }),
         "t0",
       ));
+      expect(result?.content).toContain("not captured");
+    });
+
+    it("reports genuinely empty output as empty", () => {
+      const result = toolResult(parseStdoutLine(
+        ompToolCall({ name: "$ cd /tmp", status: "completed", text: "tool call (completed): $ cd /tmp" }),
+        "t0",
+      ));
       expect(result?.content).toBe("");
+    });
+
+    it("strips omp's terminal handle even when the handle line is itself cut off", () => {
+      const result = toolResult(parseStdoutLine(
+        ompToolCall({
+          name: "$ pwd",
+          status: "completed",
+          text: "tool call (completed): $ pwd\n/home/dimaz\n\n\nWall time: 0.06 seconds\n[t…",
+        }),
+        "t0",
+      ));
+      expect(result?.content).toBe("/home/dimaz\n\nWall time: 0.06 seconds");
     });
 
     it("does not mistake real output for an echo", () => {
