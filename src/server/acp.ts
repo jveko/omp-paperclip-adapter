@@ -16,6 +16,11 @@ import {
   DEFAULT_ACP_ENGINE_PERMISSION_MODE,
   DEFAULT_ACP_ENGINE_WARM_HANDLE_IDLE_MS,
 } from "@paperclipai/adapter-utils/acpx-engine/constants";
+import {
+  listOmpModels,
+  normalizeOmpModelId,
+  type OmpModelCost,
+} from "./models.js";
 
 export const DEFAULT_OMP_COMMAND = "omp";
 
@@ -36,7 +41,31 @@ export function resolveOmpAgentCommand(config: Record<string, unknown>): string 
   return `${command} acp`;
 }
 
-export function buildOmpAcpConfig(config: Record<string, unknown>): Record<string, unknown> {
+/**
+ * Free/zero-cost preview tiers need long horizons (measured: >20 min for a
+ * 45k-token context); priced models get the engine's default (no timeout,
+ * sandbox 4h cap applies).
+ */
+export function deriveDefaultTimeoutSec(cost: OmpModelCost | null | undefined): number {
+  if (!cost) return 0;
+  return cost.input === 0 && cost.output === 0 && cost.cacheRead === 0 && cost.cacheWrite === 0
+    ? 1800
+    : 0;
+}
+
+/**
+ * Build the ACP engine config for a run. `resolveModel` normalizes the raw
+ * model ref (the raw value passes through when it returns null).
+ * `resolveCost` receives the NORMALIZED model id and returns its cost card
+ * (or null); it feeds timeout derivation when none is configured.
+ */
+export function buildOmpAcpConfig(
+  config: Record<string, unknown>,
+  resolveModel: (model: string) => string | null = () => null,
+  resolveCost: (model: string) => OmpModelCost | null = () => null,
+): Record<string, unknown> {
+  const rawModel = firstNonEmptyString(config.model);
+  const model = rawModel ? (resolveModel(rawModel) ?? rawModel) : undefined;
   const next: Record<string, unknown> = {
     ...config,
     agent: "custom",
@@ -51,6 +80,23 @@ export function buildOmpAcpConfig(config: Record<string, unknown>): Record<strin
     warmHandleIdleMs:
       config.warmHandleIdleMs ?? config.acpWarmHandleIdleMs ?? DEFAULT_ACP_ENGINE_WARM_HANDLE_IDLE_MS,
   };
+  if (model) next.model = model;
+  // timeoutSec is numeric — firstNonEmptyString would drop it. Coerce once:
+  // accept finite numbers AND numeric strings (honoring an explicit 0, which
+  // means "no timeout"); anything else falls through to cost-based derivation.
+  const rawTimeout = config.timeoutSec ?? config.acpTimeoutSec;
+  const timeoutValue =
+    typeof rawTimeout === "number"
+      ? rawTimeout
+      : typeof rawTimeout === "string" && rawTimeout.trim() !== ""
+        ? Number(rawTimeout)
+        : NaN;
+  const timeoutSec = Number.isFinite(timeoutValue) ? timeoutValue : undefined;
+  if (timeoutSec === undefined && model) {
+    next.timeoutSec = deriveDefaultTimeoutSec(resolveCost(model));
+  } else if (timeoutSec !== undefined) {
+    next.timeoutSec = timeoutSec;
+  }
   const stateDir = firstNonEmptyString(config.stateDir, config.acpStateDir);
   if (stateDir) next.stateDir = stateDir;
   // omp exposes `thinking` via its own ACP session option; the shared engine's
@@ -190,6 +236,18 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
         resolveBillingIdentity: options.resolveBillingIdentity ?? resolveOmpBillingIdentity,
       });
     }
-    return executor({ ...ctx, config: buildOmpAcpConfig(ctx.config) });
+    // Resolvers backed by the cached `omp models ls` list (5-min TTL inside
+    // models.ts). Built on first actual run, inside this memoized closure, so
+    // probe-only paths never spawn `omp models`. The fetch is skipped when no
+    // model is configured — a broken/missing `omp` would otherwise add up to
+    // 20s of uncached failure latency per run.
+    const models = firstNonEmptyString(ctx.config.model) ? await listOmpModels() : [];
+    const resolveModel = (model: string): string | null => normalizeOmpModelId(model, models);
+    const resolveCost = (model: string): OmpModelCost | null =>
+      models.find((m) => m.id === model)?.cost ?? null;
+    return executor({
+      ...ctx,
+      config: buildOmpAcpConfig(ctx.config, resolveModel, resolveCost),
+    });
   };
 }

@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   buildOmpAcpConfig,
+  deriveDefaultTimeoutSec,
   parseOmpVersion,
   probeOmpAcpSession,
   resolveOmpAgentCommand,
@@ -41,6 +42,63 @@ describe("buildOmpAcpConfig", () => {
   it("keeps stateDir only when set", () => {
     expect(buildOmpAcpConfig({}).stateDir).toBeUndefined();
     expect(buildOmpAcpConfig({ stateDir: "/tmp/s" }).stateDir).toBe("/tmp/s");
+  });
+  it("normalizes the model through resolveModel", () => {
+    const out = buildOmpAcpConfig(
+      { model: "glm-5.2" },
+      (m) => (m === "glm-5.2" ? "zai/glm-5.2" : null),
+      () => null,
+    );
+    expect(out.model).toBe("zai/glm-5.2");
+  });
+  it("keeps the raw model when resolveModel returns null", () => {
+    expect(buildOmpAcpConfig({ model: "glm-5.2" }, () => null).model).toBe("glm-5.2");
+  });
+  it("honors an explicit timeoutSec, including 0 and numeric strings", () => {
+    // resolveCost returns a FREE cost (would derive 1800) so an explicit 0
+    // can only come from the explicit-timeout branch, not derivation.
+    const free = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+    expect(buildOmpAcpConfig({ model: "m", timeoutSec: 0 }, () => "m", free).timeoutSec).toBe(0);
+    expect(buildOmpAcpConfig({ model: "m", timeoutSec: 60 }, () => "m", free).timeoutSec).toBe(60);
+    expect(buildOmpAcpConfig({ model: "m", timeoutSec: "300" }, () => "m", free).timeoutSec).toBe(300);
+  });
+  it("prefers timeoutSec over acpTimeoutSec", () => {
+    expect(buildOmpAcpConfig({ model: "m", timeoutSec: 60, acpTimeoutSec: 123 }).timeoutSec).toBe(60);
+  });
+  it("falls back to acpTimeoutSec when timeoutSec is absent", () => {
+    expect(buildOmpAcpConfig({ model: "m", acpTimeoutSec: 123 }).timeoutSec).toBe(123);
+  });
+  it("derives timeoutSec from the resolved model cost when both are absent", () => {
+    const free = buildOmpAcpConfig(
+      { model: "m" },
+      () => "m",
+      () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }),
+    );
+    expect(free.timeoutSec).toBe(1800);
+    const priced = buildOmpAcpConfig(
+      { model: "m" },
+      () => "m",
+      () => ({ input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 }),
+    );
+    expect(priced.timeoutSec).toBe(0);
+  });
+  it("adds no timeoutSec when no model is set", () => {
+    expect(buildOmpAcpConfig({}).timeoutSec).toBeUndefined();
+  });
+});
+
+describe("deriveDefaultTimeoutSec", () => {
+  it("returns 1800 for a free/zero-cost model", () => {
+    expect(deriveDefaultTimeoutSec({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 })).toBe(1800);
+  });
+
+  it("returns 0 for a priced model", () => {
+    expect(deriveDefaultTimeoutSec({ input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 })).toBe(0);
+  });
+
+  it("returns 0 when cost is absent/unavailable", () => {
+    expect(deriveDefaultTimeoutSec(null)).toBe(0);
+    expect(deriveDefaultTimeoutSec(undefined)).toBe(0);
   });
 });
 

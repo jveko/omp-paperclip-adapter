@@ -1,10 +1,17 @@
 import { execFile } from "node:child_process";
 
+export interface OmpModelCost {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
 export interface OmpModelInfo {
   id: string;
   label: string;
   contextWindow?: number;
-  cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  cost?: OmpModelCost;
   priced: boolean;
 }
 
@@ -33,9 +40,7 @@ export function parseOmpModelsJson(stdout: string): OmpModelInfo[] {
       id: `${provider}/${id}`,
       label: typeof rec.name === "string" && rec.name ? rec.name : `${provider}/${id}`,
       contextWindow: typeof rec.contextWindow === "number" ? rec.contextWindow : undefined,
-      priced:
-        cost != null &&
-        !["input", "output"].every((k) => Number((cost as Record<string, unknown>)[k] ?? 0) === 0),
+      priced: cost != null && (cost.input !== 0 || cost.output !== 0),
       cost,
     });
   }
