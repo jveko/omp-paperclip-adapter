@@ -30,6 +30,7 @@ import {
   type OmpModelCost,
 } from "./models.js";
 import { buildSkillsInstructions, skillsDir, type SkillMarkdownSource } from "./skills.js";
+import { readRetryConfig, runWithFreshSessionRetry, withRetryChain } from "./retry.js";
 
 export const DEFAULT_OMP_COMMAND = "omp";
 
@@ -304,6 +305,20 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     // instructionsFilePath untouched.
     const instructionsFile = await materializeSkillsInstructions(ctx.config);
     if (instructionsFile) config.instructionsFilePath = instructionsFile;
-    return executor({ ...ctx, config });
+    // Fresh-session retry: when a turn fails terminally (surviving omp's
+    // native TurnRecovery), re-run on a fresh ACP session up to
+    // retryFreshRetries times. Each fresh attempt busts the session
+    // fingerprint so the engine starts a brand-new session rather than
+    // resuming a possibly-poisoned warm handle. Native failover
+    // (quota/transient + model fallback) needs no adapter code — omp's
+    // TurnRecovery is default-on from omp's own config. The loop helper
+    // returns an empty chain when no retry ran, so normal runs carry no
+    // retryChain noise in resultJson.
+    const { result, chain } = await runWithFreshSessionRetry(
+      (runCtx) => executor!({ ...ctx, ...runCtx }),
+      readRetryConfig(ctx.config),
+      config,
+    );
+    return withRetryChain(result, chain);
   };
 }

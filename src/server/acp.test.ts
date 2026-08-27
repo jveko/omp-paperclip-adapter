@@ -1,6 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import type { AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import {
   buildOmpAcpConfig,
   deriveDefaultTimeoutSec,
@@ -9,6 +10,7 @@ import {
   resolveOmpAgentCommand,
   resolveOmpBillingIdentity,
 } from "./acp.js";
+import { runWithFreshSessionRetry, withRetryChain } from "./retry.js";
 
 describe("resolveOmpAgentCommand", () => {
   it("defaults to 'omp acp'", () => {
@@ -183,4 +185,20 @@ describe("probeOmpAcpSession", () => {
     expect(out.ok).toBe(false);
     expect(out.protocolVersion).toBe(99);
   }, 15_000);
+});
+describe("omp-local executor retry composition", () => {
+  it("attaches retryChain only when a retry actually occurred", async () => {
+    const failOnce = async (): Promise<AdapterExecutionResult> => ({
+      exitCode: 0, signal: null, timedOut: false,
+      errorCode: "acpx_turn_failed", errorMeta: { retryable: true },
+    });
+    const ok = async (): Promise<AdapterExecutionResult> => ({
+      exitCode: 0, signal: null, timedOut: false, errorCode: null,
+    });
+    const retried = await runWithFreshSessionRetry(failOnce, { enabled: true, freshRetries: 1 }, {});
+    const normal = await runWithFreshSessionRetry(ok, { enabled: true, freshRetries: 1 }, {});
+    expect(withRetryChain(retried.result, retried.chain).resultJson?.retryChain).toHaveLength(2);
+    // Normal runs carry no retryChain noise.
+    expect(withRetryChain(normal.result, normal.chain).resultJson).toBeUndefined();
+  });
 });
