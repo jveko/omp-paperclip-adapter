@@ -138,20 +138,43 @@ export interface OmpAcpProbeResult {
   error?: string;
 }
 
-export function probeOmpAcpSession(omp: {
-  command: string;
-  args?: string[];
-  env?: Record<string, string>;
-}, timeoutMs = 10_000): Promise<OmpAcpProbeResult> {
-  return new Promise<OmpAcpProbeResult>((resolve) => {
+export interface AcpFrameRequest {
+  method: string;
+  params?: Record<string, unknown>;
+}
+export interface AcpFrameResponse {
+  id: number;
+  result?: Record<string, unknown>;
+  error?: { code: number; message: string };
+}
+export interface AcpDriveResult {
+  ok: boolean;
+  initializeInfo?: Record<string, unknown>;
+  responses: AcpFrameResponse[];
+  error?: string;
+  /** Received protocolVersion when the initialize handshake failed on a mismatch. */
+  protocolVersion?: number;
+}
+
+/**
+ * Spawn `omp acp`, complete the initialize handshake, then issue `requests`
+ * sequentially and collect their responses. Read-only request sets must omit
+ * `session/new`: omp's extMethod handlers read persisted state from disk and
+ * need no session, while `session/new` always persists a new session record
+ * and would pollute session listings. Kills the child on completion, error,
+ * or timeout; never throws.
+ */
+export function driveAcpSession(
+  omp: { command: string; args?: string[]; env?: Record<string, string> },
+  requests: AcpFrameRequest[],
+  timeoutMs = 10_000,
+): Promise<AcpDriveResult> {
+  return new Promise<AcpDriveResult>((resolve) => {
     const child = spawn(omp.command, omp.args ?? [], {
       stdio: ["pipe", "pipe", "pipe"],
       env: omp.env ? { ...process.env, ...omp.env } : undefined,
     });
-    // A child that exits immediately (e.g. a non-ACP binary) makes this write
-    // fail with EPIPE; the close handler below already reports the failure.
     child.stdin.on("error", () => {});
-    // Bounded tail of the agent's stderr, folded into failure diagnostics.
     let stderrTail = "";
     child.stderr?.on("data", (chunk: Buffer) => {
       stderrTail = (stderrTail + chunk.toString()).slice(-2000);
@@ -162,7 +185,11 @@ export function probeOmpAcpSession(omp: {
     };
     let settled = false;
     let timer: NodeJS.Timeout | undefined;
-    const finish = (r: OmpAcpProbeResult) => {
+    const responses: AcpFrameResponse[] = [];
+    let initializeInfo: Record<string, unknown> | undefined;
+    // nextId 1 is initialize; requests take 2..n in order.
+    let nextIndex = 0;
+    const finish = (r: AcpDriveResult) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -170,54 +197,96 @@ export function probeOmpAcpSession(omp: {
       resolve(r);
     };
     timer = setTimeout(
-      () => finish({ ok: false, error: `ACP handshake timed out after ${timeoutMs}ms${suffix()}` }),
+      () => finish({ ok: false, responses, error: `ACP drive timed out after ${timeoutMs}ms${suffix()}` }),
       timeoutMs,
     );
-    child.on("error", (err) => { finish({ ok: false, error: String(err) }); });
-    child.on("close", () => { finish({ ok: false, error: `exited before handshake${suffix()}` }); });
-
+    child.on("error", (err) => {
+      finish({ ok: false, responses, error: String(err) });
+    });
+    child.on("close", () => {
+      finish({ ok: false, responses, error: `ACP child exited before the drive completed${suffix()}` });
+    });
+    const sendNext = () => {
+      if (nextIndex >= requests.length) {
+        finish({ ok: true, initializeInfo, responses });
+        return;
+      }
+      const req = requests[nextIndex];
+      child.stdin.write(
+        JSON.stringify({ jsonrpc: "2.0", id: nextIndex + 2, method: req.method, params: req.params ?? {} }) + "\n",
+      );
+    };
     const rl = createInterface({ input: child.stdout });
     rl.on("line", (line) => {
       let msg: unknown;
       try { msg = JSON.parse(line); } catch { return; }
       if (typeof msg !== "object" || msg === null || !("id" in msg)) return;
-      const { id } = msg;
-      const err = "error" in msg ? msg.error : undefined;
-      if ((id === 1 || id === 2) && typeof err === "object" && err !== null) {
-        const detail =
-          "message" in err && typeof err.message === "string" ? err.message : JSON.stringify(err);
-        finish({ ok: false, error: `ACP error on request id ${id}: ${String(detail)}` });
-        return;
-      }
-      const result = "result" in msg ? msg.result : undefined;
-      if (typeof result !== "object" || result === null) return;
-      if (id === 1 && "protocolVersion" in result) {
-        const pv = Number(result.protocolVersion);
-        if (pv !== 1) {
-          finish({ ok: false, protocolVersion: pv, error: `unexpected protocolVersion ${pv}` });
+      const id = Number((msg as { id: unknown }).id);
+      const err = (msg as { error?: unknown }).error;
+      const result = (msg as { result?: unknown }).result;
+      if (id === 1) {
+        if (typeof err === "object" && err !== null) {
+          const detail = "message" in (err as object) ? String((err as { message: unknown }).message) : JSON.stringify(err);
+          finish({ ok: false, responses, error: `ACP initialize error: ${detail}` });
           return;
         }
-        child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "session/new",
-          params: { cwd: process.cwd(), mcpServers: [] } }) + "\n");
+        if (typeof result !== "object" || result === null || Number((result as { protocolVersion?: unknown }).protocolVersion) !== 1) {
+          const received = Number((result as { protocolVersion?: unknown } | null)?.protocolVersion);
+          finish({
+            ok: false,
+            responses,
+            protocolVersion: Number.isFinite(received) ? received : undefined,
+            error: `unexpected protocolVersion ${Number.isFinite(received) ? received : "missing"}`,
+          });
+          return;
+        }
+        initializeInfo = result as Record<string, unknown>;
+        sendNext();
         return;
       }
-      if (id === 2 && "configOptions" in result) {
-        let model: { currentValue?: unknown } | undefined;
-        for (const o of Array.isArray(result.configOptions) ? result.configOptions : []) {
-          if (typeof o === "object" && o !== null && "id" in o && o.id === "model") {
-            model = o;
-            break;
-          }
-        }
-        finish({
-          ok: true,
-          protocolVersion: 1,
-          currentModel: typeof model?.currentValue === "string" ? model.currentValue : undefined,
+      const expectedId = nextIndex + 2;
+      if (id !== expectedId) return;
+      if (typeof err === "object" && err !== null) {
+        responses.push({
+          id,
+          error: {
+            code: Number((err as { code?: unknown }).code ?? 0),
+            message: "message" in (err as object) ? String((err as { message: unknown }).message) : JSON.stringify(err),
+          },
         });
+      } else if (typeof result === "object" && result !== null) {
+        responses.push({ id, result: result as Record<string, unknown> });
+      } else {
+        responses.push({ id });
       }
+      nextIndex += 1;
+      sendNext();
     });
-    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize",
-      params: { protocolVersion: 1, clientCapabilities: {} } }) + "\n");
+    child.stdin.write(
+      JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1, clientCapabilities: {} } }) + "\n",
+    );
+  });
+}
+
+export function probeOmpAcpSession(
+  omp: { command: string; args?: string[]; env?: Record<string, string> },
+  timeoutMs = 10_000,
+): Promise<OmpAcpProbeResult> {
+  return driveAcpSession(omp, [
+    { method: "session/new", params: { cwd: process.cwd(), mcpServers: [] } },
+  ], timeoutMs).then((drive): OmpAcpProbeResult => {
+    if (!drive.ok) return { ok: false, protocolVersion: drive.protocolVersion, error: drive.error };
+    const response = drive.responses[0];
+    if (response?.error) return { ok: false, error: `ACP error on request id ${response.id}: ${response.error.message}` };
+    const options = Array.isArray(response?.result?.configOptions)
+      ? (response.result?.configOptions as Array<Record<string, unknown>>)
+      : [];
+    const model = options.find((o) => o.id === "model") as { currentValue?: unknown } | undefined;
+    return {
+      ok: true,
+      protocolVersion: 1,
+      currentModel: typeof model?.currentValue === "string" ? model.currentValue : undefined,
+    };
   });
 }
 

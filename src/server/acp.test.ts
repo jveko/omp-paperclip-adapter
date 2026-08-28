@@ -5,6 +5,7 @@ import type { AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import {
   buildOmpAcpConfig,
   deriveDefaultTimeoutSec,
+  driveAcpSession,
   parseOmpVersion,
   probeOmpAcpSession,
   resolveOmpAgentCommand,
@@ -184,6 +185,63 @@ describe("probeOmpAcpSession", () => {
     });
     expect(out.ok).toBe(false);
     expect(out.protocolVersion).toBe(99);
+  }, 15_000);
+});
+
+describe("driveAcpSession", () => {
+  it("runs initialize plus sequential requests and returns their results", async () => {
+    const out = await driveAcpSession(
+      { command: process.execPath, args: [fakeAcp] },
+      [
+        { method: "_omp/sessions/listAll", params: {} },
+        { method: "_omp/projects/list", params: {} },
+      ],
+    );
+    expect(out.ok).toBe(true);
+    expect(out.responses).toHaveLength(2);
+    expect(out.responses[0].result).toMatchObject({ total: 2 });
+    expect(out.responses[1].result).toMatchObject({ totalSessions: 2 });
+  }, 15_000);
+
+  it("maps a JSON-RPC error response onto the request that caused it", async () => {
+    const out = await driveAcpSession(
+      { command: process.execPath, args: [fakeAcp], env: { FAKE_ACP_MODE: "exterror" } },
+      [{ method: "_omp/sessions/listAll", params: {} }],
+    );
+    // The drive completes with ok:true after collecting all responses; the
+    // JSON-RPC error is mapped onto the request's slot in `responses`.
+    expect(out.ok).toBe(true);
+    expect(out.responses[0].error?.message).toBe("ext boom");
+  }, 15_000);
+
+  it("never sends session/new for read-only request sets", async () => {
+    const out = await driveAcpSession(
+      { command: process.execPath, args: [fakeAcp], env: { FAKE_ACP_MODE: "record" } },
+      [{ method: "_omp/sessions/listAll", params: {} }],
+    );
+    // record mode echoes the seen frames in the listAll response (it is written
+    // after the request is logged; the initialize response predates the requests).
+    const seen = (out.responses[0]?.result as { seen?: string[] } | undefined)?.seen;
+    expect(seen).toEqual(["initialize", "_omp/sessions/listAll"]);
+  }, 15_000);
+
+  it("times out a hung responder", async () => {
+    const out = await driveAcpSession(
+      { command: process.execPath, args: ["-e", "setInterval(() => {}, 1 << 30)"] },
+      [{ method: "_omp/sessions/listAll", params: {} }],
+      200,
+    );
+    expect(out.ok).toBe(false);
+    expect(out.error).toContain("timed out");
+  }, 15_000);
+
+  it("maps a session/new JSON-RPC error onto a failed probe (regression lock)", async () => {
+    const out = await probeOmpAcpSession(
+      { command: process.execPath, args: [fakeAcp], env: { FAKE_ACP_MODE: "newerror" } },
+    );
+    expect(out.ok).toBe(false);
+    expect(out.error).toContain("id 2");
+    expect(out.error).toContain("no session");
   }, 15_000);
 });
 describe("omp-local executor retry composition", () => {
