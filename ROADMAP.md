@@ -162,6 +162,13 @@ Paperclip config. Track upstream; don't build.
 
 ## Completed
 
+- **2026-08-28 — v0.4.0 (Session runtime).** Side-channel session reads (initialize-only),
+  fork-as-action via operator config + `sessionParams.acpSessionId` override + per-run
+  `warmHandleIdleMs`, compaction rotation (adapter-owned run counters + fingerprint bust),
+  session browser work products (provider `omp-session`), governance config schema
+  (force-fresh, fork, rotation thresholds), static `sessionManagement` declaration.
+  Plugin-SDK session panel deferred to a v0.5 candidate.
+
 - **2026-08-26 — v0.1.0 (G1).** ACP-lane adapter: spawn `omp acp` via ACPX custom lane,
   `omp models ls --json` discovery with rate cards, ACP handshake + active-model probe,
   five-check testEnvironment, self-contained ui-parser bundle, 25 unit tests. Installed and
