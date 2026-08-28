@@ -1,0 +1,167 @@
+import type { AdapterConfigSchema } from "@paperclipai/adapter-utils";
+
+export interface SessionIntelConfig {
+  browser: boolean;
+  forkSourceId: string;
+  forkToken: string;
+  forceFreshToken: string;
+  maxRuns: number;
+  maxAgeHours: number;
+}
+
+function str(config: Record<string, unknown>, key: string): string {
+  const v = config[key];
+  return typeof v === "string" ? v.trim() : "";
+}
+
+function num(config: Record<string, unknown>, key: string): number {
+  const v = config[key];
+  const n = typeof v === "number" ? v : typeof v === "string" ? Number(v) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+export function readSessionIntelConfig(config: Record<string, unknown>): SessionIntelConfig {
+  return {
+    browser: config.sessionBrowser !== false && config.sessionBrowser !== "false",
+    forkSourceId: str(config, "sessionForkSourceId"),
+    forkToken: str(config, "sessionForkToken"),
+    forceFreshToken: str(config, "sessionForceFreshToken"),
+    maxRuns: num(config, "sessionMaxRuns"),
+    maxAgeHours: num(config, "sessionMaxAgeHours"),
+  };
+}
+
+export type RunDirective =
+  | { kind: "fork"; forkSourceId: string; forkToken: string }
+  | { kind: "forceFresh"; token: string }
+  | { kind: "rotate"; reason: string }
+  | { kind: "none" };
+
+interface DirectiveState {
+  forkConsumed: string[];
+  forceFreshConsumed: string[];
+  pendingRotate: { reason: string; at: string } | null;
+}
+
+/**
+ * Pick the single directive for this run. Precedence: fork > force-fresh >
+ * pending compaction rotation. Consumed tokens suppress their directive; a
+ * failed fork or a warm-handle win leaves the token unconsumed (see the
+ * post-run consumption check), so the next run retries it.
+ */
+export function resolveRunDirective(
+  cfg: Pick<SessionIntelConfig, "forkSourceId" | "forkToken" | "forceFreshToken">,
+  state: DirectiveState,
+): RunDirective {
+  if (cfg.forkToken && cfg.forkSourceId && !state.forkConsumed.includes(cfg.forkToken)) {
+    return { kind: "fork", forkSourceId: cfg.forkSourceId, forkToken: cfg.forkToken };
+  }
+  if (cfg.forceFreshToken && !state.forceFreshConsumed.includes(cfg.forceFreshToken)) {
+    return { kind: "forceFresh", token: cfg.forceFreshToken };
+  }
+  if (state.pendingRotate) return { kind: "rotate", reason: state.pendingRotate.reason };
+  return { kind: "none" };
+}
+
+const NEXT_RUN = "Takes effect on the next run (the adapter has no live connection between runs).";
+
+export function getSessionConfigSchema(): AdapterConfigSchema {
+  return {
+    fields: [
+      { key: "sessionBrowser", label: "Session browser", type: "toggle", default: true,
+        hint: `Emit a session-snapshot work product when the session landscape changes. ${NEXT_RUN}` },
+      { key: "sessionForceFreshToken", label: "Force fresh session (token)", type: "text",
+        hint: `Set/change to start a brand-new ACP session. ${NEXT_RUN}` },
+      { key: "sessionForkSourceId", label: "Fork source session id", type: "text",
+        hint: `Persisted omp session id to fork (copy a prefix-full id from a session snapshot card). ${NEXT_RUN}` },
+      { key: "sessionForkToken", label: "Fork token", type: "text",
+        hint: `Arms the fork; consumed once the run verifiably resumes the fork. ${NEXT_RUN}` },
+      { key: "sessionMaxRuns", label: "Rotate session after N runs", type: "number", default: 0,
+        hint: `0 disables. Rotate (fresh session) after N runs on the same session. ${NEXT_RUN}` },
+      { key: "sessionMaxAgeHours", label: "Rotate session older than (hours)", type: "number", default: 0,
+        hint: `0 disables. Rotate when the current session is older than this. ${NEXT_RUN}` },
+    ],
+  };
+}
+
+import type { OmpSessionsSnapshot } from "./session-intel.js";
+
+export interface WorkProductPayload {
+  type: "artifact";
+  provider: string;
+  title: string;
+  summary: string;
+  url?: string;
+  metadata: Record<string, unknown>;
+}
+
+function shortId(id: string): string {
+  return id.length > 12 ? `${id.slice(0, 12)}…` : id;
+}
+
+export function buildSessionSnapshotWorkProduct(
+  snapshot: OmpSessionsSnapshot,
+  context: { currentSessionId: string | null; runId: string; capturedAt: string },
+): WorkProductPayload {
+  const recent = [...snapshot.sessions]
+    .sort((a, b) => String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? "")))
+    .slice(0, 5);
+  const currentLine = context.currentSessionId
+    ? `Current session: ${shortId(context.currentSessionId)}`
+    : "Current session: none (fresh session on next run)";
+  const lines = [
+    currentLine,
+    ...recent.map((s) => {
+      const parsed = s.updatedAt ? Date.parse(s.updatedAt) : NaN;
+      const age = Number.isNaN(parsed) ? "unknown time" : new Date(parsed).toISOString();
+      return `${shortId(s.sessionId)} — ${s.title ?? "untitled"} — ${s.messageCount ?? "?"} msgs — ${age}`;
+    }),
+  ];
+  return {
+    type: "artifact",
+    provider: "omp-session",
+    title: `Session snapshot — ${snapshot.sessions.length} sessions, current ${context.currentSessionId ? shortId(context.currentSessionId) : "none"}`,
+    summary: lines.join("\n"),
+    metadata: {
+      projects: snapshot.projects,
+      sessions: snapshot.sessions,
+      total: snapshot.total,
+      byCwd: snapshot.byCwd,
+      currentSessionId: context.currentSessionId,
+      capturedAt: context.capturedAt,
+      runId: context.runId,
+    },
+  };
+}
+
+export function paperclipApiBase(env: NodeJS.ProcessEnv = process.env): string {
+  const explicit = env.PAPERCLIP_API_URL ?? env.PAPERCLIP_RUNTIME_API_URL;
+  if (explicit) return explicit.replace(/\/+$/, "").replace(/\/api$/, "");
+  const host = env.PAPERCLIP_LISTEN_HOST === "0.0.0.0" || !env.PAPERCLIP_LISTEN_HOST
+    ? "127.0.0.1"
+    : env.PAPERCLIP_LISTEN_HOST;
+  const port = env.PAPERCLIP_LISTEN_PORT || env.PORT || "3100";
+  return `http://${host}:${port}`;
+}
+
+export async function postWorkProduct(
+  deps: { authToken?: string; issueId: string; apiBase?: string; fetchImpl?: typeof fetch },
+  payload: WorkProductPayload,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!deps.issueId) return { ok: false, error: "no issue id on this run" };
+  if (!deps.authToken) return { ok: false, error: "no run auth token available" };
+  const doFetch = deps.fetchImpl ?? fetch;
+  try {
+    const response = await doFetch(`${deps.apiBase ?? paperclipApiBase()}/api/issues/${deps.issueId}/work-products`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${deps.authToken}` },
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+      return { ok: false, error: `work-product POST failed: HTTP ${response.status}` };
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: `work-product POST failed: ${String(err)}` };
+  }
+}
