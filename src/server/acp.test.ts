@@ -18,6 +18,7 @@ import {
   resolveOmpBillingIdentity,
 } from "./acp.js";
 import { runWithFreshSessionRetry, withRetryChain } from "./retry.js";
+import * as sessionState from "./session-state.js";
 import { loadState, saveState, sessionIntelDir } from "./session-state.js";
 
 const engineMocks = vi.hoisted(() => ({
@@ -144,19 +145,65 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     expect(forkWarn!.message).toContain("cannot be forked");
   });
 
-  it("force-fresh token busts the env exactly once", async () => {
+  it("force-fresh clears sessionParams (fingerprint-clean) exactly once", async () => {
     const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "brand-new", sessionKey: "sk2" } });
     const run = createOmpAcpExecutor();
     await run(baseCtx({ config: { command: `${process.execPath} ${fakeAcp}`, sessionForceFreshToken: "ff1" } }));
-    expect(executorFn.mock.calls[0][0].config.env.OMP_PAPERCLIP_FRESH).toBeTruthy();
+    // First run: runtimeOverride forces fresh — sessionParams empty (no
+    // matching acpSessionId), and the env is untouched (no OMP_PAPERCLIP_FRESH).
+    const merged1 = executorFn.mock.calls[0][0];
+    expect(merged1.runtime.sessionParams).toEqual({});
+    expect(merged1.config.env?.OMP_PAPERCLIP_FRESH).toBeUndefined();
+    expect(merged1.config.env?.OMP_PAPERCLIP_RETRY).toBeUndefined();
+    // The round-tripped id differs from the stored one -> token consumed.
     const state = await loadState(sessionIntelDir("co-1", "agent-1"));
     expect(state.forceFreshConsumed).toContain("ff1");
+    // Second run: token consumed -> normal resume, no override.
     await run(baseCtx({ config: { command: `${process.execPath} ${fakeAcp}`, sessionForceFreshToken: "ff1" } }));
-    expect(executorFn.mock.calls[1][0].config.env?.OMP_PAPERCLIP_FRESH).toBeUndefined();
+    const merged2 = executorFn.mock.calls[1][0];
+    expect(merged2.runtime.sessionParams).toMatchObject({ acpSessionId: "old" });
+    expect(merged2.config.env?.OMP_PAPERCLIP_FRESH).toBeUndefined();
   });
 
-  it("compaction: pendingRotate from state busts the env on the next run", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+  it("force-fresh consumption resets runCounters and clears a pending rotation", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "brand-new", sessionKey: "sk" } });
+    const run = createOmpAcpExecutor();
+    // Seed a long-lived session's run history plus a tripped rotation.
+    const dir = sessionIntelDir("co-1", "agent-1");
+    const seeded = await loadState(dir);
+    seeded.runCounters = { sk: { count: 42, firstRunAt: "2026-01-01T00:00:00.000Z" } };
+    seeded.pendingRotate = { reason: "maxRuns", at: "2026-01-02T00:00:00.000Z" };
+    await saveState(dir, seeded);
+    await run(baseCtx({ config: { command: `${process.execPath} ${fakeAcp}`, sessionForceFreshToken: "ff1" } }));
+    const state = await loadState(dir);
+    expect(state.forceFreshConsumed).toContain("ff1");
+    // The fresh session starts a new run count (reset then bumped to 1, not 43).
+    expect(state.runCounters.sk.count).toBe(1);
+    expect(state.runCounters.sk.firstRunAt).not.toBe("2026-01-01T00:00:00.000Z");
+    expect(state.pendingRotate).toBeNull();
+  });
+
+  it("successful fork supersedes a pending rotation and restarts the run count", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
+    const run = createOmpAcpExecutor();
+    const dir = sessionIntelDir("co-1", "agent-1");
+    const seeded = await loadState(dir);
+    seeded.runCounters = { sk: { count: 17, firstRunAt: "2026-01-01T00:00:00.000Z" } };
+    seeded.pendingRotate = { reason: "maxRuns", at: "2026-01-02T00:00:00.000Z" };
+    await saveState(dir, seeded);
+    await run(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, sessionForkSourceId: "sess-a", sessionForkToken: "t1" },
+    }));
+    const state = await loadState(dir);
+    expect(state.forkConsumed).toContain("t1");
+    // Fork is a fresh session under the same sessionKey: the tripped rotation
+    // must not discard it, and the run count starts over.
+    expect(state.pendingRotate).toBeNull();
+    expect(state.runCounters.sk.count).toBe(1);
+  });
+
+  it("compaction: pendingRotate from state forces fresh via sessionParams (fingerprint-clean)", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "brand-new", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
     // Seed: a completed run that tripped the threshold leaves pendingRotate.
     const dir = sessionIntelDir("co-1", "agent-1");
@@ -164,9 +211,36 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     seeded.pendingRotate = { reason: "maxRuns", at: new Date().toISOString() };
     await saveState(dir, seeded);
     await run(baseCtx({ config: { command: `${process.execPath} ${fakeAcp}` } }));
-    expect(executorFn.mock.calls[0][0].config.env.OMP_PAPERCLIP_FRESH).toBeTruthy();
+    // runtimeOverride forces fresh (sessionParams empty); env untouched.
+    const merged = executorFn.mock.calls[0][0];
+    expect(merged.runtime.sessionParams).toEqual({});
+    expect(merged.config.env?.OMP_PAPERCLIP_FRESH).toBeUndefined();
+    expect(merged.config.env?.OMP_PAPERCLIP_RETRY).toBeUndefined();
     const state = await loadState(dir);
     expect(state.pendingRotate).toBeNull();
+  });
+
+  it("saveState failure: warn emitted, run still returns the engine result", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "brand-new", sessionKey: "sk" } });
+    const events: Array<{ level?: string; message: string }> = [];
+    const run = createOmpAcpExecutor();
+    const saveSpy = vi.spyOn(sessionState, "saveState").mockRejectedValue(new Error("simulated disk full"));
+    try {
+      const result = await run(baseCtx({
+        config: { command: `${process.execPath} ${fakeAcp}` },
+        onEvent: async (ev: { level?: string; message: string }) => { events.push(ev); },
+      }));
+      // Degradation contract: a state-write error never fails a completed run.
+      expect(executorFn).toHaveBeenCalledOnce();
+      expect(result.exitCode).toBe(0);
+      expect(result.sessionParams?.acpSessionId).toBe("brand-new");
+      const warn = events.find((e) => e.message.includes("omp session intel state save failed"));
+      expect(warn).toBeTruthy();
+      expect(warn!.level).toBe("warn");
+      expect(warn!.message).toContain("simulated disk full");
+    } finally {
+      saveSpy.mockRestore();
+    }
   });
 
   it("emits a snapshot work product on landscape change and suppresses duplicates", async () => {

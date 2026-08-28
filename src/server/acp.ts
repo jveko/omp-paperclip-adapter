@@ -392,11 +392,23 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     const sessionCwd = typeof storedParams.cwd === "string" && storedParams.cwd
       ? storedParams.cwd
       : process.cwd();
+    // State writes must never fail a completed run: mirror the loadState
+    // degrade + the other warn-and-continue degradation paths.
+    const persistState = async (): Promise<void> => {
+      try {
+        await saveState(intelDir, intelState);
+      } catch (err) {
+        await ctx.onEvent?.({
+          eventType: "run.system", stream: "system", level: "warn",
+          message: `omp session intel state save failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+    };
 
     let forkTokenUsed: string | null = null;
     let forkedSessionId: string | null = null;
-    let freshEnvMarker: string | null = null;
     let freshTokenUsed: string | null = null;
+    let forceFreshOverride = false;
     let engineConfig = config;
 
     if (directive.kind === "fork") {
@@ -425,23 +437,29 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
       }
     } else if (directive.kind === "forceFresh") {
       freshTokenUsed = directive.token;
-      freshEnvMarker = `${Date.now()}-${directive.token}`;
+      forceFreshOverride = true;
     } else if (directive.kind === "rotate") {
-      freshEnvMarker = `rotate-${Date.now()}`;
+      forceFreshOverride = true;
       intelState.pendingRotate = null; // applied this run
-    }
-
-    if (freshEnvMarker) {
-      const env = { ...((engineConfig.env ?? {}) as Record<string, string>) };
-      env.OMP_PAPERCLIP_FRESH = freshEnvMarker;
-      engineConfig = { ...engineConfig, env };
     }
 
     // Fork resume override: identity fields stay untouched (no env bust), so
     // isCompatibleSession passes and the engine resumes the forked id.
+    // Force-fresh and rotation use the same override shape but CLEAR
+    // sessionParams instead: an empty sessionParams makes isCompatibleSession
+    // fail (configFingerprint "" !== the session's fingerprint), so the engine
+    // issues session/new this run. This is fingerprint-clean by design — the
+    // directive session's env is never touched, so the freshly created
+    // session's configFingerprint equals the normal run fingerprint and is
+    // RESUMABLE by subsequent markerless runs. An env marker (OMP_PAPERCLIP_FRESH)
+    // would poison the fingerprint and abandon the directive run's session —
+    // the same latent trap the retry path has (OMP_PAPERCLIP_RETRY), which we
+    // are NOT touching.
     const runtimeOverride = forkedSessionId
       ? { ...ctx.runtime, sessionParams: { ...storedParams, acpSessionId: forkedSessionId } }
-      : null;
+      : forceFreshOverride
+        ? { ...ctx.runtime, sessionParams: {} }
+        : null;
 
     const { result, chain } = await runWithFreshSessionRetry(
       (runCtx) => {
@@ -469,6 +487,11 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     if (forkTokenUsed) {
       if (usedSessionId && usedSessionId === forkedSessionId) {
         intelState.forkConsumed = consumeToken(intelState.forkConsumed, forkTokenUsed);
+        // A successfully resumed fork is a fresh session under the same
+        // sessionKey: a previously-tripped rotation must not discard it, and
+        // the run count starts over.
+        intelState.pendingRotate = null;
+        intelState.runCounters = {};
       } else {
         await ctx.onEvent?.({
           eventType: "run.system", stream: "system", level: "warn",
@@ -476,8 +499,17 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
         });
       }
     }
-    if (freshTokenUsed && usedSessionId && usedSessionId !== storedParams.acpSessionId) {
+    // Consumption semantics kept: force-fresh is consumed only when the
+    // round-tripped id differs from the stored one (a fresh session was made).
+    const freshSessionCreated = !!usedSessionId && usedSessionId !== storedParams.acpSessionId;
+    if (freshTokenUsed && freshSessionCreated) {
       intelState.forceFreshConsumed = consumeToken(intelState.forceFreshConsumed, freshTokenUsed);
+    }
+    if ((freshTokenUsed || directive.kind === "rotate") && freshSessionCreated) {
+      // The fresh session does NOT reset the fingerprint, so it must not reuse
+      // the old counter: start the run count over and clear any armed rotation.
+      intelState.runCounters = {};
+      intelState.pendingRotate = null;
     }
     if (typeof resultParams.sessionKey === "string") {
       bumpRunCounter(intelState, resultParams.sessionKey, nowIso);
@@ -490,7 +522,7 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
         };
       }
     }
-    await saveState(intelDir, intelState);
+    await persistState();
 
     const issueId = typeof ctx.context.taskId === "string" ? ctx.context.taskId : "";
     if (intel.browser && issueId) {
@@ -514,7 +546,7 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
           );
           if (posted.ok) {
             intelState.lastSnapshotDigest = digest;
-            await saveState(intelDir, intelState);
+            await persistState();
           } else {
             await ctx.onEvent?.({
               eventType: "run.system", stream: "system", level: "warn",
