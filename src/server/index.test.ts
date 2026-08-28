@@ -20,4 +20,18 @@ describe("createServerAdapter", () => {
     expect(mod.acp?.skillsMode).toBe("ephemeral");
     expect(mod.acp?.prerequisites?.nodeRange).toBe(">=24.11.0");
   });
+  it("exposes the session governance config schema", async () => {
+    const schema = await mod.getConfigSchema!();
+    expect(schema.fields.map((f) => f.key)).toContain("sessionForkToken");
+  });
+
+  it("declares session management capability with compaction defaults", () => {
+    expect(mod.sessionManagement).toEqual({
+      supportsSessionResume: true,
+      nativeContextManagement: "none",
+      defaultSessionCompaction: {
+        enabled: true, maxSessionRuns: 200, maxRawInputTokens: 2_000_000, maxSessionAgeHours: 72,
+      },
+    });
+  });
 });

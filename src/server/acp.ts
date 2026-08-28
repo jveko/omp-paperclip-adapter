@@ -31,6 +31,15 @@ import {
 } from "./models.js";
 import { buildSkillsInstructions, skillsDir, type SkillMarkdownSource } from "./skills.js";
 import { readRetryConfig, runWithFreshSessionRetry, withRetryChain } from "./retry.js";
+import { forkOmpSession, queryOmpSessions } from "./session-intel.js";
+import {
+  bumpRunCounter, consumeToken, loadState, rotateIfTripped, saveState,
+  sessionIntelDir, snapshotDigest,
+} from "./session-state.js";
+import {
+  buildSessionSnapshotWorkProduct, postWorkProduct,
+  readSessionIntelConfig, resolveRunDirective,
+} from "./session-directives.js";
 
 export const DEFAULT_OMP_COMMAND = "omp";
 
@@ -374,20 +383,166 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     // instructionsFilePath untouched.
     const instructionsFile = await materializeSkillsInstructions(ctx.config);
     if (instructionsFile) config.instructionsFilePath = instructionsFile;
-    // Fresh-session retry: when a turn fails terminally (surviving omp's
-    // native TurnRecovery), re-run on a fresh ACP session up to
-    // retryFreshRetries times. Each fresh attempt busts the session
-    // fingerprint so the engine starts a brand-new session rather than
-    // resuming a possibly-poisoned warm handle. Native failover
-    // (quota/transient + model fallback) needs no adapter code — omp's
-    // TurnRecovery is default-on from omp's own config. The loop helper
-    // returns an empty chain when no retry ran, so normal runs carry no
-    // retryChain noise in resultJson.
+    // --- v0.4 session runtime: directives, fork resume, rotation, snapshot ---
+    const intel = readSessionIntelConfig(ctx.config);
+    const intelDir = sessionIntelDir(ctx.agent.companyId, ctx.agent.id);
+    const intelState = await loadState(intelDir);
+    const directive = resolveRunDirective(intel, intelState);
+    const storedParams = (ctx.runtime.sessionParams ?? {}) as Record<string, unknown>;
+    const sessionCwd = typeof storedParams.cwd === "string" && storedParams.cwd
+      ? storedParams.cwd
+      : process.cwd();
+
+    let forkTokenUsed: string | null = null;
+    let forkedSessionId: string | null = null;
+    let freshEnvMarker: string | null = null;
+    let freshTokenUsed: string | null = null;
+    let engineConfig = config;
+
+    if (directive.kind === "fork") {
+      const ompTokens = resolveOmpAgentCommand(ctx.config).split(/\s+/);
+      const fork = await forkOmpSession(
+        { command: ompTokens[0], args: ompTokens.slice(1) },
+        directive.forkSourceId,
+        sessionCwd,
+      );
+      if (fork.ok) {
+        forkTokenUsed = directive.forkToken;
+        forkedSessionId = fork.sessionId;
+        // warmHandleIdleMs: 50 makes this run's handle warm-savable (execute.js
+        // warm-save requires warmIdleMs > 0) and runs cleanupIdleHandles before
+        // the resume decision, so no stale handle can shadow the fork override.
+        // The engine's DEFAULT for omp is 0 (handles close each turn), so under
+        // default settings the cleanup is a no-op and warm-save enablement is
+        // the load-bearing effect. Must stay > 0: idleMs <= 0 disables both.
+        // Per-run only; non-fork runs keep the operator's configured value.
+        engineConfig = { ...config, warmHandleIdleMs: 50 };
+      } else {
+        await ctx.onEvent?.({
+          eventType: "run.system", stream: "system", level: "warn",
+          message: `omp fork directive failed: ${fork.error}`,
+        });
+      }
+    } else if (directive.kind === "forceFresh") {
+      freshTokenUsed = directive.token;
+      freshEnvMarker = `${Date.now()}-${directive.token}`;
+    } else if (directive.kind === "rotate") {
+      freshEnvMarker = `rotate-${Date.now()}`;
+      intelState.pendingRotate = null; // applied this run
+    }
+
+    if (freshEnvMarker) {
+      const env = { ...((engineConfig.env ?? {}) as Record<string, string>) };
+      env.OMP_PAPERCLIP_FRESH = freshEnvMarker;
+      engineConfig = { ...engineConfig, env };
+    }
+
+    // Fork resume override: identity fields stay untouched (no env bust), so
+    // isCompatibleSession passes and the engine resumes the forked id.
+    const runtimeOverride = forkedSessionId
+      ? { ...ctx.runtime, sessionParams: { ...storedParams, acpSessionId: forkedSessionId } }
+      : null;
+
     const { result, chain } = await runWithFreshSessionRetry(
-      (runCtx) => executor!({ ...ctx, ...runCtx }),
-      readRetryConfig(ctx.config),
-      config,
+      (runCtx) => {
+        const merged = { ...ctx, ...runCtx } as typeof ctx;
+        if (runtimeOverride) merged.runtime = runtimeOverride;
+        return executor!(merged);
+      },
+      // Fork runs MUST bypass the fresh-session retry loop: retrying would
+      // bust the fingerprint via OMP_PAPERCLIP_RETRY, causing the engine to
+      // start a blank session (isCompatibleSession fails) instead of resuming
+      // the forked session — orphaning it. Disabling retries keeps the fork
+      // resume path intact: a single attempt either succeeds normally, or
+      // fails terminally with the token still armed (next run re-forks from
+      // source). omp's own TurnRecovery still handles transient provider
+      // failures within that single attempt.
+      directive.kind === "fork" ? { enabled: false, freshRetries: 0 } : readRetryConfig(ctx.config),
+      engineConfig,
     );
-    return withRetryChain(result, chain);
+    const resultParams = (result.sessionParams ?? {}) as Record<string, unknown>;
+    const usedSessionId = typeof resultParams.acpSessionId === "string" ? resultParams.acpSessionId : null;
+    const nowIso = new Date().toISOString();
+
+    // Post-run bookkeeping: consumption (verified via the round-tripped
+    // acpSessionId), rotation counters, then snapshot emission.
+    if (forkTokenUsed) {
+      if (usedSessionId && usedSessionId === forkedSessionId) {
+        intelState.forkConsumed = consumeToken(intelState.forkConsumed, forkTokenUsed);
+      } else {
+        await ctx.onEvent?.({
+          eventType: "run.system", stream: "system", level: "warn",
+          message: "omp fork directive did not take effect; it stays armed for the next run",
+        });
+      }
+    }
+    if (freshTokenUsed && usedSessionId && usedSessionId !== storedParams.acpSessionId) {
+      intelState.forceFreshConsumed = consumeToken(intelState.forceFreshConsumed, freshTokenUsed);
+    }
+    if (typeof resultParams.sessionKey === "string") {
+      bumpRunCounter(intelState, resultParams.sessionKey, nowIso);
+      if (rotateIfTripped(intelState, resultParams.sessionKey,
+        { maxRuns: intel.maxRuns, maxAgeHours: intel.maxAgeHours }, nowIso)) {
+        intelState.lastRotation = {
+          reason: intelState.pendingRotate?.reason ?? "manual",
+          at: nowIso,
+          sessionKey: resultParams.sessionKey,
+        };
+      }
+    }
+    await saveState(intelDir, intelState);
+
+    const issueId = typeof ctx.context.taskId === "string" ? ctx.context.taskId : "";
+    if (intel.browser && issueId) {
+      const ompTokens = resolveOmpAgentCommand(ctx.config).split(/\s+/);
+      const query = await queryOmpSessions(
+        { command: ompTokens[0], args: ompTokens.slice(1) },
+        { cwd: sessionCwd },
+      );
+      if (query.ok) {
+        const digest = snapshotDigest({
+          projects: query.snapshot.projects,
+          ids: query.snapshot.sessions.map((s) => [s.sessionId, s.updatedAt]),
+          current: usedSessionId,
+        });
+        if (digest !== intelState.lastSnapshotDigest) {
+          const posted = await postWorkProduct(
+            { authToken: ctx.authToken, issueId },
+            buildSessionSnapshotWorkProduct(query.snapshot, {
+              currentSessionId: usedSessionId, runId: ctx.runId, capturedAt: nowIso,
+            }),
+          );
+          if (posted.ok) {
+            intelState.lastSnapshotDigest = digest;
+            await saveState(intelDir, intelState);
+          } else {
+            await ctx.onEvent?.({
+              eventType: "run.system", stream: "system", level: "warn",
+              message: `omp session snapshot emission failed: ${posted.error}`,
+            });
+          }
+        }
+      } else {
+        await ctx.onEvent?.({
+          eventType: "run.system", stream: "system", level: "warn",
+          message: `omp session snapshot query failed: ${query.error}`,
+        });
+      }
+    }
+    // Surface session-runtime events in resultJson -> heartbeat_runs (the
+    // authoritative evidence table; see spec 3.8).
+    const sessionRuntime: Record<string, unknown> = {};
+    if (forkTokenUsed) {
+      sessionRuntime.fork = {
+        requested: forkedSessionId,
+        applied: usedSessionId === forkedSessionId,
+        activeSessionId: usedSessionId,
+      };
+    }
+    if (intelState.lastRotation) sessionRuntime.lastRotation = intelState.lastRotation;
+    const resultJson = Object.keys(sessionRuntime).length > 0
+      ? { ...(result.resultJson ?? {}), sessionRuntime }
+      : result.resultJson;
+    return withRetryChain(resultJson ? { ...result, resultJson } : result, chain);
   };
 }

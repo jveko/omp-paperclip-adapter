@@ -1,9 +1,15 @@
+import http from "node:http";
+import os from "node:os";
 import path from "node:path";
+import { mkdtemp, rm } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
-import type { AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import {
+  afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi,
+} from "vitest";
+import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import {
   buildOmpAcpConfig,
+  createOmpAcpExecutor,
   deriveDefaultTimeoutSec,
   driveAcpSession,
   parseOmpVersion,
@@ -12,6 +18,285 @@ import {
   resolveOmpBillingIdentity,
 } from "./acp.js";
 import { runWithFreshSessionRetry, withRetryChain } from "./retry.js";
+import { loadState, saveState, sessionIntelDir } from "./session-state.js";
+
+const engineMocks = vi.hoisted(() => ({
+  createAcpxEngineExecutor: vi.fn(),
+}));
+
+vi.mock("@paperclipai/adapter-utils/acpx-engine/execute", () => ({
+  createAcpxEngineExecutor: engineMocks.createAcpxEngineExecutor,
+}));
+
+function fakeEngine(result: Record<string, unknown>) {
+  const executor = vi.fn(async (ctx: AdapterExecutionContext) => result);
+  engineMocks.createAcpxEngineExecutor.mockReturnValue(executor);
+  return executor;
+}
+
+function baseCtx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecutionContext {
+  return {
+    runId: "run-1",
+    agent: { id: "agent-1", companyId: "co-1", name: "A", adapterType: "omp_local", adapterConfig: null },
+    runtime: {
+      sessionId: "old",
+      sessionParams: { acpSessionId: "old", sessionKey: "sk", cwd: process.cwd(), configFingerprint: "f" },
+      sessionDisplayId: "old", taskKey: "t",
+    },
+    config: {},
+    context: { taskId: "issue-1" },
+    onLog: async () => {},
+    onEvent: async () => {},
+    ...overrides,
+  } as AdapterExecutionContext;
+}
+
+describe("createOmpAcpExecutor session runtime wiring", () => {
+  let tmpRoot: string;
+  beforeAll(async () => {
+    tmpRoot = await mkdtemp(path.join(os.tmpdir(), "omp-acp-test-"));
+  });
+  afterAll(async () => {
+    await rm(tmpRoot, { recursive: true, force: true });
+  });
+  beforeEach(async () => {
+    engineMocks.createAcpxEngineExecutor.mockReset();
+    // Each test starts from a pristine state dir: the shared tmpRoot would
+    // otherwise leak fork/force-fresh consumption and snapshot digests across
+    // tests (the fixture asserts on those state transitions).
+    await rm(path.join(tmpRoot, "instances"), { recursive: true, force: true });
+    vi.stubEnv("PAPERCLIP_HOME", tmpRoot);
+    vi.stubEnv("PAPERCLIP_INSTANCE_ID", "test-v04");
+  });
+  afterEach(() => vi.unstubAllEnvs());
+
+  it("fork run: overrides acpSessionId, injects warmHandleIdleMs 50, keeps env clean", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
+    const run = createOmpAcpExecutor();
+    await run(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, sessionForkSourceId: "sess-a", sessionForkToken: "t1" },
+    }));
+    const merged = executorFn.mock.calls[0][0];
+    expect(merged.runtime.sessionParams).toMatchObject({ acpSessionId: "fork-1" });
+    expect(merged.config.warmHandleIdleMs).toBe(50);
+    expect(merged.config.env?.OMP_PAPERCLIP_FRESH).toBeUndefined();
+    expect(merged.config.env?.OMP_PAPERCLIP_RETRY).toBeUndefined();
+  });
+
+  it("marks the fork token consumed only when the fork id round-trips", async () => {
+    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const run = createOmpAcpExecutor();
+    await run(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, sessionForkSourceId: "sess-a", sessionForkToken: "t1" },
+    }));
+    const state = await loadState(sessionIntelDir("co-1", "agent-1"));
+    expect(state.forkConsumed).not.toContain("t1"); // warm handle won -> stays armed
+
+    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
+    // NOTE: a fresh executor per run — createOmpAcpExecutor memoizes the engine
+    // executor in its closure, so reusing `run` would ignore the new fake result.
+    const run2 = createOmpAcpExecutor();
+    await run2(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, sessionForkSourceId: "sess-a", sessionForkToken: "t1" },
+    }));
+    const state2 = await loadState(sessionIntelDir("co-1", "agent-1"));
+    expect(state2.forkConsumed).toContain("t1");
+  });
+
+  it("fork run with terminal failure: single attempt, no retry env bust, token consumed", async () => {
+    const executorFn = fakeEngine({
+      exitCode: 1, errorCode: "acpx_turn_failed",
+      sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" },
+    });
+    const events: Array<{ message: string }> = [];
+    const run = createOmpAcpExecutor();
+    await run(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, sessionForkSourceId: "sess-a", sessionForkToken: "t1" },
+      onEvent: async (ev: { message: string }) => { events.push(ev); },
+    }));
+    // A terminal failure on a fork run must NOT trigger the fresh-session
+    // retry loop (which would bust the fingerprint and orphan the fork).
+    expect(executorFn).toHaveBeenCalledOnce();
+    const merged = executorFn.mock.calls[0][0];
+    expect(merged.config.env?.OMP_PAPERCLIP_RETRY).toBeUndefined();
+    // Fork WAS resumed (sessionParams round-trips the forked id) regardless
+    // of the turn outcome, so the token is consumed.
+    const state = await loadState(sessionIntelDir("co-1", "agent-1"));
+    expect(state.forkConsumed).toContain("t1");
+    // No misleading "did not take effect" warning when the fork was resumed.
+    expect(events.some((e) => e.message.includes("did not take effect"))).toBe(false);
+  });
+
+  it("fork failure: engine still invoked, warn event emitted, run does not throw", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "s1", sessionKey: "sk" } });
+    const events: Array<{ level?: string; message: string }> = [];
+    vi.stubEnv("FAKE_ACP_MODE", "forkerror");
+    const run = createOmpAcpExecutor();
+    await run(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, sessionForkSourceId: "sess-a", sessionForkToken: "t1" },
+      onEvent: async (ev: { level?: string; message: string }) => { events.push(ev); },
+    }));
+    // Degradation contract: a failed fork never fails the run.
+    expect(executorFn).toHaveBeenCalledOnce();
+    const forkWarn = events.find((e) => e.message.includes("omp fork directive failed"));
+    expect(forkWarn).toBeTruthy();
+    expect(forkWarn!.level).toBe("warn");
+    expect(forkWarn!.message).toContain("cannot be forked");
+  });
+
+  it("force-fresh token busts the env exactly once", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "brand-new", sessionKey: "sk2" } });
+    const run = createOmpAcpExecutor();
+    await run(baseCtx({ config: { command: `${process.execPath} ${fakeAcp}`, sessionForceFreshToken: "ff1" } }));
+    expect(executorFn.mock.calls[0][0].config.env.OMP_PAPERCLIP_FRESH).toBeTruthy();
+    const state = await loadState(sessionIntelDir("co-1", "agent-1"));
+    expect(state.forceFreshConsumed).toContain("ff1");
+    await run(baseCtx({ config: { command: `${process.execPath} ${fakeAcp}`, sessionForceFreshToken: "ff1" } }));
+    expect(executorFn.mock.calls[1][0].config.env?.OMP_PAPERCLIP_FRESH).toBeUndefined();
+  });
+
+  it("compaction: pendingRotate from state busts the env on the next run", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+    const run = createOmpAcpExecutor();
+    // Seed: a completed run that tripped the threshold leaves pendingRotate.
+    const dir = sessionIntelDir("co-1", "agent-1");
+    const seeded = await loadState(dir);
+    seeded.pendingRotate = { reason: "maxRuns", at: new Date().toISOString() };
+    await saveState(dir, seeded);
+    await run(baseCtx({ config: { command: `${process.execPath} ${fakeAcp}` } }));
+    expect(executorFn.mock.calls[0][0].config.env.OMP_PAPERCLIP_FRESH).toBeTruthy();
+    const state = await loadState(dir);
+    expect(state.pendingRotate).toBeNull();
+  });
+
+  it("emits a snapshot work product on landscape change and suppresses duplicates", async () => {
+    const posts: Array<{ url: string; body: unknown }> = [];
+    const server = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => { body += c; });
+      req.on("end", () => {
+        posts.push({ url: req.url ?? "", body: JSON.parse(body) });
+        res.end(JSON.stringify({ id: "wp" }));
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const addr = server.address();
+    const port = typeof addr === "object" && addr !== null && "port" in addr ? addr.port : 0;
+    try {
+      fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "sess-b", sessionKey: "sk" } });
+      const run = createOmpAcpExecutor();
+      const ctx = baseCtx({
+        authToken: "jwt",
+        config: { command: `${process.execPath} ${fakeAcp}` },
+      });
+      // first run: emits
+      ctx.context.taskId = "issue-1";
+      vi.stubEnv("PAPERCLIP_API_URL", `http://127.0.0.1:${port}`);
+      await run(ctx);
+      expect(posts).toHaveLength(1);
+      expect(posts[0].body).toMatchObject({ provider: "omp-session" });
+      // second run: identical landscape -> suppressed
+      await run(ctx);
+      expect(posts).toHaveLength(1);
+    } finally {
+      server.close();
+      server.closeAllConnections();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("snapshot query failure: run succeeds, warn emitted, no work product POST", async () => {
+    const posts: Array<{ url: string; body: unknown }> = [];
+    const server = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => { body += c; });
+      req.on("end", () => {
+        posts.push({ url: req.url ?? "", body: JSON.parse(body) });
+        res.end(JSON.stringify({ id: "wp" }));
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const addr = server.address();
+    const port = typeof addr === "object" && addr !== null && "port" in addr ? addr.port : 0;
+    try {
+      const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "sess-b", sessionKey: "sk" } });
+      const events: Array<{ message: string }> = [];
+      const run = createOmpAcpExecutor();
+      const ctx = baseCtx({
+        authToken: "jwt",
+        config: { command: `${process.execPath} ${fakeAcp}` },
+        onEvent: async (ev: { message: string }) => { events.push(ev); },
+      });
+      ctx.context.taskId = "issue-1";
+      vi.stubEnv("PAPERCLIP_API_URL", `http://127.0.0.1:${port}`);
+      // fake-acp answers _omp/* with JSON-RPC errors -> queryOmpSessions fails.
+      vi.stubEnv("FAKE_ACP_MODE", "exterror");
+      await run(ctx);
+      // Degradation contract: a failed snapshot query never fails the run.
+      expect(executorFn).toHaveBeenCalledOnce();
+      const queryWarn = events.find((e) => e.message.includes("snapshot query failed"));
+      expect(queryWarn).toBeTruthy();
+      expect(queryWarn!.message).toContain("ext boom");
+      expect(posts).toHaveLength(0);
+    } finally {
+      server.close();
+      server.closeAllConnections();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("snapshot POST failure: warn emitted, digest not updated, retried on next run", async () => {
+    let postCount = 0;
+    const server = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => { body += c; });
+      req.on("end", () => {
+        postCount += 1;
+        if (postCount === 1) {
+          res.statusCode = 500;
+          res.end("Internal Server Error");
+        } else {
+          res.end(JSON.stringify({ id: "wp" }));
+        }
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const addr = server.address();
+    const port = typeof addr === "object" && addr !== null && "port" in addr ? addr.port : 0;
+    try {
+      const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "sess-b", sessionKey: "sk" } });
+      const events: Array<{ message: string }> = [];
+      const run = createOmpAcpExecutor();
+      const ctx = baseCtx({
+        authToken: "jwt",
+        config: { command: `${process.execPath} ${fakeAcp}` },
+        onEvent: async (ev: { message: string }) => { events.push(ev); },
+      });
+      ctx.context.taskId = "issue-1";
+      vi.stubEnv("PAPERCLIP_API_URL", `http://127.0.0.1:${port}`);
+      // First run: POST fails with HTTP 500.
+      await run(ctx);
+      expect(executorFn).toHaveBeenCalledOnce();
+      const emitWarn = events.find((e) => e.message.includes("snapshot emission failed"));
+      expect(emitWarn).toBeTruthy();
+      expect(emitWarn!.message).toContain("HTTP 500");
+      // Digest is NOT recorded, so the next healthy run retries emission.
+      const state = await loadState(sessionIntelDir("co-1", "agent-1"));
+      expect(state.lastSnapshotDigest).toBeFalsy();
+      // Second run: POST succeeds -> warn gone, digest recorded.
+      events.length = 0;
+      await run(ctx);
+      expect(executorFn).toHaveBeenCalledTimes(2);
+      expect(events.some((e) => e.message.includes("snapshot emission failed"))).toBe(false);
+      const state2 = await loadState(sessionIntelDir("co-1", "agent-1"));
+      expect(state2.lastSnapshotDigest).toBeTruthy();
+    } finally {
+      server.close();
+      server.closeAllConnections();
+      vi.unstubAllEnvs();
+    }
+  });
+});
 
 describe("resolveOmpAgentCommand", () => {
   it("defaults to 'omp acp'", () => {

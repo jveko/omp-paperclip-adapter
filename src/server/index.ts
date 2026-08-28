@@ -6,6 +6,7 @@ import { listOmpSkillsSnapshot, syncOmpSkills } from "./skills.js";
 import { probeOmpAcpSession, resolveOmpAgentCommand } from "./acp.js";
 import { testEnvironment } from "./test.js";
 import { agentConfigurationDoc, type } from "../index.js";
+import { getSessionConfigSchema } from "./session-directives.js";
 
 // NOTE: ServerAdapterModule hooks take no per-agent config; discovery uses the
 // default omp on PATH, not any agent's `command` override (documented in doc).
@@ -52,6 +53,23 @@ export function createServerAdapter(): ServerAdapterModule {
     refreshModels,
     detectModel,
     sessionCodec,
+    // Governance surface for the board's per-agent config form; every field is
+    // a next-run directive (the adapter owns no live connection).
+    getConfigSchema: () => getSessionConfigSchema(),
+    // Static capability declaration consumed by the Paperclip control plane.
+    // Without it omp_local resolves to a compaction-DISABLED default. Threshold
+    // enforcement server-side is not relied upon — the adapter rotates via its
+    // own sessionMaxRuns/sessionMaxAgeHours config.
+    sessionManagement: {
+      supportsSessionResume: true,
+      nativeContextManagement: "none",
+      defaultSessionCompaction: {
+        enabled: true,
+        maxSessionRuns: 200,
+        maxRawInputTokens: 2_000_000,
+        maxSessionAgeHours: 72,
+      },
+    },
     execute,
     testEnvironment,
     agentConfigurationDoc,
