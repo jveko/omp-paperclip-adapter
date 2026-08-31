@@ -3,6 +3,7 @@ import type * as NodeChildProcess from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AdapterEnvironmentTestContext } from "@paperclipai/adapter-utils";
 import { testEnvironment } from "./test.js";
+import type * as AcpModule from "./acp.js";
 
 // Regression guard for env threading into the environment-test version probe.
 // testEnvironment's execFile probe must carry the side-channel env
@@ -15,6 +16,20 @@ import { testEnvironment } from "./test.js";
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof NodeChildProcess>();
   return { ...actual, execFile: vi.fn() };
+});
+
+const acpMocks = vi.hoisted(() => ({
+  probeOmpAcpSession: vi.fn(async () => ({
+    ok: true, protocolVersion: 1, currentModel: "glm-5.2",
+  })),
+}));
+
+// Capture the ACP handshake probe so we can assert its env (the execFile mock
+// only covers the version probe). Real parseOmpVersion/resolveOmpAgentCommand
+// stay intact; only probeOmpAcpSession is intercepted.
+vi.mock("./acp.js", async (importOriginal) => {
+  const actual = await importOriginal<AcpModule>();
+  return { ...actual, probeOmpAcpSession: acpMocks.probeOmpAcpSession };
 });
 
 const execFileMock = vi.mocked(execFile);
@@ -44,6 +59,18 @@ describe("testEnvironment version-probe env threading", () => {
     const opts = execFileMock.mock.calls[0][2] as { env?: Record<string, string> };
     expect(opts.env?.OMP_AUTH_BROKER_URL).toBe("http://b:8765");
     expect(opts.env?.OMP_AUTH_BROKER_TOKEN).toBe("tok");
+  });
+
+  it("forwards broker env into the ACP handshake probe", async () => {
+    acpMocks.probeOmpAcpSession.mockClear();
+    await testEnvironment(envTestCtx({
+      credentialMode: "broker",
+      env: { OMP_AUTH_BROKER_URL: "http://b:8765", OMP_AUTH_BROKER_TOKEN: "tok" },
+    }));
+    expect(acpMocks.probeOmpAcpSession).toHaveBeenCalled();
+    const probe = acpMocks.probeOmpAcpSession.mock.calls[0][0] as { env?: Record<string, string> };
+    expect(probe.env?.OMP_AUTH_BROKER_URL).toBe("http://b:8765");
+    expect(probe.env?.OMP_AUTH_BROKER_TOKEN).toBe("tok");
   });
 });
 

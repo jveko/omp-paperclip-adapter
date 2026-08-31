@@ -79,15 +79,21 @@ describe("usageDigest", () => {
 
 describe("buildUsageWorkProduct", () => {
   it("omp-usage artifact; cost-only when reports empty (broker down)", () => {
-    const wp = buildUsageWorkProduct({ reports: [], costPerHeartbeatUsd: 0.0056, runId: "r1", capturedAt: "2026-08-31T00:00:00Z" });
+    const wp = buildUsageWorkProduct({ reports: [], costPerHeartbeatUsd: 0.0056, runId: "r1", capturedAt: "2026-08-31T00:00:00Z", brokerMode: true });
     expect(wp.provider).toBe("omp-usage");
     expect(wp.summary).toContain("$0.0056");
     expect(wp.summary).toContain("broker usage unavailable");
     expect(wp.metadata).toMatchObject({ runId: "r1", capturedAt: "2026-08-31T00:00:00Z" });
   });
   it("includes broker reports in the summary when present", () => {
-    const wp = buildUsageWorkProduct({ reports: [{ provider: "p", used: 5 }], costPerHeartbeatUsd: 0.0012, runId: "r1", capturedAt: "2026-08-31T00:00:00Z" });
+    const wp = buildUsageWorkProduct({ reports: [{ provider: "p", used: 5 }], costPerHeartbeatUsd: 0.0012, runId: "r1", capturedAt: "2026-08-31T00:00:00Z", brokerMode: true });
     expect(wp.summary).toContain("$0.0012");
     expect(wp.summary).toContain("{\"provider\":\"p\",\"used\":5}");
+  });
+  it("local mode (broker not in use) says so and omits 'unavailable'", () => {
+    const wp = buildUsageWorkProduct({ reports: [], costPerHeartbeatUsd: 0.0056, runId: "r1", capturedAt: "2026-08-31T00:00:00Z", brokerMode: false });
+    expect(wp.summary).toContain("local credential mode — no broker");
+    expect(wp.summary).not.toContain("unavailable");
+    expect(wp.title).not.toContain("unavailable");
   });
 });

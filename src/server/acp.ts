@@ -125,6 +125,20 @@ export function buildOmpAcpConfig(
   // effort control-key wiring is unverified for custom agents, so never send it.
   delete next.effort;
   delete next.thinkingEffort;
+  // credentialMode is the single switch that decides whether the auth broker is
+  // in play: binding broker env without selecting broker mode does NOT silently
+  // enable broker for the run child. The run's ACP child (this config.env) must
+  // agree with the ompEnv-gated side channels, which forward broker env only in
+  // broker mode — so strip it here (on a copy, never mutating ctx.config.env).
+  if (config.credentialMode !== "broker") {
+    const srcEnv = (config.env ?? {}) as Record<string, unknown>;
+    if (typeof srcEnv.OMP_AUTH_BROKER_URL === "string" || typeof srcEnv.OMP_AUTH_BROKER_TOKEN === "string") {
+      const env = { ...srcEnv };
+      delete env.OMP_AUTH_BROKER_URL;
+      delete env.OMP_AUTH_BROKER_TOKEN;
+      next.env = env;
+    }
+  }
   return next;
 }
 
@@ -417,6 +431,7 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     // Fold the failover overlay into config BEFORE engineConfig is derived: the
     // fork branch rebuilds engineConfig as { ...config, warmHandleIdleMs: 50 },
     // so an overlay added only to engineConfig would be silently dropped by the
+    // fork spread — PI_CONFIG_FILES must ride on `config` to survive it.
     if (failoverOverlayPath) {
       const operatorPi =
         typeof (ctx.config.env as Record<string, unknown> | undefined)?.PI_CONFIG_FILES === "string"
@@ -571,7 +586,6 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
         };
       }
     }
-    await persistState();
 
     const runUsage = result.usage;
     if (runUsage && result.usageBasis !== "session_cumulative"
@@ -605,7 +619,7 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
       const digest = usageDigest(reports, cost);
       if (digest !== intelState.lastUsageDigest) {
         const posted = await postWorkProduct({ authToken: ctx.authToken, issueId },
-          buildUsageWorkProduct({ reports, costPerHeartbeatUsd: cost, runId: ctx.runId, capturedAt: nowIso }));
+          buildUsageWorkProduct({ reports, costPerHeartbeatUsd: cost, runId: ctx.runId, capturedAt: nowIso, brokerMode: ctx.config.credentialMode === "broker" }));
         if (posted.ok) {
           intelState.lastUsageDigest = digest;
           await persistState();

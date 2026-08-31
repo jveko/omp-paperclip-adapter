@@ -48,13 +48,25 @@ export function usageDigest(reports: unknown[], cost: number | null): string {
 }
 
 export function buildUsageWorkProduct(ctx: {
-  reports: unknown[]; costPerHeartbeatUsd: number | null; runId: string; capturedAt: string;
+  reports: unknown[]; costPerHeartbeatUsd: number | null; runId: string; capturedAt: string; brokerMode: boolean;
 }): WorkProductPayload {
   const cost = ctx.costPerHeartbeatUsd != null ? `$${ctx.costPerHeartbeatUsd.toFixed(4)}/heartbeat est.` : "cost estimate unavailable";
-  const lines = [cost, ...(ctx.reports.length ? ctx.reports.map((r) => JSON.stringify(r)).slice(0, 8) : ["(broker usage unavailable — cost-only report)"])];
+  // Distinguish "broker not in use" (local credential mode) from "broker
+  // unavailable" (broker mode where the fetch failed / returned no reports).
+  const noReportsLine = ctx.brokerMode
+    ? "(broker usage unavailable — cost-only report)"
+    : "(local credential mode — no broker)";
+  const lines = [cost, ...(ctx.reports.length
+    ? ctx.reports.map((r) => JSON.stringify(r)).slice(0, 8)
+    : [noReportsLine])];
+  const reportPart = ctx.reports.length
+    ? `${ctx.reports.length} provider report(s)`
+    : ctx.brokerMode
+      ? "broker usage unavailable"
+      : "local credential mode (no broker)";
   return {
     type: "artifact", provider: "omp-usage",
-    title: `Usage & cost — ${ctx.reports.length} provider report(s), ${cost}`,
+    title: `Usage & cost — ${reportPart}, ${cost}`,
     summary: lines.join("\n"),
     metadata: { reports: ctx.reports, costPerHeartbeatUsd: ctx.costPerHeartbeatUsd, runId: ctx.runId, capturedAt: ctx.capturedAt },
   };

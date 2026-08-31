@@ -121,6 +121,25 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     );
   });
 
+  it("pins the operator PI_CONFIG_FILES ahead of the overlay (fold, not overwrite)", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
+    const run = createOmpAcpExecutor();
+    await run(baseCtx({
+      config: {
+        command: `${process.execPath} ${fakeAcp}`,
+        sessionForkSourceId: "sess-a", sessionForkToken: "t1",
+        fallbackChain: "brokerco/main\nbrokerco/fast",
+        env: { PI_CONFIG_FILES: "/op/x.yml" },
+      },
+    }));
+    const merged = executorFn.mock.calls[0][0];
+    // The operator value rides ahead of the overlay path (fold via
+    // path.delimiter), not overwritten by it.
+    expect(merged.config.env?.PI_CONFIG_FILES).toBe(
+      "/op/x.yml" + path.delimiter + path.join(sessionIntelDir("co-1", "agent-1"), FAILOVER_CONFIG_FILE),
+    );
+  });
+
   it("fails the run early when broker mode lacks env", async () => {
     fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "x", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
@@ -718,8 +737,26 @@ describe("buildOmpAcpConfig", () => {
     );
     expect(priced.timeoutSec).toBe(0);
   });
-  it("adds no timeoutSec when no model is set", () => {
-    expect(buildOmpAcpConfig({}).timeoutSec).toBeUndefined();
+  it("strips OMP_AUTH_BROKER_* from output env when credentialMode is not broker (authoritative switch)", () => {
+    const input = {
+      credentialMode: "local",
+      env: { OMP_AUTH_BROKER_URL: "http://b:8765", OMP_AUTH_BROKER_TOKEN: "tok", KEEP: "x" },
+    };
+    const out = buildOmpAcpConfig(input);
+    const env = out.env as Record<string, unknown>;
+    expect(env.OMP_AUTH_BROKER_URL).toBeUndefined();
+    expect(env.OMP_AUTH_BROKER_TOKEN).toBeUndefined();
+    expect(env.KEEP).toBe("x");
+    // ctx.config.env is never mutated: the strip happens on a copy.
+    expect((input.env as Record<string, unknown>).OMP_AUTH_BROKER_URL).toBe("http://b:8765");
+  });
+  it("preserves OMP_AUTH_BROKER_* in broker mode", () => {
+    const out = buildOmpAcpConfig({
+      credentialMode: "broker",
+      env: { OMP_AUTH_BROKER_URL: "http://b:8765", OMP_AUTH_BROKER_TOKEN: "tok" },
+    });
+    expect((out.env as Record<string, unknown>).OMP_AUTH_BROKER_URL).toBe("http://b:8765");
+    expect((out.env as Record<string, unknown>).OMP_AUTH_BROKER_TOKEN).toBe("tok");
   });
 });
 

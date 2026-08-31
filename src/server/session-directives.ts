@@ -85,7 +85,7 @@ export function getSessionConfigSchema(): AdapterConfigSchema {
       { key: "credentialMode", label: "Credential mode", type: "select", default: "local", options: [{ label: "Local", value: "local" }, { label: "Broker", value: "broker" }],
         hint: `Consumption-only: operator runs 'omp auth-broker serve' and binds the token via secret_ref. ${NEXT_RUN}` },
       { key: "fallbackChain", label: "Model fallback chain", type: "textarea",
-        hint: `One selector per line, injected via PI_CONFIG_FILES. ${NEXT_RUN}` },
+        hint: `One selector per line, injected via PI_CONFIG_FILES. Adding the first selector or clearing the last flips PI_CONFIG_FILES present↔absent, which rotates the agent's session (fingerprint change) on the next run. ${NEXT_RUN}` },
       { key: "usageReport", label: "Emit usage report", type: "toggle", default: true,
         hint: `Emit an omp-usage work product with cost estimates. ${NEXT_RUN}` },
     ],
