@@ -1,6 +1,8 @@
 import { execFile } from "node:child_process";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { normalizeOmpModelId, parseOmpModelsJson, type OmpModelInfo } from "./models.js";
+import {
+  listOmpModels, normalizeOmpModelId, parseOmpModelsJson, type OmpModelInfo,
+} from "./models.js";
 import { deriveDefaultTimeoutSec } from "./acp.js";
 
 vi.mock("node:child_process", () => ({ execFile: vi.fn() }));
@@ -128,6 +130,38 @@ describe("listOmpModels", () => {
     execFileMock.mockImplementation(spawnResult(SAMPLE));
     expect(await listOmpModels()).toHaveLength(3);
     expect(execFileMock).toHaveBeenCalledTimes(2);
+  });
+  it("honors a custom args array for the catalog command", async () => {
+    const { listOmpModels } = await freshModels();
+    execFileMock.mockImplementation(spawnResult(SAMPLE));
+    await listOmpModels({ command: "node", args: ["fake-acp.mjs", "models", "ls", "--json"] });
+    expect(execFileMock).toHaveBeenCalledWith(
+      "node",
+      ["fake-acp.mjs", "models", "ls", "--json"],
+      expect.objectContaining({ timeout: 20_000 }),
+      expect.any(Function),
+    );
+  });
+});
+
+describe("listOmpModels env threading", () => {
+  it("forwards env to the omp models subprocess", async () => {
+    execFileMock.mockReset();
+    execFileMock.mockImplementation((_c: string, _a: string[], _o: unknown, cb: (e: null, out: string) => void) =>
+      cb(null, JSON.stringify({ models: [{ provider: "brokerco", id: "m", label: "L", priced: false }] })));
+    const models = await listOmpModels({ command: "omp", force: true, env: { OMP_AUTH_BROKER_URL: "http://b" } });
+    const opts = execFileMock.mock.calls[0][2] as { env?: Record<string, string> };
+    expect(opts.env?.OMP_AUTH_BROKER_URL).toBe("http://b");
+    expect(models[0].id).toBe("brokerco/m");
+  });
+  it("keys the cache by env (no cross-agent catalog leak)", async () => {
+    const emit = (marker: string) => (_c: string, _a: string[], _o: unknown, cb: (e: null, out: string) => void) =>
+      cb(null, JSON.stringify({ models: [{ provider: marker, id: "m", label: "L", priced: false }] }));
+    execFileMock.mockReset(); execFileMock.mockImplementation(emit("A"));
+    await listOmpModels({ command: "omp", env: { MARKER: "A" } });
+    execFileMock.mockImplementation(emit("B"));
+    const b = await listOmpModels({ command: "omp", env: { MARKER: "B" } }); // different env → cache miss
+    expect(b[0].id).toBe("B/m");
   });
 });
 

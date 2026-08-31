@@ -32,6 +32,7 @@ import {
 import { buildSkillsInstructions, skillsDir, type SkillMarkdownSource } from "./skills.js";
 import { readRetryConfig, runWithFreshSessionRetry, withRetryChain } from "./retry.js";
 import { forkOmpSession, queryOmpSessions } from "./session-intel.js";
+import { ompEnv } from "./omp-env.js";
 import {
   bumpRunCounter, consumeToken, loadState, rotateIfTripped, saveState,
   sessionIntelDir, snapshotDigest,
@@ -367,11 +368,25 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
       });
     }
     // Resolvers backed by the cached `omp models ls` list (5-min TTL inside
-    // models.ts). Built on first actual run, inside this memoized closure, so
-    // probe-only paths never spawn `omp models`. The fetch is skipped when no
-    // model is configured — a broken/missing `omp` would otherwise add up to
-    // 20s of uncached failure latency per run.
-    const models = firstNonEmptyString(ctx.config.model) ? await listOmpModels() : [];
+    // models.ts, keyed by command+env so different agents' credentials never
+    // share a catalog). Built on first actual run, inside this memoized
+    // closure, so probe-only paths never spawn `omp models`. The fetch is
+    // skipped when no model is configured — a broken/missing `omp` would
+    // otherwise add up to 20s of uncached failure latency per run.
+    const sideChannelEnv = ompEnv({ config: ctx.config });
+    const ompTokens = resolveOmpAgentCommand(ctx.config).split(/\s+/);
+    // The resolved agent command may be multi-token (e.g. `node fake-acp.mjs`
+    // or `mise x omp -- acp`). Strip a trailing `acp` so the catalog runs the
+    // wrapper with `models ls --json` appended, exactly like the engine's own
+    // agentCommand.
+    const base = ompTokens[ompTokens.length - 1] === "acp" ? ompTokens.slice(0, -1) : ompTokens;
+    const models = firstNonEmptyString(ctx.config.model)
+      ? await listOmpModels({
+          command: base[0],
+          args: [...base.slice(1), "models", "ls", "--json"],
+          env: sideChannelEnv,
+        })
+      : [];
     const resolveModel = (model: string): string | null => normalizeOmpModelId(model, models);
     const resolveCost = (model: string): OmpModelCost | null =>
       models.find((m) => m.id === model)?.cost ?? null;
@@ -414,7 +429,7 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     if (directive.kind === "fork") {
       const ompTokens = resolveOmpAgentCommand(ctx.config).split(/\s+/);
       const fork = await forkOmpSession(
-        { command: ompTokens[0], args: ompTokens.slice(1) },
+        { command: ompTokens[0], args: ompTokens.slice(1), env: sideChannelEnv },
         directive.forkSourceId,
         sessionCwd,
       );
@@ -528,7 +543,7 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     if (intel.browser && issueId) {
       const ompTokens = resolveOmpAgentCommand(ctx.config).split(/\s+/);
       const query = await queryOmpSessions(
-        { command: ompTokens[0], args: ompTokens.slice(1) },
+        { command: ompTokens[0], args: ompTokens.slice(1), env: sideChannelEnv },
         { cwd: sessionCwd },
       );
       if (query.ok) {

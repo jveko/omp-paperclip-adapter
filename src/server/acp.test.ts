@@ -84,6 +84,17 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     expect(merged.config.env?.OMP_PAPERCLIP_RETRY).toBeUndefined();
   });
 
+  it("fork still applies with broker env threaded to the side channel", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
+    const run = createOmpAcpExecutor();
+    await run(baseCtx({ config: {
+      command: `${process.execPath} ${fakeAcp}`,
+      sessionForkSourceId: "sess-a", sessionForkToken: "t-broker",
+      credentialMode: "broker", env: { OMP_AUTH_BROKER_URL: "http://b:8765", OMP_AUTH_BROKER_TOKEN: "tok" },
+    } }));
+    expect(executorFn.mock.calls[0][0].runtime.sessionParams).toMatchObject({ acpSessionId: "fork-1" });
+  });
+
   it("marks the fork token consumed only when the fork id round-trips", async () => {
     fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();

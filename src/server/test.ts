@@ -11,12 +11,12 @@ import {
   resolveAdapterExecutionTargetCwd,
 } from "@paperclipai/adapter-utils/execution-target";
 import { parseOmpVersion, probeOmpAcpSession, resolveOmpAgentCommand } from "./acp.js";
+import { ompEnv } from "./omp-env.js";
 
-function run(command: string, args: string[], timeoutMs: number): Promise<string> {
-  return new Promise((resolve) => {
-    execFile(command, args, { timeout: timeoutMs }, (err, stdout) =>
-      resolve(err ? "" : String(stdout)),
-    );
+function run(command: string, args: string[], timeoutMs: number, env?: Record<string, string>): Promise<string> {
+  return new Promise<string>((resolve) => {
+    execFile(command, args, { timeout: timeoutMs, env: env ? { ...process.env, ...env } : undefined },
+      (_err, stdout) => resolve(String(stdout ?? "")));
   });
 }
 
@@ -68,8 +68,8 @@ export async function testEnvironment(
     });
   }
 
-  // 3. version probe
-  const versionOut = await run(bin, ["--version"], 10_000);
+  const spawnEnv = ompEnv({ config });
+  const versionOut = await run(bin, ["--version"], 10_000, spawnEnv);
   const version = parseOmpVersion(versionOut);
   if (version) {
     checks.push({
@@ -87,7 +87,7 @@ export async function testEnvironment(
   }
 
   // 4. ACP handshake + active model detection
-  const probe = await probeOmpAcpSession({ command: bin, args: acpArgs });
+  const probe = await probeOmpAcpSession({ command: bin, args: acpArgs, env: spawnEnv });
   if (probe.ok) {
     checks.push({
       level: "info",

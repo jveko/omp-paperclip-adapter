@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 
 export interface OmpModelCost {
   input: number;
@@ -82,21 +83,32 @@ export function normalizeOmpModelId(model: string, models: OmpModelInfo[]): stri
   return null;
 }
 
-let cache: { at: number; models: OmpModelInfo[] } | null = null;
+const cache = new Map<string, { at: number; models: OmpModelInfo[] }>();
 const CACHE_TTL_MS = 5 * 60 * 1000;
 
 export async function listOmpModels(
-  options: { command?: string; force?: boolean } = {},
+  options: { command?: string; force?: boolean; args?: string[]; env?: Record<string, string> } = {},
 ): Promise<OmpModelInfo[]> {
   const command = options.command ?? "omp";
-  if (!options.force && cache && Date.now() - cache.at < CACHE_TTL_MS) return cache.models;
+  const args = options.args ?? ["models", "ls", "--json"];
+  const key = createHash("sha256").update(command + "\0" + JSON.stringify(args) + "\0" + JSON.stringify(options.env ?? {})).digest("hex").slice(0, 16);
+  if (!options.force) {
+    // Evict expired entries on access so a fleet of differently-env'd agents
+    // each keep a live slot without unbounded growth.
+    const now = Date.now();
+    for (const [k, v] of cache) {
+      if (now - v.at >= CACHE_TTL_MS) cache.delete(k);
+    }
+    const hit = cache.get(key);
+    if (hit && now - hit.at < CACHE_TTL_MS) return hit.models;
+  }
   const stdout = await new Promise<string>((resolve) => {
-    execFile(command, ["models", "ls", "--json"], { timeout: 20_000 }, (err, out) =>
-      resolve(err ? "" : String(out)),
+    execFile(command, args, { timeout: 20_000, env: options.env ? { ...process.env, ...options.env } : undefined },
+      (err, out) => resolve(err ? "" : String(out)),
     );
   });
   const models = parseOmpModelsJson(stdout);
   // Cache successes only; failures retry next call.
-  if (models.length > 0) cache = { at: Date.now(), models };
+  if (models.length > 0) cache.set(key, { at: Date.now(), models });
   return models;
 }
