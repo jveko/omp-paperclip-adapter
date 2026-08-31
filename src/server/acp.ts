@@ -44,6 +44,7 @@ import {
 import {
   buildSessionSnapshotWorkProduct, postWorkProduct,
   readSessionIntelConfig, resolveRunDirective, validateCredentialMode,
+  validThinkingLevel, validateThinkingLevel,
 } from "./session-directives.js";
 
 export const DEFAULT_OMP_COMMAND = "omp";
@@ -60,9 +61,16 @@ function firstNonEmptyString(...values: unknown[]): string | undefined {
 
 export function resolveOmpAgentCommand(config: Record<string, unknown>): string {
   const explicit = firstNonEmptyString(config.agentCommand, config.acpAgentCommand);
-  if (explicit) return explicit;
   const command = firstNonEmptyString(config.command) ?? DEFAULT_OMP_COMMAND;
-  return `${command} acp`;
+  const base = explicit ?? `${command} acp`;
+  // --thinking flag rides agentCommand because the engine's set_config_option
+  // uses the wrong key (effort). Changing the level rotates the session via the
+  // fingerprint (buildOmpAcpConfig puts this in agentCommand, which is hashed).
+  // Applies to the explicit agentCommand too (skipped only when it already
+  // carries --thinking, including a dangling flag with no value).
+  const level = validThinkingLevel(config.thinking);
+  if (level && !/--thinking(\s|=|$)/.test(base)) return `${base} --thinking ${level}`;
+  return base;
 }
 
 /**
@@ -123,8 +131,12 @@ export function buildOmpAcpConfig(
   if (stateDir) next.stateDir = stateDir;
   // omp exposes `thinking` via its own ACP session option; the shared engine's
   // effort control-key wiring is unverified for custom agents, so never send it.
+  // The engine reads all four of these keys (execute.js:613-618) and forwards any
+  // value as `key: "effort"`, which omp rejects — strip every one of them.
   delete next.effort;
   delete next.thinkingEffort;
+  delete next.reasoningEffort;
+  delete next.modelReasoningEffort;
   // credentialMode is the single switch that decides whether the auth broker is
   // in play: binding broker env without selecting broker mode does NOT silently
   // enable broker for the run child. The run's ACP child (this config.env) must
@@ -378,6 +390,15 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     if (credErr) {
       return { exitCode: 1, signal: null, timedOut: false, errorCode: "omp_config_error", errorMessage: credErr };
     }
+    // v0.6 thinking validation: a bad value emits a warn but does NOT abort
+    // (the append itself is fail-open — omp uses its default level).
+    const thinkMsg = validateThinkingLevel(ctx.config);
+    if (thinkMsg) {
+      await ctx.onEvent?.({
+        eventType: "run.system", stream: "system", level: "warn",
+        message: thinkMsg,
+      });
+    }
     if (!executor) {
       // Lazy by design: the acpx engine (and its transitive CLI deps) must not
       // load until a run actually executes, so probe-only imports stay cheap.
@@ -412,11 +433,11 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     }
     const sideChannelEnv = ompEnv({ config: ctx.config, overlayPath: failoverOverlayPath });
     const ompTokens = resolveOmpAgentCommand(ctx.config).split(/\s+/);
-    // The resolved agent command may be multi-token (e.g. `node fake-acp.mjs`
-    // or `mise x omp -- acp`). Strip a trailing `acp` so the catalog runs the
-    // wrapper with `models ls --json` appended, exactly like the engine's own
-    // agentCommand.
-    const base = ompTokens[ompTokens.length - 1] === "acp" ? ompTokens.slice(0, -1) : ompTokens;
+    // The resolved agent command may carry trailing flags (e.g. `--thinking
+    // medium`). Locate `acp` by index so trailing tokens are never confused
+    // with the base command.
+    const acpIdx = ompTokens.indexOf("acp");
+    const base = acpIdx >= 0 ? ompTokens.slice(0, acpIdx) : ompTokens;
     const models = firstNonEmptyString(ctx.config.model)
       ? await listOmpModels({
           command: base[0],

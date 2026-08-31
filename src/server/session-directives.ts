@@ -65,6 +65,29 @@ export function resolveRunDirective(
   return { kind: "none" };
 }
 
+/** omp's CLI thinking levels (parseCliThinkingLevel). `inherit` is intentionally
+ * excluded (omp rejects it) and `default` is a sentinel meaning "emit no flag". */
+const THINKING_LEVELS = ["off", "auto", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+export function validThinkingLevel(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  // Trim so padded values from the API (" medium ") still match: a padded value
+  // that failed matching would silently drop the directive AND raise a
+  // misleading warn. validateThinkingLevel delegates here, so both paths are fixed.
+  const trimmed = value.trim();
+  return (THINKING_LEVELS as readonly string[]).includes(trimmed) ? trimmed : null;
+}
+
+/** Actionable message when config.thinking holds an out-of-enum value, else null.
+ * Mirrors validateCredentialMode: the append itself is fail-open (a bad value
+ * just means "use the omp default"), so this only feeds a warn, never an abort. */
+export function validateThinkingLevel(config: Record<string, unknown>): string | null {
+  const level = config.thinking;
+  if (level === undefined || level === "default") return null;
+  if (validThinkingLevel(level) !== null) return null;
+  return `thinking is '${String(level)}' but expected one of off, auto, minimal, low, medium, high, xhigh, max (default is sentinel for no flag).`;
+}
+
 const NEXT_RUN = "Takes effect on the next run (the adapter has no live connection between runs).";
 
 export function getSessionConfigSchema(): AdapterConfigSchema {
@@ -84,6 +107,19 @@ export function getSessionConfigSchema(): AdapterConfigSchema {
         hint: `0 disables. Rotate when the current session is older than this. ${NEXT_RUN}` },
       { key: "credentialMode", label: "Credential mode", type: "select", default: "local", options: [{ label: "Local", value: "local" }, { label: "Broker", value: "broker" }],
         hint: `Consumption-only: operator runs 'omp auth-broker serve' and binds the token via secret_ref. ${NEXT_RUN}` },
+      { key: "thinking", label: "Thinking level", type: "select", default: "default",
+        options: [
+          { label: "Model default", value: "default" },
+          { label: "off", value: "off" },
+          { label: "auto", value: "auto" },
+          { label: "minimal", value: "minimal" },
+          { label: "low", value: "low" },
+          { label: "medium", value: "medium" },
+          { label: "high", value: "high" },
+          { label: "xhigh", value: "xhigh" },
+          { label: "max", value: "max" },
+        ],
+        hint: `Forwards omp --thinking <level> to the run's omp child. Changing the level rotates the session (starts fresh) so the new level applies — it does NOT change a resumed session, and it is ignored on fork runs. "Model default" sends nothing. ${NEXT_RUN}` },
       { key: "fallbackChain", label: "Model fallback chain", type: "textarea",
         hint: `One selector per line, injected via PI_CONFIG_FILES. Adding the first selector or clearing the last flips PI_CONFIG_FILES present↔absent, which rotates the agent's session (fingerprint change) on the next run. ${NEXT_RUN}` },
       { key: "usageReport", label: "Emit usage report", type: "toggle", default: true,
@@ -91,7 +127,6 @@ export function getSessionConfigSchema(): AdapterConfigSchema {
     ],
   };
 }
-
 /** Actionable message when broker mode is misconfigured, else null. Mirrors omp's
  * fail-closed resolveAuthBrokerConfig (discover.ts:217-222). config.env values are
  * already resolved strings (see plan precondition). */

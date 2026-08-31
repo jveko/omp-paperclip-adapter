@@ -67,9 +67,10 @@ export async function testEnvironment(
   const bin = tokens[0];
   const acpArgs = tokens.slice(1);
   // Non-ACP subcommands (--version, auth-broker status) run through the full
-  // resolved command with a trailing `acp` stripped, so a multi-token wrapper
-  // (e.g. `mise x omp -- acp`) probes as `mise x omp -- --version`.
-  const base = tokens[tokens.length - 1] === "acp" ? tokens.slice(0, -1) : tokens;
+  // resolved command. `acp` is located by index so trailing flags (e.g.
+  // `--thinking medium`) never leak into the probe argv.
+  const acpIdx = tokens.indexOf("acp");
+  const base = acpIdx >= 0 ? tokens.slice(0, acpIdx) : tokens;
 
   // 1. cwd absolute + accessible
   try {

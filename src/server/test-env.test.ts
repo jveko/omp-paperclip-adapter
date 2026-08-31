@@ -98,6 +98,27 @@ describe("testEnvironment multi-token command probes", () => {
     expect(calls[1][0]).toBe("mise");
     expect(calls[1][1]).toEqual(["x", "omp", "--", "auth-broker", "status", "--json"]);
   });
+  it("strips trailing --thinking flags from BOTH probes for a thinking-configured agent", async () => {
+    // With thinking set, resolveOmpAgentCommand yields `omp acp --thinking medium`.
+    // The base split (indexOf "acp") must still yield `omp` so the version probe
+    // is `omp --version` and the broker probe is `omp auth-broker status --json`,
+    // not a mangled `omp acp --thinking medium --version` that starts an ACP
+    // server and times out.
+    execFileMock
+      .mockImplementationOnce((_c, _a, _o, cb) => cb(null, "omp/18.0.5"))
+      .mockImplementationOnce((_c, _a, _o, cb) => cb(null, '{"ok":true,"url":"http://b:8765","version":"18"}'));
+    await testEnvironment(envTestCtx({
+      credentialMode: "broker",
+      command: "omp",
+      thinking: "medium",
+      env: { OMP_AUTH_BROKER_URL: "http://b:8765", OMP_AUTH_BROKER_TOKEN: "tok" },
+    }));
+    const calls = execFileMock.mock.calls;
+    expect(calls[0][0]).toBe("omp");
+    expect(calls[0][1]).toEqual(["--version"]);
+    expect(calls[1][0]).toBe("omp");
+    expect(calls[1][1]).toEqual(["auth-broker", "status", "--json"]);
+  });
 });
 
 describe("testEnvironment broker-status parsing", () => {

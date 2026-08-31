@@ -663,8 +663,37 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     }
   });
 
-});
+  it("catalog probe strips trailing flags from agentCommand (thinking:medium → base 'omp')", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+    const run = createOmpAcpExecutor();
+    modelsMocks.listOmpModels.mockClear();
+    await run(baseCtx({ config: { command: "omp", model: "prov/m", thinking: "medium" } }));
+    expect(modelsMocks.listOmpModels).toHaveBeenCalled();
+    const calls = modelsMocks.listOmpModels.mock.calls;
+    const call = calls[calls.length - 1][0];
+    expect(call.command).toBe("omp");
+    expect(call.args).not.toContain("acp");
+    expect(call.args).not.toContain("--thinking");
+    expect(call.args).not.toContain("medium");
+  });
 
+  it("warns (not aborts) for an invalid thinking level", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+    const events: Array<{ eventType?: string; level?: string; message?: string }> = [];
+    const ctx = baseCtx({
+      config: { command: "omp", thinking: "bogus" },
+      onEvent: async (ev: unknown) => { events.push(ev as { eventType?: string; level?: string; message?: string }); },
+    });
+    const run = createOmpAcpExecutor();
+    await run(ctx);
+    // warn emitted with the fail-open message...
+    const warn = events.find((e) => e.level === "warn" && /thinking is 'bogus'/.test(e.message ?? ""));
+    expect(warn).toBeTruthy();
+    // ...and the run still executes (does NOT abort on a bad thinking level).
+    expect(executorFn).toHaveBeenCalledOnce();
+  });
+
+});
 describe("resolveOmpAgentCommand", () => {
   it("defaults to 'omp acp'", () => {
     expect(resolveOmpAgentCommand({})).toBe("omp acp");
@@ -672,10 +701,30 @@ describe("resolveOmpAgentCommand", () => {
   it("derives from command override", () => {
     expect(resolveOmpAgentCommand({ command: "/usr/local/bin/omp" })).toBe("/usr/local/bin/omp acp");
   });
-  it("explicit agentCommand wins", () => {
-    expect(resolveOmpAgentCommand({ command: "omp", agentCommand: "mise x omp -- acp" })).toBe(
-      "mise x omp -- acp",
+  it("appends --thinking to an explicit agentCommand (never silently drops the directive)", () => {
+    expect(resolveOmpAgentCommand({ agentCommand: "mise x omp -- acp", thinking: "medium" })).toBe(
+      "mise x omp -- acp --thinking medium",
     );
+  });
+  it("appends --thinking for a valid level", () => {
+    expect(resolveOmpAgentCommand({ thinking: "medium" })).toBe("omp acp --thinking medium");
+  });
+  it("skips --thinking for default sentinel, unset, or invalid", () => {
+    expect(resolveOmpAgentCommand({ thinking: "default" })).toBe("omp acp");
+    expect(resolveOmpAgentCommand({})).toBe("omp acp");
+    expect(resolveOmpAgentCommand({ thinking: "bogus" })).toBe("omp acp");
+  });
+  it("does not double-append --thinking when the explicit agentCommand already carries it", () => {
+    expect(resolveOmpAgentCommand({
+      agentCommand: "omp acp --thinking low",
+      thinking: "high",
+    })).toBe("omp acp --thinking low");
+  });
+  it("does not double-append --thinking when the dangling flag (without a value) is present", () => {
+    expect(resolveOmpAgentCommand({
+      agentCommand: "omp acp --thinking",
+      thinking: "high",
+    })).toBe("omp acp --thinking");
   });
 });
 
@@ -693,6 +742,16 @@ describe("buildOmpAcpConfig", () => {
     const out = buildOmpAcpConfig({ effort: "high", thinkingEffort: "high" });
     expect(out.effort).toBeUndefined();
     expect(out.thinkingEffort).toBeUndefined();
+  });
+  it("strips reasoningEffort/modelReasoningEffort (the engine's other effort keys)", () => {
+    const out = buildOmpAcpConfig({
+      reasoningEffort: "high", modelReasoningEffort: "high",
+    });
+    expect(out.reasoningEffort).toBeUndefined();
+    expect(out.modelReasoningEffort).toBeUndefined();
+  });
+  it("rides the --thinking flag on agentCommand (the run fingerprint input)", () => {
+    expect(buildOmpAcpConfig({ thinking: "medium" }).agentCommand).toBe("omp acp --thinking medium");
   });
   it("keeps stateDir only when set", () => {
     expect(buildOmpAcpConfig({}).stateDir).toBeUndefined();

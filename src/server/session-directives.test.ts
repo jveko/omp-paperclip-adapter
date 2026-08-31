@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getSessionConfigSchema, paperclipApiBase, readSessionIntelConfig, resolveRunDirective, validateCredentialMode } from "./session-directives.js";
+import { getSessionConfigSchema, paperclipApiBase, readSessionIntelConfig, resolveRunDirective, validateCredentialMode, validThinkingLevel, validateThinkingLevel } from "./session-directives.js";
 
 describe("readSessionIntelConfig", () => {
   it("defaults browser on, usage report on, everything else off", () => {
@@ -71,7 +71,7 @@ describe("getSessionConfigSchema", () => {
     expect(keys).toEqual([
       "sessionBrowser", "sessionForceFreshToken", "sessionForkSourceId",
       "sessionForkToken", "sessionMaxRuns", "sessionMaxAgeHours",
-      "credentialMode", "fallbackChain", "usageReport",
+      "credentialMode", "thinking", "fallbackChain", "usageReport",
     ]);
     for (const field of schema.fields) expect(field.hint).toContain("next run");
   });
@@ -82,6 +82,48 @@ describe("getSessionConfigSchema", () => {
     expect(byKey.fallbackChain.type).toBe("textarea");
     expect(byKey.usageReport.type).toBe("toggle");
     expect(byKey.usageReport.default).toBe(true);
+  });
+  it("exposes the thinking field as a 9-option select defaulting to 'default'", () => {
+    const byKey = Object.fromEntries(getSessionConfigSchema().fields.map((f) => [f.key, f]));
+    const t = byKey.thinking;
+    expect(t.type).toBe("select");
+    expect(t.default).toBe("default");
+    expect(t.options.map((o: { value: string }) => o.value)).toEqual([
+      "default", "off", "auto", "minimal", "low", "medium", "high", "xhigh", "max",
+    ]);
+  });
+});
+
+describe("validThinkingLevel", () => {
+  it("accepts the omp CLI thinking levels", () => {
+    expect(validThinkingLevel("medium")).toBe("medium");
+    expect(validThinkingLevel("off")).toBe("off");
+    expect(validThinkingLevel("auto")).toBe("auto");
+    expect(validThinkingLevel("minimal")).toBe("minimal");
+    expect(validThinkingLevel("low")).toBe("low");
+    expect(validThinkingLevel("high")).toBe("high");
+    expect(validThinkingLevel("xhigh")).toBe("xhigh");
+    expect(validThinkingLevel("max")).toBe("max");
+  });
+  it("trims padded values from the API", () => {
+    expect(validThinkingLevel(" medium ")).toBe("medium");
+    expect(validThinkingLevel("  high  ")).toBe("high");
+    expect(validThinkingLevel("  ")).toBeNull();
+  });
+});
+
+describe("validateThinkingLevel", () => {
+  it("returns null for a set, valid thinking level", () => {
+    expect(validateThinkingLevel({ thinking: "low" })).toBeNull();
+  });
+  it("returns null when thinking is unset or the default sentinel", () => {
+    expect(validateThinkingLevel({})).toBeNull();
+    expect(validateThinkingLevel({ thinking: "default" })).toBeNull();
+  });
+  it("returns an actionable message for an out-of-enum value", () => {
+    const msg = validateThinkingLevel({ thinking: "bogus" });
+    expect(msg).toMatch(/bogus/);
+    expect(msg).toMatch(/off, auto, minimal, low, medium, high, xhigh, max/);
   });
 });
 
