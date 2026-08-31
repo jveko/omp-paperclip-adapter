@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getSessionConfigSchema, paperclipApiBase, readSessionIntelConfig, resolveRunDirective } from "./session-directives.js";
+import { getSessionConfigSchema, paperclipApiBase, readSessionIntelConfig, resolveRunDirective, validateCredentialMode } from "./session-directives.js";
 
 describe("readSessionIntelConfig", () => {
   it("defaults browser on and everything else off", () => {
@@ -60,16 +60,48 @@ describe("resolveRunDirective", () => {
 });
 
 describe("getSessionConfigSchema", () => {
-  it("exposes the six session fields with next-run hints", () => {
+  it("exposes the session fields in order with next-run hints", () => {
     const schema = getSessionConfigSchema();
     const keys = schema.fields.map((f) => f.key);
     expect(keys).toEqual([
       "sessionBrowser", "sessionForceFreshToken", "sessionForkSourceId",
       "sessionForkToken", "sessionMaxRuns", "sessionMaxAgeHours",
+      "credentialMode", "fallbackChain", "usageReport",
     ]);
     for (const field of schema.fields) expect(field.hint).toContain("next run");
   });
+  it("exposes the v0.5 fields with correct types/defaults", () => {
+    const byKey = Object.fromEntries(getSessionConfigSchema().fields.map((f) => [f.key, f]));
+    expect(byKey.credentialMode.type).toBe("select");
+    expect(byKey.credentialMode.default).toBe("local");
+    expect(byKey.fallbackChain.type).toBe("textarea");
+    expect(byKey.usageReport.type).toBe("toggle");
+    expect(byKey.usageReport.default).toBe(true);
+  });
 });
+
+describe("validateCredentialMode", () => {
+  it("passes for local mode", () => {
+    expect(validateCredentialMode({ credentialMode: "local" })).toBeNull();
+  });
+  it("passes for broker mode with resolved string env", () => {
+    expect(validateCredentialMode({
+      credentialMode: "broker",
+      env: { OMP_AUTH_BROKER_URL: "http://b:8765", OMP_AUTH_BROKER_TOKEN: "tok" },
+    })).toBeNull();
+  });
+  it("returns an actionable error when broker mode lacks url or token", () => {
+    expect(validateCredentialMode({
+      credentialMode: "broker",
+      env: { OMP_AUTH_BROKER_URL: "http://b:8765" },
+    })).toMatch(/OMP_AUTH_BROKER_TOKEN/);
+    expect(validateCredentialMode({
+      credentialMode: "broker",
+      env: {},
+    })).toMatch(/OMP_AUTH_BROKER_URL/);
+  });
+});
+
 describe("paperclipApiBase", () => {
   it("defaults to 127.0.0.1:3100 when PAPERCLIP_LISTEN_PORT is empty", () => {
     expect(paperclipApiBase({ PAPERCLIP_LISTEN_PORT: "" })).toBe("http://127.0.0.1:3100");

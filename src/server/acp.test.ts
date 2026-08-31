@@ -94,6 +94,14 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     } }));
     expect(executorFn.mock.calls[0][0].runtime.sessionParams).toMatchObject({ acpSessionId: "fork-1" });
   });
+  it("fails the run early when broker mode lacks env", async () => {
+    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "x", sessionKey: "sk" } });
+    const run = createOmpAcpExecutor();
+    const res = await run(baseCtx({ config: { command: `${process.execPath} ${fakeAcp}`, credentialMode: "broker", env: {} } }));
+    expect(res.errorCode).toBe("omp_config_error");
+    expect(res.errorMessage).toMatch(/OMP_AUTH_BROKER_URL/);
+    expect(engineMocks.createAcpxEngineExecutor.mock.calls.length).toBe(0); // engine never invoked
+  });
 
   it("marks the fork token consumed only when the fork id round-trips", async () => {
     fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });

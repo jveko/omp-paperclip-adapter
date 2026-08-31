@@ -80,9 +80,29 @@ export function getSessionConfigSchema(): AdapterConfigSchema {
         hint: `0 disables. Rotate (fresh session) after N runs on the same session. ${NEXT_RUN}` },
       { key: "sessionMaxAgeHours", label: "Rotate session older than (hours)", type: "number", default: 0,
         hint: `0 disables. Rotate when the current session is older than this. ${NEXT_RUN}` },
+      { key: "credentialMode", label: "Credential mode", type: "select", default: "local", options: [{ label: "Local", value: "local" }, { label: "Broker", value: "broker" }],
+        hint: `Consumption-only: operator runs 'omp auth-broker serve' and binds the token via secret_ref. ${NEXT_RUN}` },
+      { key: "fallbackChain", label: "Model fallback chain", type: "textarea",
+        hint: `One selector per line, injected via PI_CONFIG_FILES. ${NEXT_RUN}` },
+      { key: "usageReport", label: "Emit usage report", type: "toggle", default: true,
+        hint: `Emit an omp-usage work product with cost estimates. ${NEXT_RUN}` },
     ],
   };
 }
+
+/** Actionable message when broker mode is misconfigured, else null. Mirrors omp's
+ * fail-closed resolveAuthBrokerConfig (discover.ts:217-222). config.env values are
+ * already resolved strings (see plan precondition). */
+export function validateCredentialMode(config: Record<string, unknown>): string | null {
+  if (config.credentialMode !== "broker") return null;
+  const env = (config.env ?? {}) as Record<string, unknown>;
+  const url = typeof env.OMP_AUTH_BROKER_URL === "string" && env.OMP_AUTH_BROKER_URL;
+  const token = typeof env.OMP_AUTH_BROKER_TOKEN === "string" && env.OMP_AUTH_BROKER_TOKEN;
+  if (!url) return "credentialMode is 'broker' but OMP_AUTH_BROKER_URL is not set in the agent env.";
+  if (!token) return "credentialMode is 'broker' but OMP_AUTH_BROKER_TOKEN is not set in the agent env (bind it to a company secret via secret_ref).";
+  return null;
+}
+
 
 import type { OmpSessionsSnapshot } from "./session-intel.js";
 

@@ -46,3 +46,75 @@ describe("testEnvironment version-probe env threading", () => {
     expect(opts.env?.OMP_AUTH_BROKER_TOKEN).toBe("tok");
   });
 });
+
+describe("testEnvironment multi-token command probes", () => {
+  beforeEach(() => {
+    execFileMock.mockReset();
+    execFileMock.mockImplementation((_c, _a, _o, cb) => cb(null, "omp/18.0.5"));
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it("runs --version and auth-broker status through the full resolved command", async () => {
+    // A trailing `acp` is stripped so non-ACP subcommands are appended to the
+    // wrapper invocation rather than argv[0]-only.
+    execFileMock
+      .mockImplementationOnce((_c, _a, _o, cb) => cb(null, "omp/18.0.5"))
+      .mockImplementationOnce((_c, _a, _o, cb) => cb(null, '{"ok":true,"url":"http://b:8765","version":"18"}'));
+    await testEnvironment(envTestCtx({
+      credentialMode: "broker",
+      agentCommand: "mise x omp -- acp",
+      env: { OMP_AUTH_BROKER_URL: "http://b:8765", OMP_AUTH_BROKER_TOKEN: "tok" },
+    }));
+    const calls = execFileMock.mock.calls;
+    expect(calls[0][0]).toBe("mise");
+    expect(calls[0][1]).toEqual(["x", "omp", "--", "--version"]);
+    expect(calls[1][0]).toBe("mise");
+    expect(calls[1][1]).toEqual(["x", "omp", "--", "auth-broker", "status", "--json"]);
+  });
+});
+
+describe("testEnvironment broker-status parsing", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("reports a reachable broker check (info) when status returns ok", async () => {
+    execFileMock
+      .mockImplementationOnce((_c, _a, _o, cb) => cb(null, "omp/18.0.5"))
+      .mockImplementationOnce((_c, _a, _o, cb) => cb(null, '{"url":"http://b:8765","ok":true,"version":"18"}'));
+    const res = await testEnvironment(envTestCtx({
+      credentialMode: "broker",
+      env: { OMP_AUTH_BROKER_URL: "http://b:8765", OMP_AUTH_BROKER_TOKEN: "tok" },
+    }));
+    const check = res.checks.find((c) => c.code === "omp_broker_reachable");
+    expect(check).toBeTruthy();
+    expect(check!.level).toBe("info");
+    expect(check!.detail).toContain("http://b:8765");
+  });
+
+  it("reports an unreachable broker check (warn) when not configured", async () => {
+    execFileMock
+      .mockImplementationOnce((_c, _a, _o, cb) => cb(null, "omp/18.0.5"))
+      .mockImplementationOnce((_c, _a, _o, cb) => cb(null, '{"ok":false,"reason":"not_configured"}'));
+    const res = await testEnvironment(envTestCtx({
+      credentialMode: "broker",
+      env: { OMP_AUTH_BROKER_URL: "http://b:8765", OMP_AUTH_BROKER_TOKEN: "tok" },
+    }));
+    const check = res.checks.find((c) => c.code === "omp_broker_unreachable");
+    expect(check).toBeTruthy();
+    expect(check!.level).toBe("warn");
+  });
+
+  it("keeps the broker error in detail (not 'no output') when status reports connection refused", async () => {
+    execFileMock
+      .mockImplementationOnce((_c, _a, _o, cb) => cb(null, "omp/18.0.5"))
+      .mockImplementationOnce((_c, _a, _o, cb) => cb(null, '{"ok":false,"url":"http://b:8765","error":"connection refused"}'));
+    const res = await testEnvironment(envTestCtx({
+      credentialMode: "broker",
+      env: { OMP_AUTH_BROKER_URL: "http://b:8765", OMP_AUTH_BROKER_TOKEN: "tok" },
+    }));
+    const check = res.checks.find((c) => c.code === "omp_broker_unreachable");
+    expect(check).toBeTruthy();
+    expect(check!.level).toBe("warn");
+    expect(check!.detail).toContain("connection refused");
+    expect(check!.detail).not.toContain("no output");
+  });
+});

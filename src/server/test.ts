@@ -29,6 +29,10 @@ export async function testEnvironment(
   const tokens = agentCommand.split(/\s+/);
   const bin = tokens[0];
   const acpArgs = tokens.slice(1);
+  // Non-ACP subcommands (--version, auth-broker status) run through the full
+  // resolved command with a trailing `acp` stripped, so a multi-token wrapper
+  // (e.g. `mise x omp -- acp`) probes as `mise x omp -- --version`.
+  const base = tokens[tokens.length - 1] === "acp" ? tokens.slice(0, -1) : tokens;
 
   // 1. cwd absolute + accessible
   try {
@@ -69,7 +73,7 @@ export async function testEnvironment(
   }
 
   const spawnEnv = ompEnv({ config });
-  const versionOut = await run(bin, ["--version"], 10_000, spawnEnv);
+  const versionOut = await run(base[0], [...base.slice(1), "--version"], 10_000, spawnEnv);
   const version = parseOmpVersion(versionOut);
   if (version) {
     checks.push({
@@ -118,6 +122,15 @@ export async function testEnvironment(
       code: "omp_billing_unknown",
       message: `OMP_PAPERCLIP_BILLING_TYPE='${rawBilling}' unknown; falling back to api`,
     });
+  }
+  // 6. broker health (credentialMode=broker)
+  if (config.credentialMode === "broker") {
+    const stdout = await run(base[0], [...base.slice(1), "auth-broker", "status", "--json"], 10_000, spawnEnv);
+    let reachable = false;
+    try { const j = JSON.parse(stdout); reachable = j.ok !== false && (typeof j.url === "string" || j.reason !== "not_configured"); } catch { /* keep false */ }
+    checks.push(reachable
+      ? { level: "info", code: "omp_broker_reachable", message: "auth-broker reachable", detail: stdout.slice(0, 200) }
+      : { level: "warn", code: "omp_broker_unreachable", message: "credentialMode=broker but `omp auth-broker status` did not report a reachable broker", detail: stdout.slice(0, 200) || "no output" });
   }
 
   return {

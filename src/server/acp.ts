@@ -39,7 +39,7 @@ import {
 } from "./session-state.js";
 import {
   buildSessionSnapshotWorkProduct, postWorkProduct,
-  readSessionIntelConfig, resolveRunDirective,
+  readSessionIntelConfig, resolveRunDirective, validateCredentialMode,
 } from "./session-directives.js";
 
 export const DEFAULT_OMP_COMMAND = "omp";
@@ -353,6 +353,13 @@ type OmpAcpExecutor = (ctx: AdapterExecutionContext) => Promise<AdapterExecution
 export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAcpExecutor {
   let executor: OmpAcpExecutor | null = null;
   return async (ctx) => {
+    // Fail closed: broker credentialMode demands a resolved broker url+token.
+    // Return before any engine work so a misconfigured agent never runs a
+    // half-configured session.
+    const credErr = validateCredentialMode(ctx.config);
+    if (credErr) {
+      return { exitCode: 1, signal: null, timedOut: false, errorCode: "omp_config_error", errorMessage: credErr };
+    }
     if (!executor) {
       // Lazy by design: the acpx engine (and its transitive CLI deps) must not
       // load until a run actually executes, so probe-only imports stay cheap.
