@@ -19,6 +19,43 @@ function run(command: string, args: string[], timeoutMs: number, env?: Record<st
       (_err, stdout) => resolve(String(stdout ?? "")));
   });
 }
+/** Copy only the OTEL_EXPORTER_OTLP_* string vars from a source env dict. */
+function pickOtel(src: Record<string, unknown> | undefined): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (!src) return out;
+  for (const [k, v] of Object.entries(src)) {
+    if (k.startsWith("OTEL_EXPORTER_OTLP_") && typeof v === "string") out[k] = v;
+  }
+  return out;
+}
+export function evaluateOtlpCheck(env: Record<string, unknown>): AdapterEnvironmentCheck {
+  const signals = ["", "TRACES_", "LOGS_", "METRICS_"] as const;
+  const endpoints = signals
+    .map((s) => env[`OTEL_EXPORTER_OTLP_${s}ENDPOINT`])
+    .filter((v): v is string => typeof v === "string" && v.length > 0);
+  if (endpoints.length === 0) {
+    return { level: "info", code: "omp_otlp_export_off", message: "OTLP export not configured (set OTEL_EXPORTER_OTLP_ENDPOINT or a signal-specific ..._ENDPOINT in agent env; agent env overrides host env)" };
+  }
+  const genericProtocol =
+    typeof env.OTEL_EXPORTER_OTLP_PROTOCOL === "string" && env.OTEL_EXPORTER_OTLP_PROTOCOL
+      ? (env.OTEL_EXPORTER_OTLP_PROTOCOL as string)
+      : "http/protobuf";
+  const effective = (sig: string): string => {
+    const proto = env[`OTEL_EXPORTER_OTLP_${sig}PROTOCOL`];
+    return typeof proto === "string" && proto ? proto : genericProtocol;
+  };
+  const unsupported = signals
+    .filter((s) => effective(s) !== "http/protobuf")
+    .map((s) => (s ? s.slice(0, -1).toLowerCase() : "default"));
+  if (unsupported.length > 0) {
+    return {
+      level: "warn", code: "omp_otlp_protocol_unsupported",
+      message: `OTLP endpoint set but protocol(s) unsupported for: ${unsupported.join(", ")}`,
+      detail: "omp emits only http/protobuf; other values silently disable that signal (telemetry-export-otlp.ts:8-12).",
+    };
+  }
+  return { level: "info", code: "omp_otlp_export_armed", message: `OTLP export armed → ${endpoints.join(", ")}`, detail: "omp emits traces/metrics/logs; Paperclip has no built-in sink — point at an external collector." };
+}
 
 export async function testEnvironment(
   ctx: AdapterEnvironmentTestContext,
@@ -132,6 +169,8 @@ export async function testEnvironment(
       ? { level: "info", code: "omp_broker_reachable", message: "auth-broker reachable", detail: stdout.slice(0, 200) }
       : { level: "warn", code: "omp_broker_unreachable", message: "credentialMode=broker but `omp auth-broker status` did not report a reachable broker", detail: stdout.slice(0, 200) || "no output" });
   }
+  // 7. OTLP export diagnostic (agent env overrides host env)
+  checks.push(evaluateOtlpCheck({ ...pickOtel(process.env), ...pickOtel(env) }));
 
   return {
     adapterType: ctx.adapterType,

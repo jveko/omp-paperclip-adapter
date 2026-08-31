@@ -20,6 +20,7 @@ import {
 import { runWithFreshSessionRetry, withRetryChain } from "./retry.js";
 import * as sessionState from "./session-state.js";
 import { loadState, saveState, sessionIntelDir } from "./session-state.js";
+import { FAILOVER_CONFIG_FILE } from "./failover-config.js";
 
 const engineMocks = vi.hoisted(() => ({
   createAcpxEngineExecutor: vi.fn(),
@@ -94,6 +95,22 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     } }));
     expect(executorFn.mock.calls[0][0].runtime.sessionParams).toMatchObject({ acpSessionId: "fork-1" });
   });
+  it("fork run with fallbackChain still carries PI_CONFIG_FILES (overlay folded into config before engineConfig)", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
+    const run = createOmpAcpExecutor();
+    await run(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, sessionForkSourceId: "sess-a", sessionForkToken: "t1", fallbackChain: "brokerco/main\nbrokerco/fast" },
+    }));
+    const merged = executorFn.mock.calls[0][0];
+    expect(merged.config.warmHandleIdleMs).toBe(50); // fork override applied
+    // The fork branch rebuilds engineConfig as { ...config, warmHandleIdleMs: 50 };
+    // PI_CONFIG_FILES must ride on config (not be added to engineConfig after),
+    // so it survives the fork spread.
+    expect(merged.config.env?.PI_CONFIG_FILES).toBe(
+      path.join(sessionIntelDir("co-1", "agent-1"), FAILOVER_CONFIG_FILE),
+    );
+  });
+
   it("fails the run early when broker mode lacks env", async () => {
     fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "x", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();

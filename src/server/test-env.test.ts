@@ -118,3 +118,13 @@ describe("testEnvironment broker-status parsing", () => {
     expect(check!.detail).not.toContain("no output");
   });
 });
+
+describe("testEnvironment OTLP diagnostic", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("emits an OTLP export diagnostic check", async () => {
+    execFileMock.mockImplementationOnce((_c, _a, _o, cb) => cb(null, "omp/18.0.5"));
+    const res = await testEnvironment(envTestCtx({}));
+    expect(res.checks.some((c) => c.code === "omp_otlp_export_off" || c.code === "omp_otlp_export_armed")).toBe(true);
+  });
+});

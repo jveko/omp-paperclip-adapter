@@ -31,8 +31,9 @@ import {
 } from "./models.js";
 import { buildSkillsInstructions, skillsDir, type SkillMarkdownSource } from "./skills.js";
 import { readRetryConfig, runWithFreshSessionRetry, withRetryChain } from "./retry.js";
-import { forkOmpSession, queryOmpSessions } from "./session-intel.js";
+import { materializeFailoverOverlay } from "./failover-config.js";
 import { ompEnv } from "./omp-env.js";
+import { forkOmpSession, queryOmpSessions } from "./session-intel.js";
 import {
   bumpRunCounter, consumeToken, loadState, rotateIfTripped, saveState,
   sessionIntelDir, snapshotDigest,
@@ -380,7 +381,19 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     // closure, so probe-only paths never spawn `omp models`. The fetch is
     // skipped when no model is configured — a broken/missing `omp` would
     // otherwise add up to 20s of uncached failure latency per run.
-    const sideChannelEnv = ompEnv({ config: ctx.config });
+    const failoverOverlay = await materializeFailoverOverlay(
+      ctx.config,
+      sessionIntelDir(ctx.agent.companyId, ctx.agent.id),
+    );
+    const failoverOverlayPath =
+      failoverOverlay.status === "ok" ? failoverOverlay.path : null;
+    if (failoverOverlay.status === "error") {
+      await ctx.onEvent?.({
+        eventType: "run.system", stream: "system", level: "warn",
+        message: `omp failover overlay write failed: ${failoverOverlay.error}; continuing without PI_CONFIG_FILES`,
+      });
+    }
+    const sideChannelEnv = ompEnv({ config: ctx.config, overlayPath: failoverOverlayPath });
     const ompTokens = resolveOmpAgentCommand(ctx.config).split(/\s+/);
     // The resolved agent command may be multi-token (e.g. `node fake-acp.mjs`
     // or `mise x omp -- acp`). Strip a trailing `acp` so the catalog runs the
@@ -398,6 +411,17 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     const resolveCost = (model: string): OmpModelCost | null =>
       models.find((m) => m.id === model)?.cost ?? null;
     const config = buildOmpAcpConfig(ctx.config, resolveModel, resolveCost);
+    // Fold the failover overlay into config BEFORE engineConfig is derived: the
+    // fork branch rebuilds engineConfig as { ...config, warmHandleIdleMs: 50 },
+    // so an overlay added only to engineConfig would be silently dropped by the
+    if (failoverOverlayPath) {
+      const operatorPi =
+        typeof (ctx.config.env as Record<string, unknown> | undefined)?.PI_CONFIG_FILES === "string"
+          ? (ctx.config.env as Record<string, unknown>).PI_CONFIG_FILES as string
+          : "";
+      const mergedPi = [operatorPi, failoverOverlayPath].filter(Boolean).join(path.delimiter);
+      if (mergedPi) config.env = { ...(config.env ?? {}), PI_CONFIG_FILES: mergedPi };
+    }
     // Ephemeral skills: materialize the merged instructions file (skills +
     // user instructions) so the engine injects it into this run. The merged
     // file always carries the user's content when present, so the path is set

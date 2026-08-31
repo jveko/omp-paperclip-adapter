@@ -1,3 +1,4 @@
+import path from "node:path";
 /**
  * Assemble the environment every omp process must carry so the run's ACP child
  * and the side-channel spawns (model catalog, active-model probe, fork, session
@@ -24,6 +25,7 @@ export function ompEnv(
   for (const [k, v] of Object.entries(src)) {
     if (k.startsWith("OTEL_EXPORTER_OTLP_") && typeof v === "string") env[k] = v;
   }
-  if (input.overlayPath) env.PI_CONFIG_FILES = input.overlayPath;
+  const parts = [str("PI_CONFIG_FILES"), input.overlayPath].filter(Boolean);
+  if (parts.length) env.PI_CONFIG_FILES = parts.join(path.delimiter);
   return env;
 }

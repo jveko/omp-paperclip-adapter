@@ -8,8 +8,9 @@ import { createOmpAcpExecutor } from "./acp.js";
 // Regression guards for env threading into the fork and session-query side
 // channels. The fork and query call sites in createOmpAcpExecutor must forward
 // the resolved side-channel env (OMP_AUTH_BROKER_URL for broker credential
-// mode). Fork and session-intel are mocked so we can inspect the omp args each
-// receives without spawning real subprocesses.
+// mode, and PI_CONFIG_FILES when a failover fallbackChain is set). Fork and
+// session-intel are mocked so we can inspect the omp args each receives without
+// spawning real subprocesses.
 const mocks = vi.hoisted(() => ({
   forkOmpSession: vi.fn(async () => ({ ok: true, sessionId: "fork-1" })),
   queryOmpSessions: vi.fn(async () => ({
@@ -93,5 +94,17 @@ describe("side-channel env threading", () => {
     const ompArg = mocks.queryOmpSessions.mock.calls[0][0] as { env?: Record<string, string> };
     expect(ompArg.env?.OMP_AUTH_BROKER_URL).toBe("http://b:8765");
     expect(ompArg.env?.OMP_AUTH_BROKER_TOKEN).toBe("tok");
+  });
+
+  it("forwards the failover overlay (PI_CONFIG_FILES) into the fork side channel when fallbackChain is set", async () => {
+    const executor = vi.fn(async () => ({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } }));
+    mocks.createAcpxEngineExecutor.mockReturnValue(executor);
+    const run = createOmpAcpExecutor();
+    await run(baseCtx({
+      config: { command: "omp", sessionForkSourceId: "sess-a", sessionForkToken: "t-overlay", fallbackChain: "brokerco/main\nbrokerco/fast" },
+    }));
+    expect(mocks.forkOmpSession).toHaveBeenCalledTimes(1);
+    const ompArg = mocks.forkOmpSession.mock.calls[0][0] as { env?: Record<string, string> };
+    expect(ompArg.env?.PI_CONFIG_FILES).toBeTruthy();
   });
 });
