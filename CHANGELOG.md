@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.6.0 — 2026-08-31
+
+Fleet control: per-agent runtime directives over the omp child, adapter-local and unblocked.
+
+- **Thinking directive** — a `thinking` board field forwards omp's `--thinking <level>` to the run's
+  omp child via `agentCommand`. Chosen over the config overlay (a silent no-op: fixed filename → no
+  fingerprint change, and omp restores the transcript's stored level on resume) and over ACP
+  `set_config_option` (the engine sends the wrong key, `effort`, which omp rejects). Because
+  `agentCommand` is inside the run fingerprint, **changing the level rotates the session** so the new
+  level applies; it is a documented no-op on resumed and fork runs (needs an upstream engine seam).
+- **Effort-key strip** — `buildOmpAcpConfig` now also drops `reasoningEffort`/`modelReasoningEffort`
+  (the engine reads four effort keys; a stray value made it send `key: "effort"` and abort the run).
+- **Token-split fix** — the catalog, `--version`, and broker-health probes extract the command base by
+  `indexOf("acp")` instead of stripping a trailing `acp`, so a `--thinking`-bearing `agentCommand` no
+  longer mangles those probes into starting an ACP server.
+- **Worktree side-channel cwd** — the fork/query session cwd now mirrors the engine's precedence
+  (`paperclipWorkspace.cwd` → `config.cwd` → stale `storedParams.cwd` → `process.cwd()`), so a
+  `git_worktree` run's session snapshot/fork query the actual worktree, not a stale directory.
+
+Descoped after research: the `auth-gateway` metering proxy (no per-request cost metering — the v0.5
+broker + per-run usage work products already attribute cost per agent), cost-per-heartbeat as a live
+board field (`getConfigSchema` is context-free), and the `mode` knob (no engine seam). ExtensionAPI
+bridge and the plugin-SDK session panel are deferred to v0.7.
+
+
 ## 0.5.0 — 2026-08-31
 
 Fleet runtime: omp employees become configurable, credential-shared, and observable as a population.

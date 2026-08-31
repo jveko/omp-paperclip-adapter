@@ -162,6 +162,17 @@ Paperclip config. Track upstream; don't build.
 
 ## Completed
 
+- **2026-08-31 — v0.6.0 (Fleet control).** Thinking directive (`--thinking` on `agentCommand`,
+  rotate-on-change; effort-key strip extended to all four engine keys; `indexOf("acp")` token-split
+  for catalog/version/broker probes) and worktree side-channel cwd alignment (mirror the engine's
+  `paperclipWorkspace.cwd` precedence). Adapter-local, no upstream dependency. Item 2 (thinking/model
+  controls) shipped as next-run directives; model path confirmed live. Descoped after research:
+  gateway metering proxy (redundant with v0.5 broker + usage work products), cost-per-heartbeat board
+  field (`getConfigSchema` context-free), `mode` knob (no engine seam). Remaining: plugin-SDK session
+  panel + ExtensionAPI bridge (v0.7), warm process pool (item 8), fork/compaction un-gating (blocked
+  on the cross-run resume fingerprint instability).
+
+
 - **2026-08-31 — v0.5.0 (Fleet runtime).** `ompEnv` env-threading (fixes env-blind side-channel
   credential resolution; per-env catalog cache), `credentialMode: local|broker` (consumption-only,
   fail-closed, secret_ref), per-agent `retry.fallbackChains` via `PI_CONFIG_FILES`, OTLP export
