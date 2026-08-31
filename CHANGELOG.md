@@ -14,6 +14,14 @@ Session runtime: omp employees become inspectable and steerable at the session l
   rotates sessions after configured run-count/age thresholds.
 - Static `sessionManagement` declaration (corrects the compaction-disabled default).
 
+**Known limitations (deployment-gated):** fork-as-action and compaction-rotation depend on
+the engine resuming a session across runs (`canResume` requires a stable session fingerprint).
+On the codan instance the engine's session fingerprint varies run-to-run even with identical
+config/cwd/skills, so cross-run resume does not occur and those two capabilities are
+currently inert there (they are correct in code and activate once resume works). Session
+browser, force-fresh, the governance schema, and the `sessionManagement` declaration are
+verified working. Root cause is engine-side (Paperclip), not the adapter — tracked upstream.
+
 ## 0.1.0 — 2026-08-26
 
 Initial release.
