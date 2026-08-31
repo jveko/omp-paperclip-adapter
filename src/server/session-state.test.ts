@@ -10,6 +10,7 @@ import {
 const emptyState = (): SessionIntelState => ({
   forkConsumed: [], forceFreshConsumed: [], runCounters: {},
   pendingRotate: null, lastSnapshotDigest: null, lastRotation: null,
+  recentRuns: [], lastUsageDigest: null,
 });
 
 describe("session state", () => {
@@ -35,6 +36,48 @@ describe("session state", () => {
     await writeFile(path.join(dir, "state.json"), "{not json", "utf8");
     const loaded = await loadState(dir);
     expect(loaded).toEqual(emptyState());
+  });
+
+  it("round-trips recentRuns including cachedInputTokens", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "omp-intel-"));
+    dirs.push(dir);
+    const state = emptyState();
+    state.recentRuns = [
+      { at: "t", inputTokens: 1000, outputTokens: 100, cachedInputTokens: 500 },
+      { at: "t2", inputTokens: 2000, outputTokens: 200, cachedInputTokens: 0 },
+    ];
+    await saveState(dir, state);
+    const loaded = await loadState(dir);
+    expect(loaded.recentRuns).toEqual(state.recentRuns);
+  });
+
+  it("carries recentRuns and lastUsageDigest with defaults", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "omp-intel-"));
+    dirs.push(dir);
+    const s = await loadState(dir);
+    expect(s.recentRuns).toEqual([]);
+    expect(s.lastUsageDigest).toBeNull();
+  });
+
+  it("filters malformed recentRuns and resets a wrong-typed lastUsageDigest", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "omp-intel-"));
+    dirs.push(dir);
+    await writeFile(
+      path.join(dir, "state.json"),
+      JSON.stringify({
+        recentRuns: [
+          { at: "t", inputTokens: 1, outputTokens: 2 },
+          { at: "t", inputTokens: "nope" },
+          "garbage",
+          null,
+        ],
+        lastUsageDigest: 7,
+      }),
+      "utf8",
+    );
+    const loaded = await loadState(dir);
+    expect(loaded.recentRuns).toEqual([{ at: "t", inputTokens: 1, outputTokens: 2 }]);
+    expect(loaded.lastUsageDigest).toBeNull();
   });
 
   it("resets each field to its default when state.json parses but is wrong-typed", async () => {

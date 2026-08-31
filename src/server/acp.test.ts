@@ -21,10 +21,20 @@ import { runWithFreshSessionRetry, withRetryChain } from "./retry.js";
 import * as sessionState from "./session-state.js";
 import { loadState, saveState, sessionIntelDir } from "./session-state.js";
 import { FAILOVER_CONFIG_FILE } from "./failover-config.js";
-
 const engineMocks = vi.hoisted(() => ({
   createAcpxEngineExecutor: vi.fn(),
 }));
+
+const modelsMocks = vi.hoisted(() => ({
+  listOmpModels: vi.fn(async () => [
+    { id: "prov/m", label: "M", cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } },
+  ]),
+}));
+
+vi.mock("./models.js", async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, listOmpModels: modelsMocks.listOmpModels };
+});
 
 vi.mock("@paperclipai/adapter-utils/acpx-engine/execute", () => ({
   createAcpxEngineExecutor: engineMocks.createAcpxEngineExecutor,
@@ -352,7 +362,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
       const run = createOmpAcpExecutor();
       const ctx = baseCtx({
         authToken: "jwt",
-        config: { command: `${process.execPath} ${fakeAcp}` },
+        config: { command: `${process.execPath} ${fakeAcp}`, usageReport: false },
       });
       // first run: emits
       ctx.context.taskId = "issue-1";
@@ -389,7 +399,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
       const run = createOmpAcpExecutor();
       const ctx = baseCtx({
         authToken: "jwt",
-        config: { command: `${process.execPath} ${fakeAcp}` },
+        config: { command: `${process.execPath} ${fakeAcp}`, usageReport: false },
         onEvent: async (ev: { message: string }) => { events.push(ev); },
       });
       ctx.context.taskId = "issue-1";
@@ -434,7 +444,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
       const run = createOmpAcpExecutor();
       const ctx = baseCtx({
         authToken: "jwt",
-        config: { command: `${process.execPath} ${fakeAcp}` },
+        config: { command: `${process.execPath} ${fakeAcp}`, usageReport: false },
         onEvent: async (ev: { message: string }) => { events.push(ev); },
       });
       ctx.context.taskId = "issue-1";
@@ -461,6 +471,179 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
       vi.unstubAllEnvs();
     }
   });
+
+  it("emits an omp-usage report once and suppresses an identical second run", async () => {
+    const posts: Array<{ url: string; body: unknown }> = [];
+    const server = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => { body += c; });
+      req.on("end", () => {
+        posts.push({ url: req.url ?? "", body: JSON.parse(body) });
+        res.end(JSON.stringify({ id: "wp" }));
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const addr = server.address();
+    const port = typeof addr === "object" && addr !== null && "port" in addr ? addr.port : 0;
+    try {
+      // local mode (no broker): reports=[], cost from result.usage (via recentRuns mean);
+      // two runs with identical usage -> the digest bucket is unchanged -> one post.
+      fakeEngine({ exitCode: 0, usage: { inputTokens: 1000, outputTokens: 100 }, usageBasis: "per_run", sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+      const run = createOmpAcpExecutor();
+      const ctx = baseCtx({
+        authToken: "jwt",
+        config: { command: `${process.execPath} ${fakeAcp}`, usageReport: true, sessionBrowser: false },
+      });
+      ctx.context.taskId = "issue-1";
+      vi.stubEnv("PAPERCLIP_API_URL", `http://127.0.0.1:${port}`);
+      await run(ctx);
+      const usagePosts = () => posts.filter((p) => (p.body as { provider?: string } | null)?.provider === "omp-usage");
+      expect(usagePosts()).toHaveLength(1);
+      // second run: identical usage -> digest unchanged -> suppressed
+      await run(ctx);
+      expect(usagePosts()).toHaveLength(1);
+    } finally {
+      server.close();
+      server.closeAllConnections();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("local mode does not call the broker", async () => {
+    const urls: string[] = [];
+    const server = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => { body += c; });
+      req.on("end", () => {
+        urls.push(req.url ?? "");
+        res.end(JSON.stringify({ id: "wp" }));
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const addr = server.address();
+    const port = typeof addr === "object" && addr !== null && "port" in addr ? addr.port : 0;
+    try {
+      fakeEngine({ exitCode: 0, usage: { inputTokens: 1000, outputTokens: 100 }, usageBasis: "per_run", sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+      const run = createOmpAcpExecutor();
+      const ctx = baseCtx({
+        authToken: "jwt",
+        config: { command: `${process.execPath} ${fakeAcp}`, credentialMode: "local",
+          usageReport: true, sessionBrowser: false,
+          env: { OMP_AUTH_BROKER_URL: `http://127.0.0.1:${port}`, OMP_AUTH_BROKER_TOKEN: "tok" } },
+      });
+      ctx.context.taskId = "issue-1";
+      vi.stubEnv("PAPERCLIP_API_URL", `http://127.0.0.1:${port}`);
+      await run(ctx);
+      // fetchBrokerUsage is only invoked in broker mode: even with broker env
+      // set, local mode must NOT call /v1/usage.
+      expect(urls.some((u) => u.includes("/v1/usage"))).toBe(false);
+      // cost-only report still emitted to the work-products route.
+      expect(urls.some((u) => u.includes("work-products"))).toBe(true);
+    } finally {
+      server.close();
+      server.closeAllConnections();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("usage POST failure: warn emitted, digest not updated, retried next run", async () => {
+    let postCount = 0;
+    const server = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => { body += c; });
+      req.on("end", () => {
+        postCount += 1;
+        if (postCount === 1) {
+          res.statusCode = 500;
+          res.end("Internal Server Error");
+        } else {
+          res.end(JSON.stringify({ id: "wp" }));
+        }
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const addr = server.address();
+    const port = typeof addr === "object" && addr !== null && "port" in addr ? addr.port : 0;
+    try {
+      const executorFn = fakeEngine({ exitCode: 0, usage: { inputTokens: 1000, outputTokens: 100, cachedInputTokens: 0 }, usageBasis: "per_run", sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+      const events: Array<{ message: string }> = [];
+      const run = createOmpAcpExecutor();
+      const ctx = baseCtx({
+        authToken: "jwt",
+        config: { command: `${process.execPath} ${fakeAcp}`, model: "prov/m", credentialMode: "local", usageReport: true, sessionBrowser: false },
+        onEvent: async (ev: { message: string }) => { events.push(ev); },
+      });
+      ctx.context.taskId = "issue-1";
+      vi.stubEnv("PAPERCLIP_API_URL", `http://127.0.0.1:${port}`);
+      await run(ctx);
+      expect(executorFn).toHaveBeenCalledOnce();
+      const emitWarn = events.find((e) => e.message.includes("usage report emission failed"));
+      expect(emitWarn).toBeTruthy();
+      expect(emitWarn!.message).toContain("HTTP 500");
+      const state = await loadState(sessionIntelDir("co-1", "agent-1"));
+      expect(state.lastUsageDigest).toBeFalsy();
+      events.length = 0;
+      await run(ctx);
+      expect(executorFn).toHaveBeenCalledTimes(2);
+      expect(events.some((e) => e.message.includes("usage report emission failed"))).toBe(false);
+      const state2 = await loadState(sessionIntelDir("co-1", "agent-1"));
+      expect(state2.lastUsageDigest).toBeTruthy();
+    } finally {
+      server.close();
+      server.closeAllConnections();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("cost path: emits $/heartbeat est card, re-emits on digest change, skips session_cumulative append", async () => {
+    const posts: Array<{ url: string; body: unknown }> = [];
+    const server = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => { body += c; });
+      req.on("end", () => {
+        posts.push({ url: req.url ?? "", body: JSON.parse(body) });
+        res.end(JSON.stringify({ id: "wp" }));
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const addr = server.address();
+    const port = typeof addr === "object" && addr !== null && "port" in addr ? addr.port : 0;
+    try {
+      const usagePosts = () => posts.filter((p) => (p.body as { provider?: string } | null)?.provider === "omp-usage");
+      const ctx = baseCtx({
+        authToken: "jwt",
+        config: { command: `${process.execPath} ${fakeAcp}`, model: "prov/m", credentialMode: "local", usageReport: true, sessionBrowser: false },
+      });
+      ctx.context.taskId = "issue-1";
+      vi.stubEnv("PAPERCLIP_API_URL", `http://127.0.0.1:${port}`);
+      // run 1: emits a cost card ($ + /heartbeat est.)
+      fakeEngine({ exitCode: 0, usage: { inputTokens: 1000, outputTokens: 100, cachedInputTokens: 500 }, usageBasis: "per_run", sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+      await createOmpAcpExecutor()(ctx);
+      expect(usagePosts()).toHaveLength(1);
+      const summary = (usagePosts()[0].body as { summary?: string }).summary ?? "";
+      expect(summary).toContain("$");
+      expect(summary).toContain("/heartbeat est.");
+      // run 2: identical usage -> digest unchanged -> suppressed
+      fakeEngine({ exitCode: 0, usage: { inputTokens: 1000, outputTokens: 100, cachedInputTokens: 500 }, usageBasis: "per_run", sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+      await createOmpAcpExecutor()(ctx);
+      expect(usagePosts()).toHaveLength(1);
+      // run 3: DIFFERENT usage -> digest changes -> second card
+      fakeEngine({ exitCode: 0, usage: { inputTokens: 9000, outputTokens: 900, cachedInputTokens: 500 }, usageBasis: "per_run", sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+      await createOmpAcpExecutor()(ctx);
+      expect(usagePosts()).toHaveLength(2);
+      // session_cumulative run: does NOT append to recentRuns
+      const before = (await loadState(sessionIntelDir("co-1", "agent-1"))).recentRuns.length;
+      fakeEngine({ exitCode: 0, usage: { inputTokens: 99999, outputTokens: 9999, cachedInputTokens: 9999 }, usageBasis: "session_cumulative", sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+      await createOmpAcpExecutor()(ctx);
+      const after = (await loadState(sessionIntelDir("co-1", "agent-1"))).recentRuns.length;
+      expect(after).toBe(before);
+    } finally {
+      server.close();
+      server.closeAllConnections();
+      vi.unstubAllEnvs();
+    }
+  });
+
 });
 
 describe("resolveOmpAgentCommand", () => {

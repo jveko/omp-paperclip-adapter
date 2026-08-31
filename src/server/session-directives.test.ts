@@ -2,11 +2,11 @@ import { describe, expect, it } from "vitest";
 import { getSessionConfigSchema, paperclipApiBase, readSessionIntelConfig, resolveRunDirective, validateCredentialMode } from "./session-directives.js";
 
 describe("readSessionIntelConfig", () => {
-  it("defaults browser on and everything else off", () => {
+  it("defaults browser on, usage report on, everything else off", () => {
     const cfg = readSessionIntelConfig({});
     expect(cfg).toEqual({
       browser: true, forkSourceId: "", forkToken: "",
-      forceFreshToken: "", maxRuns: 0, maxAgeHours: 0,
+      forceFreshToken: "", maxRuns: 0, maxAgeHours: 0, usageReport: true,
     });
   });
   it("reads typed values and tolerates garbage", () => {
@@ -17,15 +17,20 @@ describe("readSessionIntelConfig", () => {
       sessionForceFreshToken: "ff-1",
       sessionMaxRuns: "5",
       sessionMaxAgeHours: "bogus",
+      usageReport: false,
     });
     expect(cfg.browser).toBe(false);
     expect(cfg.forkSourceId).toBe("sess-1");
     expect(cfg.maxRuns).toBe(5);
     expect(cfg.maxAgeHours).toBe(0);
+    expect(cfg.usageReport).toBe(false);
   });
   it("treats the string 'false' as off for sessionBrowser", () => {
     const cfg = readSessionIntelConfig({ sessionBrowser: "false" });
     expect(cfg.browser).toBe(false);
+  });
+  it("treats 'false' as off for usageReport", () => {
+    expect(readSessionIntelConfig({ usageReport: "false" }).usageReport).toBe(false);
   });
 });
 

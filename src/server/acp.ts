@@ -39,6 +39,9 @@ import {
   sessionIntelDir, snapshotDigest,
 } from "./session-state.js";
 import {
+  buildUsageWorkProduct, estimateCostPerHeartbeat, fetchBrokerUsage, usageDigest,
+} from "./usage-report.js";
+import {
   buildSessionSnapshotWorkProduct, postWorkProduct,
   readSessionIntelConfig, resolveRunDirective, validateCredentialMode,
 } from "./session-directives.js";
@@ -570,7 +573,50 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     }
     await persistState();
 
+    const runUsage = result.usage;
+    if (runUsage && result.usageBasis !== "session_cumulative"
+      && typeof runUsage.inputTokens === "number" && typeof runUsage.outputTokens === "number") {
+      intelState.recentRuns = [...intelState.recentRuns, {
+        at: nowIso,
+        inputTokens: runUsage.inputTokens,
+        outputTokens: runUsage.outputTokens,
+        cachedInputTokens: typeof runUsage.cachedInputTokens === "number" ? runUsage.cachedInputTokens : 0,
+      }].slice(-20);
+    }
+    await persistState();
+
     const issueId = typeof ctx.context.taskId === "string" ? ctx.context.taskId : "";
+    if (intel.usageReport && issueId) {
+      const cfgEnv = (ctx.config.env ?? {}) as Record<string, unknown>;
+      const brokerUrl = typeof cfgEnv.OMP_AUTH_BROKER_URL === "string" ? cfgEnv.OMP_AUTH_BROKER_URL : "";
+      const brokerTok = typeof cfgEnv.OMP_AUTH_BROKER_TOKEN === "string" ? cfgEnv.OMP_AUTH_BROKER_TOKEN : "";
+      const usageRes = ctx.config.credentialMode === "broker" && brokerUrl && brokerTok
+        ? await fetchBrokerUsage({ url: brokerUrl, token: brokerTok })
+        : { ok: true as const, reports: [] as unknown[] };
+      const rawModel = firstNonEmptyString(ctx.config.model);
+      const cost = estimateCostPerHeartbeat(intelState.recentRuns, resolveCost(rawModel ? (resolveModel(rawModel) ?? rawModel) : ""));
+      const reports = usageRes.ok ? usageRes.reports : [];
+      if (!usageRes.ok) {
+        await ctx.onEvent?.({
+          eventType: "run.system", stream: "system", level: "warn",
+          message: `omp broker usage unavailable: ${usageRes.error}; emitting cost-only report`,
+        });
+      }
+      const digest = usageDigest(reports, cost);
+      if (digest !== intelState.lastUsageDigest) {
+        const posted = await postWorkProduct({ authToken: ctx.authToken, issueId },
+          buildUsageWorkProduct({ reports, costPerHeartbeatUsd: cost, runId: ctx.runId, capturedAt: nowIso }));
+        if (posted.ok) {
+          intelState.lastUsageDigest = digest;
+          await persistState();
+        } else {
+          await ctx.onEvent?.({
+            eventType: "run.system", stream: "system", level: "warn",
+            message: `omp usage report emission failed: ${posted.error}`,
+          });
+        }
+      }
+    }
     if (intel.browser && issueId) {
       const ompTokens = resolveOmpAgentCommand(ctx.config).split(/\s+/);
       const query = await queryOmpSessions(

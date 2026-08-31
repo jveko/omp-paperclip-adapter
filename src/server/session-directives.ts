@@ -7,6 +7,7 @@ export interface SessionIntelConfig {
   forceFreshToken: string;
   maxRuns: number;
   maxAgeHours: number;
+  usageReport: boolean;
 }
 
 function str(config: Record<string, unknown>, key: string): string {
@@ -28,6 +29,7 @@ export function readSessionIntelConfig(config: Record<string, unknown>): Session
     forceFreshToken: str(config, "sessionForceFreshToken"),
     maxRuns: num(config, "sessionMaxRuns"),
     maxAgeHours: num(config, "sessionMaxAgeHours"),
+    usageReport: config.usageReport !== false && config.usageReport !== "false",
   };
 }
 

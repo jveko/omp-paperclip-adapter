@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
 
 export interface RunCounter { count: number; firstRunAt: string }
+export interface RunUsage { at: string; inputTokens: number; outputTokens: number; cachedInputTokens: number }
 export interface SessionIntelState {
   forkConsumed: string[];
   forceFreshConsumed: string[];
@@ -11,6 +12,8 @@ export interface SessionIntelState {
   pendingRotate: { reason: string; at: string } | null;
   lastSnapshotDigest: string | null;
   lastRotation: { reason: string; at: string; sessionKey: string } | null;
+  recentRuns: RunUsage[];
+  lastUsageDigest: string | null;
 }
 
 const MAX_TOKENS = 64;
@@ -26,6 +29,7 @@ function emptyState(): SessionIntelState {
   return {
     forkConsumed: [], forceFreshConsumed: [], runCounters: {},
     pendingRotate: null, lastSnapshotDigest: null, lastRotation: null,
+    recentRuns: [], lastUsageDigest: null,
   };
 }
 
@@ -41,6 +45,8 @@ export async function loadState(dir: string): Promise<SessionIntelState> {
       pendingRotate: isRotateInfo(parsed.pendingRotate) ? parsed.pendingRotate : base.pendingRotate,
       lastSnapshotDigest: typeof parsed.lastSnapshotDigest === "string" ? parsed.lastSnapshotDigest : base.lastSnapshotDigest,
       lastRotation: isLastRotation(parsed.lastRotation) ? parsed.lastRotation : base.lastRotation,
+      recentRuns: Array.isArray(parsed.recentRuns) ? parsed.recentRuns.filter(isRunUsage).slice(-20) : base.recentRuns,
+      lastUsageDigest: typeof parsed.lastUsageDigest === "string" ? parsed.lastUsageDigest : base.lastUsageDigest,
     };
   } catch {
     return emptyState();
@@ -75,6 +81,16 @@ function isLastRotation(value: unknown): value is { reason: string; at: string; 
     && typeof value.at === "string"
     && "sessionKey" in value
     && typeof value.sessionKey === "string";
+}
+
+function isRunUsage(value: unknown): value is RunUsage {
+  return typeof value === "object" && value !== null
+    && "at" in value
+    && typeof value.at === "string"
+    && "inputTokens" in value
+    && typeof value.inputTokens === "number"
+    && "outputTokens" in value
+    && typeof value.outputTokens === "number";
 }
 
 export async function saveState(dir: string, state: SessionIntelState): Promise<void> {
