@@ -162,6 +162,15 @@ Paperclip config. Track upstream; don't build.
 
 ## Completed
 
+- **2026-08-31 — v0.5.0 (Fleet runtime).** `ompEnv` env-threading (fixes env-blind side-channel
+  credential resolution; per-env catalog cache), `credentialMode: local|broker` (consumption-only,
+  fail-closed, secret_ref), per-agent `retry.fallbackChains` via `PI_CONFIG_FILES`, OTLP export
+  diagnostic (protocol-mismatch warn), MCP HTTP-lane count on the run path, usage & cost work product
+  (broker `/v1/usage` + rate-card estimate incl. cache-read). Items 3/7/10/11 shipped in adapter-local
+  scope. Remaining G2: warm process pool (item 8), gateway metering proxy, plugin-SDK session panel,
+  and fork/compaction un-gating (blocked on the cross-run resume fingerprint instability).
+
+
 - **2026-08-28 — v0.4.0 (Session runtime).** Side-channel session reads (initialize-only),
   fork-as-action via operator config + `sessionParams.acpSessionId` override + per-run
   `warmHandleIdleMs`, compaction rotation (adapter-owned run counters + fingerprint bust),

@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.5.0 — 2026-08-31
+
+Fleet runtime: omp employees become configurable, credential-shared, and observable as a population.
+
+- **`ompEnv` env-threading** — one env map now reaches every omp spawn (the run's ACP child and
+  the previously env-blind side-channel catalog/probe/fork/query/usage calls), fixing a latent bug
+  where a broker-configured agent resolved its catalog and reads against the server's credentials.
+  The model-catalog cache is now keyed per command+env (no cross-agent leak).
+- **`credentialMode: local | broker`** — point an employee at an operator-run `omp auth-broker serve`
+  via `OMP_AUTH_BROKER_URL`/`OMP_AUTH_BROKER_TOKEN` (bound to a company `secret_ref`); fail-closed
+  validation; a `testEnvironment` broker-health probe. Consumption only — the adapter never starts the broker.
+- **Per-agent model-fallback chains** — a `fallbackChain` config field materializes a
+  `retry.fallbackChains` omp overlay injected via `PI_CONFIG_FILES` (omp's native TurnRecovery is
+  default-on but ships pointed at nothing). Appends to any operator `PI_CONFIG_FILES`.
+- **OTLP export diagnostic** — `testEnvironment` reports whether OTLP export is armed and warns on a
+  non-`http/protobuf` protocol (omp emits only http/protobuf; Paperclip has no built-in sink).
+- **MCP HTTP-lane verification** — forwarded MCP server count reported on the run path
+  (`resultJson.sessionRuntime.mcpServerCount`); stdio remains upstream-blocked.
+- **Usage & cost reporting** — an `omp-usage` work product: broker `/v1/usage` (HTTP, no omp session)
+  plus a rate-card × recent-run cost-per-heartbeat estimate (incl. cache-read tokens), digest-deduped.
+
+Deferred (documented): serving-model attribution after native failover (needs an upstream `_omp`
+surface), the `auth-gateway` metering proxy, the plugin-SDK session panel, and fork/compaction
+un-gating (blocked on the cross-run session-resume fingerprint instability — see 0.4.0 note).
+
+
 ## 0.4.0 — 2026-08-28
 
 Session runtime: omp employees become inspectable and steerable at the session level.
