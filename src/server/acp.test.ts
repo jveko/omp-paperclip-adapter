@@ -256,6 +256,61 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     expect(state.pendingRotate).toBeNull();
   });
 
+  it("reports the runtime MCP server count in sessionRuntime on the run path", async () => {
+    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const run = createOmpAcpExecutor();
+    const res = await run(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}` },
+      runtimeMcp: {
+        getServers: () => [
+          { name: "mcp-1", url: "http://mcp:1", token: "t1", connectionId: "c1" },
+        ],
+      },
+    }));
+    // The MCP count rides on the run path (ctx.runtimeMcp is only real on
+    // AdapterExecutionContext, never on the environment-test context).
+    const sessionRuntime = res.resultJson?.sessionRuntime;
+    expect(
+      sessionRuntime && typeof sessionRuntime === "object" && "mcpServerCount" in sessionRuntime
+        ? sessionRuntime.mcpServerCount
+        : undefined,
+    ).toBe(1);
+  });
+
+  it("omits mcpServerCount from sessionRuntime when no MCP servers are present", async () => {
+    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const run = createOmpAcpExecutor();
+    const res = await run(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}` },
+      runtimeMcp: { getServers: () => [] },
+    }));
+    // No fork/rotation/MCP servers -> sessionRuntime stays empty and is not
+    // attached to resultJson at all.
+    const sessionRuntime = res.resultJson?.sessionRuntime;
+    expect(
+      sessionRuntime && typeof sessionRuntime === "object" && "mcpServerCount" in sessionRuntime
+        ? sessionRuntime.mcpServerCount
+        : undefined,
+    ).toBeUndefined();
+    expect(res.resultJson?.sessionRuntime).toBeUndefined();
+  });
+
+  it("records lastRotation into sessionRuntime when compaction trips", async () => {
+    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+    const run = createOmpAcpExecutor();
+    const res = await run(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, sessionMaxRuns: 1 },
+    }));
+    // The run's counter trips maxRuns=1, recording a rotation that must reach
+    // resultJson -> heartbeat_runs (v0.4 spec §3.8 evidence).
+    const sessionRuntime = res.resultJson?.sessionRuntime;
+    expect(
+      sessionRuntime && typeof sessionRuntime === "object" && "lastRotation" in sessionRuntime
+        ? (sessionRuntime.lastRotation as { reason?: string }).reason
+        : undefined,
+    ).toBe("maxRuns");
+  });
+
   it("saveState failure: warn emitted, run still returns the engine result", async () => {
     const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "brand-new", sessionKey: "sk" } });
     const events: Array<{ level?: string; message: string }> = [];

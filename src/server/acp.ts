@@ -618,6 +618,10 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
       };
     }
     if (intelState.lastRotation) sessionRuntime.lastRotation = intelState.lastRotation;
+    // MCP servers forwarded to session/new are http-only (AdapterRuntimeMcpAccess has no
+    // stdio/command discriminator), so a 0 count means "no http MCP servers", not "no MCP".
+    const mcpServerCount = ctx.runtimeMcp?.getServers?.().length ?? 0;
+    if (mcpServerCount > 0) sessionRuntime.mcpServerCount = mcpServerCount;
     const resultJson = Object.keys(sessionRuntime).length > 0
       ? { ...(result.resultJson ?? {}), sessionRuntime }
       : result.resultJson;
