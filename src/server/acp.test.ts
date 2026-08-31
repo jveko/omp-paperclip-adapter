@@ -16,6 +16,7 @@ import {
   probeOmpAcpSession,
   resolveOmpAgentCommand,
   resolveOmpBillingIdentity,
+  resolveSessionCwd,
 } from "./acp.js";
 import { runWithFreshSessionRetry, withRetryChain } from "./retry.js";
 import * as sessionState from "./session-state.js";
@@ -725,6 +726,47 @@ describe("resolveOmpAgentCommand", () => {
       agentCommand: "omp acp --thinking",
       thinking: "high",
     })).toBe("omp acp --thinking");
+  });
+});
+
+describe("resolveSessionCwd", () => {
+  const currentCwd = process.cwd();
+
+  it("current paperclipWorkspace.cwd wins over stale storedParams.cwd", () => {
+    const ctx = {
+      config: {},
+      context: { paperclipWorkspace: { cwd: "/workspace/current", source: "git_worktree" } },
+    };
+    expect(resolveSessionCwd(ctx, { cwd: "/workspace/stale" })).toBe("/workspace/current");
+  });
+
+  it("agent_home source + config.cwd → config.cwd (not workspace cwd)", () => {
+    const ctx = {
+      config: { cwd: "/config/cwd" },
+      context: { paperclipWorkspace: { cwd: "/workspace/agent_home", source: "agent_home" } },
+    };
+    expect(resolveSessionCwd(ctx, {})).toBe("/config/cwd");
+  });
+
+  it("no workspace cwd, no config.cwd → storedParams.cwd", () => {
+    const ctx = {
+      config: {},
+      context: { paperclipWorkspace: { cwd: "", source: "default" } },
+    };
+    expect(resolveSessionCwd(ctx, { cwd: "/stored/cwd" })).toBe("/stored/cwd");
+  });
+
+  it("none of the above → process.cwd()", () => {
+    const ctx = { config: {}, context: {} };
+    expect(resolveSessionCwd(ctx, {})).toBe(currentCwd);
+  });
+
+  it("git_worktree leaf: paperclipWorkspace.cwd is used", () => {
+    const ctx = {
+      config: {},
+      context: { paperclipWorkspace: { cwd: "/worktree/leaf", source: "git_worktree" } },
+    };
+    expect(resolveSessionCwd(ctx, { cwd: "/stale/stored" })).toBe("/worktree/leaf");
   });
 });
 

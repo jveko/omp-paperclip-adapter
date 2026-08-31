@@ -52,6 +52,7 @@ export const DEFAULT_OMP_COMMAND = "omp";
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 export const packageRootDir = path.resolve(moduleDir, "../..");
 
+
 function firstNonEmptyString(...values: unknown[]): string | undefined {
   for (const v of values) {
     if (typeof v === "string" && v.trim().length > 0) return v.trim();
@@ -73,6 +74,27 @@ export function resolveOmpAgentCommand(config: Record<string, unknown>): string 
   return base;
 }
 
+/**
+ * Resolve the cwd that session side channels (fork / query) must use, mirroring
+ * the engine's precedence (execute.js:838-842). Side channels must query the
+ * run's ACTUAL cwd: storedParams.cwd is the PREVIOUS run's persisted cwd and
+ * goes stale on a workspace move (e.g. adopting git_worktree), whereas the
+ * current run's authoritative cwd is resolved by the engine from
+ * ctx.context.paperclipWorkspace + ctx.config.cwd.
+ */
+
+export function resolveSessionCwd(
+  ctx: Pick<AdapterExecutionContext, "config" | "context">,
+  storedParams: Record<string, unknown>,
+): string {
+  const ws = (ctx.context?.paperclipWorkspace ?? {}) as { cwd?: string; source?: string };
+  const configuredCwd = firstNonEmptyString(ctx.config.cwd) ?? "";
+  // engine: agent_home + a configured cwd overrides the workspace cwd
+  const effectiveWsCwd = ws.source === "agent_home" && configuredCwd ? "" : (ws.cwd ?? "");
+  return effectiveWsCwd || configuredCwd
+    || (typeof storedParams.cwd === "string" && storedParams.cwd)
+    || process.cwd();
+}
 /**
  * Free/zero-cost preview tiers need long horizons (measured: >20 min for a
  * 45k-token context); priced models get the engine's default (no timeout,
@@ -474,9 +496,7 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     const intelState = await loadState(intelDir);
     const directive = resolveRunDirective(intel, intelState);
     const storedParams = (ctx.runtime.sessionParams ?? {}) as Record<string, unknown>;
-    const sessionCwd = typeof storedParams.cwd === "string" && storedParams.cwd
-      ? storedParams.cwd
-      : process.cwd();
+    const sessionCwd = resolveSessionCwd(ctx, storedParams);
     // State writes must never fail a completed run: mirror the loadState
     // degrade + the other warn-and-continue degradation paths.
     const persistState = async (): Promise<void> => {
