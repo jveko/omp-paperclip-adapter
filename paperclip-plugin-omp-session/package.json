@@ -1,0 +1,34 @@
+{
+  "name": "paperclip-plugin-omp-session",
+  "version": "0.1.0",
+  "description": "Paperclip plugin: agent run/session runtime, usage, and cost overview from heartbeat_runs and cost_events.",
+  "type": "module",
+  "license": "MIT",
+  "paperclipPlugin": "manifest.json",
+  "main": "./dist/worker.js",
+  "files": [
+    "dist",
+    "manifest.json",
+    "migrations"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@paperclipai/plugin-sdk": "^2026.824.0"
+  },
+  "devDependencies": {
+    "@paperclipai/plugin-sdk": "^2026.824.0",
+    "@paperclipai/shared": "^2026.824.0",
+    "@types/node": "^22.20.1",
+    "@types/react": "^19.2.17",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.3",
+    "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
