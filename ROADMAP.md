@@ -162,6 +162,16 @@ Paperclip config. Track upstream; don't build.
 
 ## Completed
 
+- **2026-09-01 — v0.7.0 (Native integration).** Lazy-skill bridge (`skillsAsTools` field; a static
+  omp ExtensionAPI extension registers each enabled company skill as an essential on-demand tool
+  returning its `SKILL.md`, replacing eager prompt-injection; manifest handoff via `config.env`;
+  side-channel fail-soft; provider-safe names) and the `paperclip-plugin-omp-session` package (agent
+  `detailTab` reading `heartbeat_runs`/`cost_events` via the plugin worker). Both adapter-local, no
+  upstream required. Remaining G3: warm process pool (item 8), fork/compaction un-gating (blocked on
+  the cross-run resume fingerprint instability), rich per-session metadata (upstream `_omp` fields),
+  and the full cross-session omp browser (issue-scoped work products).
+
+
 - **2026-08-31 — v0.6.0 (Fleet control).** Thinking directive (`--thinking` on `agentCommand`,
   rotate-on-change; effort-key strip extended to all four engine keys; `indexOf("acp")` token-split
   for catalog/version/broker probes) and worktree side-channel cwd alignment (mirror the engine's

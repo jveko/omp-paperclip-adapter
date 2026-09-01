@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.7.0 — 2026-09-01
+
+Native integration: skills as on-demand tools, and a board session panel — both adapter-local, no
+upstream change required.
+
+- **Lazy-skill bridge** — a `skillsAsTools` board field loads a static omp ExtensionAPI extension
+  (`dist/skill-bridge.js`, injected via `--extension` on `agentCommand`) that registers each enabled
+  company skill as a zero-arg **essential** native tool whose `execute()` returns the skill's
+  `SKILL.md` **on demand** (re-read per call, so edits land in warm sessions). This replaces eager
+  prompt-injection of all skill prose — less context, scales to many skills. The adapter materializes
+  a `skills-manifest.json` (desired-filtered, provider-safe `paperclip_skill_*` names, description
+  fallback) and hands its path to the run child via `config.env`; the bridge no-ops in side-channel
+  children (which never get the manifest env). Toggling rotates the session (fingerprint).
+- **Session panel plugin** — a new `paperclip-plugin-omp-session` package adds an agent `detailTab`
+  showing recent runs' session-runtime, usage, and cost, read by the plugin worker via `ctx.db.query`
+  over the whitelisted `heartbeat_runs` (`result_json.sessionRuntime`, `usage_json`) and `cost_events`
+  (`cost_cents`→USD). Manifest validated against the strict plugin schema (namespace DB capabilities +
+  `migrationsDir`); installed via `POST /api/plugins/install`.
+- **Latent fixes carried in:** provider-safe tool names (a `/` in a tool name 400s every request);
+  `loadMode:"essential"` (else extension tools are stripped from the model's schema); array-shaped
+  `AgentToolResult.content`.
+
+Descoped/deferred: the full cross-session omp browser in the panel (issue-scoped work products, not
+worker-readable), rich per-session metadata (needs upstream `_omp` fields), and re-implementing
+tool-event streaming (ACP already forwards it).
+
+
 ## 0.6.0 — 2026-08-31
 
 Fleet control: per-agent runtime directives over the omp child, adapter-local and unblocked.
