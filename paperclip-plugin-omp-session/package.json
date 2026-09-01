@@ -4,11 +4,10 @@
   "description": "Paperclip plugin: agent run/session runtime, usage, and cost overview from heartbeat_runs and cost_events.",
   "type": "module",
   "license": "MIT",
-  "paperclipPlugin": "manifest.json",
+  "paperclipPlugin": { "manifest": "dist/manifest.js", "worker": "dist/worker.js", "ui": "dist/ui" },
   "main": "./dist/worker.js",
   "files": [
     "dist",
-    "manifest.json",
     "migrations"
   ],
   "scripts": {

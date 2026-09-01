@@ -1,10 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { readFile } from "node:fs/promises";
 import { pluginManifestV1Schema } from "@paperclipai/shared/validators/plugin";
-
-const manifest = JSON.parse(
-  await readFile(new URL("../manifest.json", import.meta.url), "utf8"),
-);
+import manifest from "../src/manifest.js";
 
 describe("paperclip-plugin-omp-session manifest", () => {
   it("validates against the strict plugin manifest schema", () => {

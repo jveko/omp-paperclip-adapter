@@ -1,12 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { readFile } from "node:fs/promises";
+import manifest from "../src/manifest.js";
 import { createTestHarness } from "@paperclipai/plugin-sdk";
 import type { TestHarness } from "@paperclipai/plugin-sdk";
 import plugin from "../src/worker.js";
-
-const manifest = JSON.parse(
-  await readFile(new URL("../manifest.json", import.meta.url), "utf8"),
-);
 
 interface SessionRuntime {
   fork: { requested: string; applied: boolean; activeSessionId: string } | null;

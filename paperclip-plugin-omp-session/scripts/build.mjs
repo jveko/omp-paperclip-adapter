@@ -7,8 +7,9 @@ import { createPluginBundlerPresets } from "@paperclipai/plugin-sdk/bundlers";
 const presets = createPluginBundlerPresets({ uiEntry: "src/ui.tsx" });
 
 await Promise.all([
+  build(presets.esbuild.manifest),
   build(presets.esbuild.worker),
   build(presets.esbuild.ui),
 ]);
 
-console.log("Built dist/worker.js and dist/ui/ (esbuild presets from @paperclipai/plugin-sdk/bundlers)");
+console.log("Built dist/manifest.js, dist/worker.js and dist/ui/ (esbuild presets from @paperclipai/plugin-sdk/bundlers)");
