@@ -18,8 +18,8 @@ interface CostEventRow {
 }
 
 interface SessionRuntime {
-  fork: string | null;
-  rotation: number | null;
+  fork: { requested: string; applied: boolean; activeSessionId: string } | null;
+  rotation: { reason: string; at: string; sessionKey: string } | null;
   mcpServerCount: number | null;
 }
 
@@ -54,12 +54,34 @@ function tryParseJson(raw: unknown): unknown {
   return raw;
 }
 
+function parseFork(value: unknown): { requested: string; applied: boolean; activeSessionId: string } | null {
+  if (typeof value !== "object" || value === null) return null;
+  const o = value as Record<string, unknown>;
+  if (typeof o.applied !== "boolean" || typeof o.activeSessionId !== "string") return null;
+  return {
+    requested: typeof o.requested === "string" ? o.requested : "",
+    applied: o.applied,
+    activeSessionId: o.activeSessionId,
+  };
+}
+
+function parseRotation(value: unknown): { reason: string; at: string; sessionKey: string } | null {
+  if (typeof value !== "object" || value === null) return null;
+  const o = value as Record<string, unknown>;
+  if (typeof o.reason !== "string" || typeof o.at !== "string") return null;
+  return {
+    reason: o.reason,
+    at: o.at,
+    sessionKey: typeof o.sessionKey === "string" ? o.sessionKey : "",
+  };
+}
+
 function parseSessionRuntime(value: unknown): SessionRuntime | null {
   if (typeof value !== "object" || value === null) return null;
   const o = value as Record<string, unknown>;
   return {
-    fork: typeof o.fork === "string" ? o.fork : null,
-    rotation: typeof o.rotation === "number" ? o.rotation : null,
+    fork: parseFork(o.fork),
+    rotation: parseRotation(o.lastRotation),
     mcpServerCount: typeof o.mcpServerCount === "number" ? o.mcpServerCount : null,
   };
 }
@@ -104,17 +126,24 @@ const plugin = definePlugin({
       const costRows = await ctx.db.query<CostEventRow>(
         `SELECT run_id, model, cost_cents
          FROM cost_events
-         WHERE agent_id = $1`,
-        [agentId],
+         WHERE agent_id = $1 AND run_id = ANY($2)`,
+        [agentId, runs.map((r) => r.id)],
       );
 
       // Build cost map: run_id -> totalCents
       const costByRun = new Map<string, number>();
-      let totalCostCents = 0;
       for (const row of costRows) {
         const cents = typeof row.cost_cents === "number" ? row.cost_cents : 0;
         costByRun.set(row.run_id, (costByRun.get(row.run_id) ?? 0) + cents);
-        totalCostCents += cents;
+      }
+
+      // Summary cost is scoped to the SAME recent-runs window as Runs/Duration
+      // (LIMIT ${RECENT_RUNS_LIMIT}) — never the lifetime total. Compute the
+      // sum from the returned page runs, not from costRows, so the windowing
+      // is robust even if the DB-level scoping is inadvertently removed.
+      let totalCostCents = 0;
+      for (const row of runs) {
+        totalCostCents += costByRun.get(row.id) ?? 0;
       }
 
       let totalSessionSeconds: number | null = null;

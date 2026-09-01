@@ -11,8 +11,8 @@ import type { StatusBadgeVariant } from "@paperclipai/plugin-sdk/ui";
 // -- Data shapes (mirror worker.ts) -----------------------------------------
 
 interface SessionRuntime {
-  fork: string | null;
-  rotation: number | null;
+  fork: { requested: string; applied: boolean; activeSessionId: string } | null;
+  rotation: { reason: string; at: string; sessionKey: string } | null;
   mcpServerCount: number | null;
 }
 
@@ -87,8 +87,8 @@ function formatUsage(usage: Record<string, number> | null): string {
 function formatSessionRuntime(rt: SessionRuntime | null): string {
   if (!rt) return "\u2014";
   const parts: string[] = [];
-  if (rt.fork) parts.push(`fork:${rt.fork}`);
-  if (rt.rotation != null) parts.push(`rot:${rt.rotation}`);
+  if (rt.fork) parts.push(`fork:${rt.fork.activeSessionId}${rt.fork.applied ? "" : "(stale)"}`);
+  if (rt.rotation) parts.push(`rot:${rt.rotation.reason}`);
   if (rt.mcpServerCount != null) parts.push(`mcp:${rt.mcpServerCount}`);
   return parts.join(" ") || "\u2014";
 }

@@ -9,8 +9,8 @@ const manifest = JSON.parse(
 );
 
 interface SessionRuntime {
-  fork: string | null;
-  rotation: number | null;
+  fork: { requested: string; applied: boolean; activeSessionId: string } | null;
+  rotation: { reason: string; at: string; sessionKey: string } | null;
   mcpServerCount: number | null;
 }
 
@@ -56,7 +56,13 @@ const RUN_1 = {
   status: "completed",
   started_at: "2026-09-01T10:00:00Z",
   ended_at: "2026-09-01T10:30:00Z",
-  result_json: { sessionRuntime: { fork: "main", rotation: 3, mcpServerCount: 2 } },
+  result_json: {
+    sessionRuntime: {
+      fork: { requested: "sess-a", applied: true, activeSessionId: "sess-a" },
+      lastRotation: { reason: "maxRuns", at: "2026-09-01T09:00:00Z", sessionKey: "sk" },
+      mcpServerCount: 2,
+    },
+  },
   usage_json: { prompt_tokens: 1500, completion_tokens: 800 },
 };
 
@@ -65,7 +71,12 @@ const RUN_2 = {
   status: "failed",
   started_at: "2026-09-01T11:00:00Z",
   ended_at: "2026-09-01T11:05:00Z",
-  result_json: { sessionRuntime: { fork: "feature/x", rotation: 1 } },
+  result_json: {
+    sessionRuntime: {
+      fork: { requested: "sess-x", applied: false, activeSessionId: "sess-b" },
+      lastRotation: { reason: "maxAgeHours", at: "2026-09-01T10:00:00Z", sessionKey: "sk2" },
+    },
+  },
   usage_json: { prompt_tokens: 500, completion_tokens: 100 },
 };
 
@@ -91,7 +102,11 @@ describe("omp-session-overview data handler", () => {
     expect(r1.status).toBe("completed");
     expect(r1.startedAt).toBe("2026-09-01T10:00:00Z");
     expect(r1.endedAt).toBe("2026-09-01T10:30:00Z");
-    expect(r1.sessionRuntime).toEqual({ fork: "main", rotation: 3, mcpServerCount: 2 });
+    expect(r1.sessionRuntime).toEqual({
+      fork: { requested: "sess-a", applied: true, activeSessionId: "sess-a" },
+      rotation: { reason: "maxRuns", at: "2026-09-01T09:00:00Z", sessionKey: "sk" },
+      mcpServerCount: 2,
+    });
     expect(r1.usage).toEqual({ prompt_tokens: 1500, completion_tokens: 800 });
     // 500 + 200 cents = 700 -> 7.00 USD
     expect(r1.costUsd).toBe(7);
@@ -99,7 +114,11 @@ describe("omp-session-overview data handler", () => {
     const r2 = overview.runs[1];
     expect(r2.id).toBe("run-2");
     expect(r2.status).toBe("failed");
-    expect(r2.sessionRuntime).toEqual({ fork: "feature/x", rotation: 1, mcpServerCount: null });
+    expect(r2.sessionRuntime).toEqual({
+      fork: { requested: "sess-x", applied: false, activeSessionId: "sess-b" },
+      rotation: { reason: "maxAgeHours", at: "2026-09-01T10:00:00Z", sessionKey: "sk2" },
+      mcpServerCount: null,
+    });
     expect(r2.usage).toEqual({ prompt_tokens: 500, completion_tokens: 100 });
     expect(r2.costUsd).toBe(3);
 
@@ -122,6 +141,26 @@ describe("omp-session-overview data handler", () => {
     expect(overview.summary.totalCostUsd).toBe(1.23);
   });
 
+  it("scopes summary cost to the recent-runs window (excludes cost of runs outside the page)", async () => {
+    const harness = await makeHarness();
+    // RUN_1 is the only run in the returned page; run-99 is NOT in the page but
+    // has cost events. The summary total must reflect only the windowed runs.
+    stubDb(harness, [RUN_1], [
+      { run_id: "run-1", model: "gpt-4", cost_cents: 200 },
+      { run_id: "run-99", model: "gpt-4", cost_cents: 5000 },
+    ]);
+
+    const overview = await harness.getData<OmpSessionOverview>(
+      "omp-session-overview",
+      { agentId: "test-agent-1" },
+    );
+
+    expect(overview.runs).toHaveLength(1);
+    expect(overview.runs[0].costUsd).toBe(2);
+    // run-99's $50.00 must NOT leak into the windowed summary.
+    expect(overview.summary.totalCostUsd).toBe(2);
+  });
+
   it("degrades gracefully on malformed usage_json", async () => {
     const harness = await makeHarness();
     stubDb(harness, [{ ...RUN_1, usage_json: "not-json" }], []);
@@ -135,8 +174,8 @@ describe("omp-session-overview data handler", () => {
     expect(overview.runs[0].usage).toBeNull();
     // Other fields still populated
     expect(overview.runs[0].sessionRuntime).toEqual({
-      fork: "main",
-      rotation: 3,
+      fork: { requested: "sess-a", applied: true, activeSessionId: "sess-a" },
+      rotation: { reason: "maxRuns", at: "2026-09-01T09:00:00Z", sessionKey: "sk" },
       mcpServerCount: 2,
     });
   });

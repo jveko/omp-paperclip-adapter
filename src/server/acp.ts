@@ -79,6 +79,27 @@ export function shouldAppendSkillBridgeExtension(
   return typeof manifest === "string" && manifest.length > 0 && !/\s/.test(bridgePath);
 }
 
+export type BridgeRunMode = { kind: "ok" } | { kind: "whitespace"; warn: string };
+
+/**
+ * Decide how the run flow delivers skills content when skillsAsTools is on.
+ * The lazy-skill bridge requires a whitespace-free bridgePath (the adapter's
+ * side channels split agentCommand with a naive /\s+/ tokenizer), so a
+ * whitespace-bearing path must fall back to prose injection. Exported as a
+ * test seam: it takes bridgePath so the whitespace branch is testable without
+ * a real whitespace-bearing install path (the module const bridgePath never
+ * has whitespace in an installed adapter).
+ */
+export function resolveBridgeRunMode(bridgePath: string): BridgeRunMode {
+  if (/\s/.test(bridgePath)) {
+    return {
+      kind: "whitespace",
+      warn: "omp skills-as-tools bridge path contains whitespace; falling back to prompt-injected skill instructions",
+    };
+  }
+  return { kind: "ok" };
+}
+
 export function resolveOmpAgentCommand(config: Record<string, unknown>): string {
   const explicit = firstNonEmptyString(config.agentCommand, config.acpAgentCommand);
   const command = firstNonEmptyString(config.command) ?? DEFAULT_OMP_COMMAND;
@@ -426,15 +447,11 @@ async function materializeSkillsInstructions(config: Record<string, unknown>): P
 type OmpAcpExecutorOptions = Omit<
   AcpxEngineExecutorOptions,
   "adapterType" | "moduleDir" | "packageRootDir"
-> & {
-  /** Override the bridge path for testing. Defaults to the module level bridgePath. */
-  bridgePath?: string;
-};
+>;
 type OmpAcpExecutor = (ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>;
 
 export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAcpExecutor {
-  const { bridgePath: runBridgePath, ...engineOptions } = options;
-  const bridgePathForRun = runBridgePath ?? bridgePath;
+  const engineOptions = options;
   let executor: OmpAcpExecutor | null = null;
   return async (ctx) => {
     // Fail closed: broker credentialMode demands a resolved broker url+token.
@@ -512,10 +529,11 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     const skillsAsToolsOn = ctx.config.skillsAsTools === true || ctx.config.skillsAsTools === "true";
     let bridgeActive = false;
     if (skillsAsToolsOn) {
-      if (/\s/.test(bridgePathForRun)) {
+      const bridgeMode = resolveBridgeRunMode(bridgePath);
+      if (bridgeMode.kind === "whitespace") {
         await ctx.onEvent?.({
           eventType: "run.system", stream: "system", level: "warn",
-          message: "omp skills-as-tools bridge path contains whitespace; falling back to prompt-injected skill instructions",
+          message: bridgeMode.warn,
         });
       } else {
         const manifest = await materializeSkillManifest(ctx.config, intelDir, moduleDir);

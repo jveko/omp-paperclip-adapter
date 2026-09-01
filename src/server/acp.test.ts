@@ -14,6 +14,7 @@ import {
   driveAcpSession,
   parseOmpVersion,
   probeOmpAcpSession,
+  resolveBridgeRunMode,
   resolveOmpAgentCommand,
   resolveOmpBillingIdentity,
   resolveSessionCwd,
@@ -874,6 +875,35 @@ describe("shouldAppendSkillBridgeExtension", () => {
       { env: { PAPERCLIP_SKILLS_MANIFEST: "/tmp/m.json" } },
       "/opt/omp dist/skill-bridge.js",
     )).toBe(false);
+  });
+});
+
+describe("resolveBridgeRunMode", () => {
+  // The module const bridgePath can never carry whitespace in a real install,
+  // so the prose-fallback branch of the run wiring is guarded behind this
+  // helper (it takes bridgePath). A whitespace result warns AND leaves the
+  // bridge inactive, so prose injection runs and resolveOmpAgentCommand
+  // appends no --extension (shouldAppendSkillBridgeExtension returns false).
+  it("returns whitespace (prose-fallback) mode with a warn when bridgePath has whitespace", () => {
+    const mode = resolveBridgeRunMode("/opt/omp dist/skill-bridge.js");
+    expect(mode).toEqual({
+      kind: "whitespace",
+      warn: "omp skills-as-tools bridge path contains whitespace; falling back to prompt-injected skill instructions",
+    });
+    // No --extension when the bridge is off (the run wiring warns and falls
+    // back to prose injection instead).
+    expect(shouldAppendSkillBridgeExtension(
+      { env: { PAPERCLIP_SKILLS_MANIFEST: "/tmp/m.json" } },
+      "/opt/omp dist/skill-bridge.js",
+    )).toBe(false);
+  });
+
+  it("returns ok (bridge active) for a whitespace-free bridgePath", () => {
+    expect(resolveBridgeRunMode("/opt/omp/dist/skill-bridge.js")).toEqual({ kind: "ok" });
+    expect(shouldAppendSkillBridgeExtension(
+      { env: { PAPERCLIP_SKILLS_MANIFEST: "/tmp/m.json" } },
+      "/opt/omp/dist/skill-bridge.js",
+    )).toBe(true);
   });
 });
 describe("resolveSessionCwd", () => {

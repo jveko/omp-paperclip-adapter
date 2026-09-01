@@ -162,8 +162,11 @@ describe("materializeSkillManifest", () => {
     expect(manifest[0].description).toBe("Write conventional commits.");
   });
 
-  it("falls back to the runtimeName when the body is empty", async () => {
-    await fs.writeFile(path.join(commitDir, "SKILL.md"), "");
+  it("uses the first BODY paragraph, not frontmatter text, when frontmatter lacks a description", async () => {
+    await fs.writeFile(
+      path.join(commitDir, "SKILL.md"),
+      "---\nname: commit-skill\nversion: 1.0.0\n---\n# Commit\n\nWrite conventional commits.\n",
+    );
     mocks.readPaperclipSkillSyncPreference.mockReturnValue({
       explicit: true,
       desiredSkills: ["commit"],
@@ -177,6 +180,26 @@ describe("materializeSkillManifest", () => {
 
     const result = await materializeSkillManifest({}, dir, MODULE_DIR);
     const manifest = JSON.parse(await fs.readFile(result!, "utf8"));
-    expect(manifest[0].description).toBe("commit");
+    expect(manifest[0].description).toBe("Write conventional commits.");
+  });
+
+  it("creates a missing output directory before writing the manifest", async () => {
+    const freshDir = path.join(tmpdir(), `skill-manifest-missing-${randomUUID()}`);
+    mocks.readPaperclipSkillSyncPreference.mockReturnValue({
+      explicit: true,
+      desiredSkills: ["commit"],
+      desiredSkillEntries: [],
+    });
+    mocks.readPaperclipRuntimeSkillEntries.mockResolvedValue([
+      makeEntry("paperclipai/paperclip/commit", "commit", commitDir),
+    ]);
+    mocks.resolvePaperclipDesiredSkillNames.mockReturnValue(["paperclipai/paperclip/commit"]);
+    mocks.listPaperclipSkillEntries.mockResolvedValue([]);
+
+    const result = await materializeSkillManifest({}, freshDir, MODULE_DIR);
+    expect(result).toBe(path.join(freshDir, "skills-manifest.json"));
+    const manifest = JSON.parse(await fs.readFile(result!, "utf8"));
+    expect(manifest).toHaveLength(1);
+    expect(manifest[0].name).toBe("commit");
   });
 });

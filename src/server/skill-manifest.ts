@@ -32,11 +32,11 @@ export function sanitizeSkillToolName(value: string): string {
  * frontmatter, so the paragraph fallback is the path that actually runs.
  */
 export function describeSkill(markdown: string, runtimeName: string): string {
-  const trimmed = markdown.trim();
-  if (trimmed.startsWith("---")) {
-    const end = trimmed.indexOf("\n---", 3);
+  let body = markdown.trim();
+  if (body.startsWith("---")) {
+    const end = body.indexOf("\n---", 3);
     if (end !== -1) {
-      const front = trimmed.slice(0, end).split("\n");
+      const front = body.slice(0, end).split("\n");
       const descLine = front
         .map((line) => line.trim())
         .find((line) => /^description\s*:/i.test(line));
@@ -47,10 +47,14 @@ export function describeSkill(markdown: string, runtimeName: string): string {
           .replace(/^["']|["']$/g, "");
         if (value) return value;
       }
+      // No usable description: slice off the frontmatter block (everything
+      // up to and including the closing '---' fence) so the body scan below
+      // never reads '---' / frontmatter keys as the description.
+      body = body.slice(end + 4).trim();
     }
   }
   const paragraph: string[] = [];
-  for (const line of trimmed.split("\n")) {
+  for (const line of body.split("\n")) {
     const text = line.trim();
     if (!text) {
       if (paragraph.length > 0) break;
@@ -121,6 +125,7 @@ export async function materializeSkillManifest(
   if (manifest.length === 0) return null;
 
   const manifestPath = path.join(dir, "skills-manifest.json");
+  await fs.mkdir(dir, { recursive: true });
   await fs.writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
   return manifestPath;
 }
