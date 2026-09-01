@@ -827,13 +827,29 @@ describe("resolveOmpAgentCommand", () => {
   });
 
   it("does not double-append --thinking when the dangling flag (without a value) is present", () => {
-
-  it("does not double-append --thinking when the dangling flag (without a value) is present", () => {
     expect(resolveOmpAgentCommand({
       agentCommand: "omp acp --thinking",
       thinking: "high",
     })).toBe("omp acp --thinking");
   });
+
+  it("appends --extension <bridgePath> when env has PAPERCLIP_SKILLS_MANIFEST", () => {
+    expect(resolveOmpAgentCommand({
+      env: { PAPERCLIP_SKILLS_MANIFEST: "/tmp/manifest.json" },
+    })).toBe("omp acp --extension " + path.join(path.dirname(fileURLToPath(import.meta.url)), "../../dist/skill-bridge.js"));
+  });
+
+  it("does not append --extension when env lacks PAPERCLIP_SKILLS_MANIFEST", () => {
+    expect(resolveOmpAgentCommand({})).toBe("omp acp");
+  });
+
+  it("does not append --extension when PAPERCLIP_SKILLS_MANIFEST is empty string", () => {
+    expect(resolveOmpAgentCommand({
+      env: { PAPERCLIP_SKILLS_MANIFEST: "" },
+    })).toBe("omp acp");
+  });
+});
+
 describe("shouldAppendSkillBridgeExtension", () => {
   it("returns true when manifest env is set and bridgePath is whitespace-free", () => {
     expect(shouldAppendSkillBridgeExtension(
@@ -860,25 +876,6 @@ describe("shouldAppendSkillBridgeExtension", () => {
     )).toBe(false);
   });
 });
-
-});
-  it("appends --extension <bridgePath> when env has PAPERCLIP_SKILLS_MANIFEST", () => {
-    expect(resolveOmpAgentCommand({
-      env: { PAPERCLIP_SKILLS_MANIFEST: "/tmp/manifest.json" },
-    })).toBe("omp acp --extension " + path.join(path.dirname(fileURLToPath(import.meta.url)), "../../dist/skill-bridge.js"));
-  });
-
-  it("does not append --extension when env lacks PAPERCLIP_SKILLS_MANIFEST", () => {
-    expect(resolveOmpAgentCommand({})).toBe("omp acp");
-  });
-
-  it("does not append --extension when PAPERCLIP_SKILLS_MANIFEST is empty string", () => {
-    expect(resolveOmpAgentCommand({
-      env: { PAPERCLIP_SKILLS_MANIFEST: "" },
-    })).toBe("omp acp");
-  });
-
-
 describe("resolveSessionCwd", () => {
   const currentCwd = process.cwd();
 
