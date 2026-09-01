@@ -34,6 +34,7 @@ import { readRetryConfig, runWithFreshSessionRetry, withRetryChain } from "./ret
 import { materializeFailoverOverlay } from "./failover-config.js";
 import { ompEnv } from "./omp-env.js";
 import { forkOmpSession, queryOmpSessions } from "./session-intel.js";
+import { materializeSkillManifest } from "./skill-manifest.js";
 import {
   bumpRunCounter, consumeToken, loadState, rotateIfTripped, saveState,
   sessionIntelDir, snapshotDigest,
@@ -51,7 +52,7 @@ export const DEFAULT_OMP_COMMAND = "omp";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 export const packageRootDir = path.resolve(moduleDir, "../..");
-
+export const bridgePath = path.join(packageRootDir, "dist", "skill-bridge.js");
 
 function firstNonEmptyString(...values: unknown[]): string | undefined {
   for (const v of values) {
@@ -60,18 +61,44 @@ function firstNonEmptyString(...values: unknown[]): string | undefined {
   return undefined;
 }
 
+/**
+ * Decide whether the lazy-skill bridge extension should ride the omp agent
+ * command. True only when a non-empty manifest path was materialized into
+ * config.env (the run flow sets it) AND the resolved dist/skill-bridge.js
+ * absolute path is whitespace-free — the adapter's side channels split
+ * agentCommand with a naive /\s+/ tokenizer, so a whitespace-bearing path
+ * must fall back to prose injection instead. Exported as a test seam so the
+ * whitespace guard is directly testable (the real install's path never has
+ * whitespace).
+ */
+export function shouldAppendSkillBridgeExtension(
+  config: Record<string, unknown>,
+  bridgePath: string,
+): boolean {
+  const manifest = (config.env as Record<string, unknown> | undefined)?.PAPERCLIP_SKILLS_MANIFEST;
+  return typeof manifest === "string" && manifest.length > 0 && !/\s/.test(bridgePath);
+}
+
 export function resolveOmpAgentCommand(config: Record<string, unknown>): string {
   const explicit = firstNonEmptyString(config.agentCommand, config.acpAgentCommand);
   const command = firstNonEmptyString(config.command) ?? DEFAULT_OMP_COMMAND;
   const base = explicit ?? `${command} acp`;
+  // Lazy-skill bridge: append --extension <bridgePath> when the run flow
+  // materialized the manifest env (pure function of config — the env presence
+  // IS the bridge-active signal). Side channels that reuse the command but
+  // lack the manifest env simply don't get the flag, so the bridge no-ops
+  // there.
+  const extension = shouldAppendSkillBridgeExtension(config, bridgePath)
+    ? ` --extension ${bridgePath}`
+    : "";
   // --thinking flag rides agentCommand because the engine's set_config_option
   // uses the wrong key (effort). Changing the level rotates the session via the
   // fingerprint (buildOmpAcpConfig puts this in agentCommand, which is hashed).
   // Applies to the explicit agentCommand too (skipped only when it already
   // carries --thinking, including a dangling flag with no value).
   const level = validThinkingLevel(config.thinking);
-  if (level && !/--thinking(\s|=|$)/.test(base)) return `${base} --thinking ${level}`;
-  return base;
+  if (level && !/--thinking(\s|=|$)/.test(base)) return `${base}${extension} --thinking ${level}`;
+  return `${base}${extension}`;
 }
 
 /**
@@ -399,10 +426,15 @@ async function materializeSkillsInstructions(config: Record<string, unknown>): P
 type OmpAcpExecutorOptions = Omit<
   AcpxEngineExecutorOptions,
   "adapterType" | "moduleDir" | "packageRootDir"
->;
+> & {
+  /** Override the bridge path for testing. Defaults to the module level bridgePath. */
+  bridgePath?: string;
+};
 type OmpAcpExecutor = (ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>;
 
 export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAcpExecutor {
+  const { bridgePath: runBridgePath, ...engineOptions } = options;
+  const bridgePathForRun = runBridgePath ?? bridgePath;
   let executor: OmpAcpExecutor | null = null;
   return async (ctx) => {
     // Fail closed: broker credentialMode demands a resolved broker url+token.
@@ -428,23 +460,21 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
         "@paperclipai/adapter-utils/acpx-engine/execute"
       );
       executor = createAcpxEngineExecutor({
-        ...options,
+        ...engineOptions,
         adapterType: "omp_local",
         moduleDir,
         packageRootDir,
         resolveBillingIdentity: options.resolveBillingIdentity ?? resolveOmpBillingIdentity,
       });
     }
+    const intelDir = sessionIntelDir(ctx.agent.companyId, ctx.agent.id);
     // Resolvers backed by the cached `omp models ls` list (5-min TTL inside
     // models.ts, keyed by command+env so different agents' credentials never
     // share a catalog). Built on first actual run, inside this memoized
     // closure, so probe-only paths never spawn `omp models`. The fetch is
     // skipped when no model is configured — a broken/missing `omp` would
     // otherwise add up to 20s of uncached failure latency per run.
-    const failoverOverlay = await materializeFailoverOverlay(
-      ctx.config,
-      sessionIntelDir(ctx.agent.companyId, ctx.agent.id),
-    );
+    const failoverOverlay = await materializeFailoverOverlay(ctx.config, intelDir);
     const failoverOverlayPath =
       failoverOverlay.status === "ok" ? failoverOverlay.path : null;
     if (failoverOverlay.status === "error") {
@@ -470,6 +500,32 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     const resolveModel = (model: string): string | null => normalizeOmpModelId(model, models);
     const resolveCost = (model: string): OmpModelCost | null =>
       models.find((m) => m.id === model)?.cost ?? null;
+    // Lazy-skill bridge: when skillsAsTools is on, materialize the skills
+    // manifest and hand its path to the run child via
+    // PAPERCLIP_SKILLS_MANIFEST so the bundled bridge extension
+    // (dist/skill-bridge.js) registers each desired skill as an on-demand
+    // native tool. The env MUST be set before buildOmpAcpConfig runs below so
+    // resolveOmpAgentCommand sees it and appends --extension <bridgePath>
+    // (which, like --thinking, rotates the session fingerprint). A
+    // whitespace-bearing bridge path would break the adapter's naive /\s+/
+    // token split, so warn and fall back to prose injection instead.
+    const skillsAsToolsOn = ctx.config.skillsAsTools === true || ctx.config.skillsAsTools === "true";
+    let bridgeActive = false;
+    if (skillsAsToolsOn) {
+      if (/\s/.test(bridgePathForRun)) {
+        await ctx.onEvent?.({
+          eventType: "run.system", stream: "system", level: "warn",
+          message: "omp skills-as-tools bridge path contains whitespace; falling back to prompt-injected skill instructions",
+        });
+      } else {
+        const manifest = await materializeSkillManifest(ctx.config, intelDir, moduleDir);
+        if (manifest) {
+          // Do not clobber existing env keys — fold the manifest var in.
+          ctx.config.env = { ...(ctx.config.env ?? {}), PAPERCLIP_SKILLS_MANIFEST: manifest };
+          bridgeActive = true;
+        }
+      }
+    }
     const config = buildOmpAcpConfig(ctx.config, resolveModel, resolveCost);
     // Fold the failover overlay into config BEFORE engineConfig is derived: the
     // fork branch rebuilds engineConfig as { ...config, warmHandleIdleMs: 50 },
@@ -483,16 +539,18 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
       const mergedPi = [operatorPi, failoverOverlayPath].filter(Boolean).join(path.delimiter);
       if (mergedPi) config.env = { ...(config.env ?? {}), PI_CONFIG_FILES: mergedPi };
     }
-    // Ephemeral skills: materialize the merged instructions file (skills +
-    // user instructions) so the engine injects it into this run. The merged
-    // file always carries the user's content when present, so the path is set
-    // unconditionally whenever any skill is desired; null leaves any existing
-    // instructionsFilePath untouched.
-    const instructionsFile = await materializeSkillsInstructions(ctx.config);
+    // Ephemeral skills: when the bridge is active, skill content is delivered
+    // on demand via the registered native tools, so prose injection is skipped
+    // (bridge and prose are mutually exclusive). Otherwise materialize the
+    // merged instructions file (skills + user instructions) so the engine
+    // injects it into this run. The merged file always carries the user's
+    // content when present, so the path is set unconditionally whenever any
+    // skill is desired; null leaves any existing instructionsFilePath
+    // untouched.
+    const instructionsFile = bridgeActive ? null : await materializeSkillsInstructions(ctx.config);
     if (instructionsFile) config.instructionsFilePath = instructionsFile;
     // --- v0.4 session runtime: directives, fork resume, rotation, snapshot ---
     const intel = readSessionIntelConfig(ctx.config);
-    const intelDir = sessionIntelDir(ctx.agent.companyId, ctx.agent.id);
     const intelState = await loadState(intelDir);
     const directive = resolveRunDirective(intel, intelState);
     const storedParams = (ctx.runtime.sessionParams ?? {}) as Record<string, unknown>;
@@ -509,7 +567,6 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
         });
       }
     };
-
     let forkTokenUsed: string | null = null;
     let forkedSessionId: string | null = null;
     let freshTokenUsed: string | null = null;

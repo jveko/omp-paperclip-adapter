@@ -72,6 +72,7 @@ describe("getSessionConfigSchema", () => {
       "sessionBrowser", "sessionForceFreshToken", "sessionForkSourceId",
       "sessionForkToken", "sessionMaxRuns", "sessionMaxAgeHours",
       "credentialMode", "thinking", "fallbackChain", "usageReport",
+      "skillsAsTools",
     ]);
     for (const field of schema.fields) expect(field.hint).toContain("next run");
   });

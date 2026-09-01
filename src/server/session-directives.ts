@@ -124,6 +124,8 @@ export function getSessionConfigSchema(): AdapterConfigSchema {
         hint: `One selector per line, injected via PI_CONFIG_FILES. Adding the first selector or clearing the last flips PI_CONFIG_FILES present↔absent, which rotates the agent's session (fingerprint change) on the next run. ${NEXT_RUN}` },
       { key: "usageReport", label: "Emit usage report", type: "toggle", default: true,
         hint: `Emit an omp-usage work product with cost estimates. ${NEXT_RUN}` },
+      { key: "skillsAsTools", label: "Expose skills as on-demand tools", type: "toggle", default: false,
+        hint: `Register each enabled company skill as a native omp tool that returns its instructions on demand, instead of injecting all skill text into the prompt. Reduces context use. ${NEXT_RUN}` },
     ],
   };
 }

@@ -17,6 +17,7 @@ import {
   resolveOmpAgentCommand,
   resolveOmpBillingIdentity,
   resolveSessionCwd,
+  shouldAppendSkillBridgeExtension,
 } from "./acp.js";
 import { runWithFreshSessionRetry, withRetryChain } from "./retry.js";
 import * as sessionState from "./session-state.js";
@@ -31,6 +32,33 @@ const modelsMocks = vi.hoisted(() => ({
     { id: "prov/m", label: "M", cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } },
   ]),
 }));
+
+
+const skillManifestMocks = vi.hoisted(() => ({
+  materializeSkillManifest: vi.fn(),
+}));
+
+vi.mock("./skill-manifest.js", () => ({
+  materializeSkillManifest: skillManifestMocks.materializeSkillManifest,
+}));
+
+const serverUtilsMocks = vi.hoisted(() => ({
+  readPaperclipSkillSyncPreference: vi.fn(),
+  readPaperclipRuntimeSkillEntries: vi.fn(),
+  resolvePaperclipDesiredSkillNames: vi.fn(),
+  readPaperclipSkillMarkdown: vi.fn(),
+}));
+
+vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    readPaperclipSkillSyncPreference: serverUtilsMocks.readPaperclipSkillSyncPreference,
+    readPaperclipRuntimeSkillEntries: serverUtilsMocks.readPaperclipRuntimeSkillEntries,
+    resolvePaperclipDesiredSkillNames: serverUtilsMocks.resolvePaperclipDesiredSkillNames,
+    readPaperclipSkillMarkdown: serverUtilsMocks.readPaperclipSkillMarkdown,
+  };
+});
 
 vi.mock("./models.js", async (importOriginal) => {
   const actual = await importOriginal();
@@ -74,6 +102,17 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
   beforeEach(async () => {
     engineMocks.createAcpxEngineExecutor.mockReset();
+    serverUtilsMocks.readPaperclipSkillSyncPreference.mockReset();
+    serverUtilsMocks.readPaperclipRuntimeSkillEntries.mockReset();
+    serverUtilsMocks.resolvePaperclipDesiredSkillNames.mockReset();
+    serverUtilsMocks.readPaperclipSkillMarkdown.mockReset();
+    serverUtilsMocks.readPaperclipSkillSyncPreference.mockReturnValue({
+      explicit: false, desiredSkills: [], desiredSkillEntries: [],
+    });
+    serverUtilsMocks.readPaperclipRuntimeSkillEntries.mockResolvedValue([]);
+    serverUtilsMocks.resolvePaperclipDesiredSkillNames.mockReturnValue([]);
+    serverUtilsMocks.readPaperclipSkillMarkdown.mockResolvedValue(null);
+    skillManifestMocks.materializeSkillManifest.mockReset();
     // Each test starts from a pristine state dir: the shared tmpRoot would
     // otherwise leak fork/force-fresh consumption and snapshot digests across
     // tests (the fixture asserts on those state transitions).
@@ -721,13 +760,124 @@ describe("resolveOmpAgentCommand", () => {
       thinking: "high",
     })).toBe("omp acp --thinking low");
   });
+  it("skillsAsTools:true with desired skill sets manifest env, appends --extension, skips prose", async () => {
+    skillManifestMocks.materializeSkillManifest.mockResolvedValue("/tmp/skills-manifest.json");
+    serverUtilsMocks.readPaperclipSkillSyncPreference.mockReturnValue({
+      explicit: true, desiredSkills: ["echo"], desiredSkillEntries: [],
+    });
+    serverUtilsMocks.readPaperclipRuntimeSkillEntries.mockResolvedValue([
+      { key: "paperclipai/echo", runtimeName: "echo", source: "/tmp/echo" },
+    ]);
+    serverUtilsMocks.resolvePaperclipDesiredSkillNames.mockReturnValue(["paperclipai/echo"]);
+    serverUtilsMocks.readPaperclipSkillMarkdown.mockResolvedValue("# Echo skill");
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const run = createOmpAcpExecutor();
+    await run(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, skillsAsTools: true },
+    }));
+    const merged = executorFn.mock.calls[0][0];
+    // Manifest env is set
+    expect(merged.config.env?.PAPERCLIP_SKILLS_MANIFEST).toBe("/tmp/skills-manifest.json");
+    // agentCommand includes --extension
+    expect(merged.config.agentCommand).toContain("--extension");
+    // Prose instructions are NOT set (bridge active)
+    expect(merged.config.instructionsFilePath).toBeUndefined();
+  });
+
+  it("skillsAsTools:false does not set manifest env, no --extension, prose runs", async () => {
+    serverUtilsMocks.readPaperclipSkillSyncPreference.mockReturnValue({
+      explicit: true, desiredSkills: ["echo"], desiredSkillEntries: [],
+    });
+    serverUtilsMocks.readPaperclipRuntimeSkillEntries.mockResolvedValue([
+      { key: "paperclipai/echo", runtimeName: "echo", source: "/tmp/echo" },
+    ]);
+    serverUtilsMocks.resolvePaperclipDesiredSkillNames.mockReturnValue(["paperclipai/echo"]);
+    serverUtilsMocks.readPaperclipSkillMarkdown.mockResolvedValue("# Echo skill");
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const run = createOmpAcpExecutor();
+    await run(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, skillsAsTools: false },
+    }));
+    const merged = executorFn.mock.calls[0][0];
+    // Manifest env NOT set
+    expect(merged.config.env?.PAPERCLIP_SKILLS_MANIFEST).toBeUndefined();
+    // No --extension in agentCommand
+    expect(merged.config.agentCommand).not.toContain("--extension");
+  });
+  it("treats the string 'false' as off (bridge stays inactive, prose runs)", async () => {
+    serverUtilsMocks.readPaperclipSkillSyncPreference.mockReturnValue({
+      explicit: true, desiredSkills: ["echo"], desiredSkillEntries: [],
+    });
+    serverUtilsMocks.readPaperclipRuntimeSkillEntries.mockResolvedValue([
+      { key: "paperclipai/echo", runtimeName: "echo", source: "/tmp/echo" },
+    ]);
+    serverUtilsMocks.resolvePaperclipDesiredSkillNames.mockReturnValue(["paperclipai/echo"]);
+    serverUtilsMocks.readPaperclipSkillMarkdown.mockResolvedValue("# Echo skill");
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const run = createOmpAcpExecutor();
+    await run(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, skillsAsTools: "false" },
+    }));
+    const merged = executorFn.mock.calls[0][0];
+    // Toggle arrives as a string; "false" must NOT arm the bridge.
+    expect(merged.config.env?.PAPERCLIP_SKILLS_MANIFEST).toBeUndefined();
+    expect(merged.config.agentCommand).not.toContain("--extension");
+    // Prose injection still runs (desired skill materializes an instructions file).
+    expect(merged.config.instructionsFilePath).toBeTruthy();
+  });
+
+  it("does not double-append --thinking when the dangling flag (without a value) is present", () => {
+
   it("does not double-append --thinking when the dangling flag (without a value) is present", () => {
     expect(resolveOmpAgentCommand({
       agentCommand: "omp acp --thinking",
       thinking: "high",
     })).toBe("omp acp --thinking");
   });
+describe("shouldAppendSkillBridgeExtension", () => {
+  it("returns true when manifest env is set and bridgePath is whitespace-free", () => {
+    expect(shouldAppendSkillBridgeExtension(
+      { env: { PAPERCLIP_SKILLS_MANIFEST: "/tmp/m.json" } },
+      "/opt/omp/dist/skill-bridge.js",
+    )).toBe(true);
+  });
+
+  it("returns false when manifest env is missing", () => {
+    expect(shouldAppendSkillBridgeExtension({}, "/opt/omp/dist/skill-bridge.js")).toBe(false);
+  });
+
+  it("returns false when manifest env is empty string", () => {
+    expect(shouldAppendSkillBridgeExtension(
+      { env: { PAPERCLIP_SKILLS_MANIFEST: "" } },
+      "/opt/omp/dist/skill-bridge.js",
+    )).toBe(false);
+  });
+
+  it("returns false when bridgePath contains whitespace", () => {
+    expect(shouldAppendSkillBridgeExtension(
+      { env: { PAPERCLIP_SKILLS_MANIFEST: "/tmp/m.json" } },
+      "/opt/omp dist/skill-bridge.js",
+    )).toBe(false);
+  });
 });
+
+});
+  it("appends --extension <bridgePath> when env has PAPERCLIP_SKILLS_MANIFEST", () => {
+    expect(resolveOmpAgentCommand({
+      env: { PAPERCLIP_SKILLS_MANIFEST: "/tmp/manifest.json" },
+    })).toBe("omp acp --extension " + path.join(path.dirname(fileURLToPath(import.meta.url)), "../../dist/skill-bridge.js"));
+  });
+
+  it("does not append --extension when env lacks PAPERCLIP_SKILLS_MANIFEST", () => {
+    expect(resolveOmpAgentCommand({})).toBe("omp acp");
+  });
+
+  it("does not append --extension when PAPERCLIP_SKILLS_MANIFEST is empty string", () => {
+    expect(resolveOmpAgentCommand({
+      env: { PAPERCLIP_SKILLS_MANIFEST: "" },
+    })).toBe("omp acp");
+  });
+
 
 describe("resolveSessionCwd", () => {
   const currentCwd = process.cwd();
