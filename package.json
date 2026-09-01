@@ -20,8 +20,9 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc && npm run build:uiparser",
+    "build": "tsc && npm run build:uiparser && npm run build:bridge",
     "build:uiparser": "esbuild src/ui-parser.ts --bundle --format=cjs --outfile=dist/ui-parser.js",
+    "build:bridge": "esbuild src/server/skill-bridge.ts --bundle --platform=node --format=esm --outfile=dist/skill-bridge.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
