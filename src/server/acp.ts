@@ -35,6 +35,7 @@ import { materializeFailoverOverlay } from "./failover-config.js";
 import { ompEnv } from "./omp-env.js";
 import { forkOmpSession, queryOmpSessions } from "./session-intel.js";
 import { materializeSkillManifest } from "./skill-manifest.js";
+import { materializeGovernanceManifest } from "./governance-manifest.js";
 import {
   bumpRunCounter, consumeToken, loadState, rotateIfTripped, saveState,
   sessionIntelDir, snapshotDigest,
@@ -52,7 +53,7 @@ export const DEFAULT_OMP_COMMAND = "omp";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 export const packageRootDir = path.resolve(moduleDir, "../..");
-export const bridgePath = path.join(packageRootDir, "dist", "skill-bridge.js");
+export const bridgePath = path.join(packageRootDir, "dist", "paperclip-bridge.js");
 
 function firstNonEmptyString(...values: unknown[]): string | undefined {
   for (const v of values) {
@@ -62,21 +63,26 @@ function firstNonEmptyString(...values: unknown[]): string | undefined {
 }
 
 /**
- * Decide whether the lazy-skill bridge extension should ride the omp agent
- * command. True only when a non-empty manifest path was materialized into
- * config.env (the run flow sets it) AND the resolved dist/skill-bridge.js
- * absolute path is whitespace-free — the adapter's side channels split
- * agentCommand with a naive /\s+/ tokenizer, so a whitespace-bearing path
- * must fall back to prose injection instead. Exported as a test seam so the
+ * Decide whether the paperclip bridge extension should ride the omp agent
+ * command. True when the run flow materialized EITHER manifest into config.env
+ * — the skills manifest (v0.7 lazy skill registration) or the governance
+ * manifest (v0.8 policy engine) — AND the resolved dist/paperclip-bridge.js
+ * absolute path is whitespace-free: the adapter's side channels split
+ * agentCommand with a naive /\s+/ tokenizer, so a whitespace-bearing path must
+ * fall back to prose injection instead. Exported as a test seam so the
  * whitespace guard is directly testable (the real install's path never has
  * whitespace).
  */
-export function shouldAppendSkillBridgeExtension(
+export function shouldAppendBridgeExtension(
   config: Record<string, unknown>,
   bridgePath: string,
 ): boolean {
-  const manifest = (config.env as Record<string, unknown> | undefined)?.PAPERCLIP_SKILLS_MANIFEST;
-  return typeof manifest === "string" && manifest.length > 0 && !/\s/.test(bridgePath);
+  const env = (config.env ?? {}) as Record<string, unknown>;
+  const skills = env.PAPERCLIP_SKILLS_MANIFEST;
+  const governance = env.PAPERCLIP_GOVERNANCE_MANIFEST;
+  return ((typeof skills === "string" && skills.length > 0)
+    || (typeof governance === "string" && governance.length > 0))
+    && !/\s/.test(bridgePath);
 }
 
 export type BridgeRunMode = { kind: "ok" } | { kind: "whitespace"; warn: string };
@@ -104,12 +110,11 @@ export function resolveOmpAgentCommand(config: Record<string, unknown>): string 
   const explicit = firstNonEmptyString(config.agentCommand, config.acpAgentCommand);
   const command = firstNonEmptyString(config.command) ?? DEFAULT_OMP_COMMAND;
   const base = explicit ?? `${command} acp`;
-  // Lazy-skill bridge: append --extension <bridgePath> when the run flow
-  // materialized the manifest env (pure function of config — the env presence
-  // IS the bridge-active signal). Side channels that reuse the command but
-  // lack the manifest env simply don't get the flag, so the bridge no-ops
-  // there.
-  const extension = shouldAppendSkillBridgeExtension(config, bridgePath)
+  // Paperclip bridge: append --extension <bridgePath> when the run flow
+  // materialized a manifest env (pure function of config — the env presence IS
+  // the bridge-active signal). Side channels that reuse the command but lack
+  // the manifest env simply don't get the flag, so the bridge no-ops there.
+  const extension = shouldAppendBridgeExtension(config, bridgePath)
     ? ` --extension ${bridgePath}`
     : "";
   // --thinking flag rides agentCommand because the engine's set_config_option
@@ -520,7 +525,7 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     // Lazy-skill bridge: when skillsAsTools is on, materialize the skills
     // manifest and hand its path to the run child via
     // PAPERCLIP_SKILLS_MANIFEST so the bundled bridge extension
-    // (dist/skill-bridge.js) registers each desired skill as an on-demand
+    // (dist/paperclip-bridge.js) registers each desired skill as an on-demand
     // native tool. The env MUST be set before buildOmpAcpConfig runs below so
     // resolveOmpAgentCommand sees it and appends --extension <bridgePath>
     // (which, like --thinking, rotates the session fingerprint). A
@@ -542,6 +547,36 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
           ctx.config.env = { ...(ctx.config.env ?? {}), PAPERCLIP_SKILLS_MANIFEST: manifest };
           bridgeActive = true;
         }
+      }
+    }
+    // Governance substrate (v0.8): when the operator sets governancePolicy,
+    // materialize it into the agent's state dir and hand the path to the run
+    // child via PAPERCLIP_GOVERNANCE_MANIFEST. That env both arms the bridge's
+    // --extension (shouldAppendBridgeExtension) and — because
+    // materializeFailoverOverlay reads the same config — folds
+    // tools.approvalMode:yolo into the overlay, making the bridge the run's
+    // only deterministic permission gate. An unparseable document warns and the
+    // run proceeds ungoverned rather than dying on a policy typo.
+    const governanceManifest = await materializeGovernanceManifest(
+      ctx.config,
+      intelDir,
+      (message) => ctx.onEvent?.({
+        eventType: "run.system", stream: "system", level: "warn", message,
+      }),
+    );
+    if (governanceManifest) {
+      // Fold, never clobber: the skills manifest env may already be set.
+      ctx.config.env = {
+        ...(ctx.config.env ?? {}),
+        PAPERCLIP_GOVERNANCE_MANIFEST: governanceManifest,
+      };
+      // Governance has no prose-injection fallback: without the extension
+      // loaded the policy is decoration, so say so instead of staying quiet.
+      if (resolveBridgeRunMode(bridgePath).kind === "whitespace") {
+        await ctx.onEvent?.({
+          eventType: "run.system", stream: "system", level: "warn",
+          message: "omp governance policy is set but the bridge extension path contains whitespace; guardrails are not enforced",
+        });
       }
     }
     const config = buildOmpAcpConfig(ctx.config, resolveModel, resolveCost);

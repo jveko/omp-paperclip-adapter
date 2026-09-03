@@ -1,7 +1,7 @@
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import {
   afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi,
@@ -9,6 +9,7 @@ import {
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import {
   buildOmpAcpConfig,
+  bridgePath,
   createOmpAcpExecutor,
   deriveDefaultTimeoutSec,
   driveAcpSession,
@@ -18,12 +19,13 @@ import {
   resolveOmpAgentCommand,
   resolveOmpBillingIdentity,
   resolveSessionCwd,
-  shouldAppendSkillBridgeExtension,
+  shouldAppendBridgeExtension,
 } from "./acp.js";
 import { runWithFreshSessionRetry, withRetryChain } from "./retry.js";
 import * as sessionState from "./session-state.js";
 import { loadState, saveState, sessionIntelDir } from "./session-state.js";
 import { FAILOVER_CONFIG_FILE } from "./failover-config.js";
+import { GOVERNANCE_MANIFEST_FILE } from "./governance-manifest.js";
 const engineMocks = vi.hoisted(() => ({
   createAcpxEngineExecutor: vi.fn(),
 }));
@@ -179,6 +181,85 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     expect(merged.config.env?.PI_CONFIG_FILES).toBe(
       "/op/x.yml" + path.delimiter + path.join(sessionIntelDir("co-1", "agent-1"), FAILOVER_CONFIG_FILE),
     );
+  });
+
+  it("governancePolicy set: folds manifest env, single-gate overlay, and --extension", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const run = createOmpAcpExecutor();
+    await run(baseCtx({
+      config: {
+        command: `${process.execPath} ${fakeAcp}`,
+        governancePolicy: 'guardrails:\n  bashDeny:\n    - "rm -rf"\nbudgetCapUsd: 2',
+      },
+    }));
+    const merged = executorFn.mock.calls[0][0];
+    const intel = sessionIntelDir("co-1", "agent-1");
+    expect(merged.config.env?.PAPERCLIP_GOVERNANCE_MANIFEST)
+      .toBe(path.join(intel, GOVERNANCE_MANIFEST_FILE));
+    expect(JSON.parse(await readFile(merged.config.env.PAPERCLIP_GOVERNANCE_MANIFEST, "utf8")))
+      .toEqual({ guardrails: { bashDeny: ["rm -rf"] }, budgetCapUsd: 2 });
+    // Governance alone arms the bridge even with skillsAsTools off — once.
+    expect(merged.config.agentCommand).toContain(`--extension ${bridgePath}`);
+    expect(merged.config.agentCommand.match(/--extension/g)).toHaveLength(1);
+    // The same policy folds the single-gate key into the one overlay file, and
+    // that overlay is what PI_CONFIG_FILES carries.
+    expect(merged.config.env?.PI_CONFIG_FILES).toBe(path.join(intel, FAILOVER_CONFIG_FILE));
+    expect(await readFile(path.join(intel, FAILOVER_CONFIG_FILE), "utf8"))
+      .toContain("approvalMode: yolo");
+  });
+
+  it("without governancePolicy the run keeps its v0.7 shape (no manifest, no yolo)", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const run = createOmpAcpExecutor();
+    await run(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, fallbackChain: "brokerco/main" },
+    }));
+    const merged = executorFn.mock.calls[0][0];
+    const intel = sessionIntelDir("co-1", "agent-1");
+    expect(merged.config.env?.PAPERCLIP_GOVERNANCE_MANIFEST).toBeUndefined();
+    expect(merged.config.agentCommand).not.toContain("--extension");
+    const overlay = await readFile(path.join(intel, FAILOVER_CONFIG_FILE), "utf8");
+    expect(overlay).toContain("fallbackChains");
+    expect(overlay).not.toContain("approvalMode");
+  });
+
+  it("governance folds in alongside the skills manifest instead of clobbering it", async () => {
+    skillManifestMocks.materializeSkillManifest.mockResolvedValue("/tmp/skills-manifest.json");
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const run = createOmpAcpExecutor();
+    await run(baseCtx({
+      config: {
+        command: `${process.execPath} ${fakeAcp}`,
+        skillsAsTools: true,
+        governancePolicy: "budgetCapUsd: 1",
+      },
+    }));
+    const merged = executorFn.mock.calls[0][0];
+    expect(merged.config.env?.PAPERCLIP_SKILLS_MANIFEST).toBe("/tmp/skills-manifest.json");
+    expect(merged.config.env?.PAPERCLIP_GOVERNANCE_MANIFEST).toContain(GOVERNANCE_MANIFEST_FILE);
+    expect(merged.config.agentCommand.match(/--extension/g)).toHaveLength(1);
+  });
+
+  it("malformed governancePolicy warns and runs ungoverned instead of crashing", async () => {
+    const events: { level?: string; message?: string }[] = [];
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const run = createOmpAcpExecutor();
+    await run(baseCtx({
+      config: {
+        command: `${process.execPath} ${fakeAcp}`,
+        governancePolicy: "guardrails: [unclosed",
+      },
+      onEvent: async (ev: unknown) => {
+        events.push(ev as { level?: string; message?: string });
+      },
+    }));
+    const merged = executorFn.mock.calls[0][0];
+    // Ungoverned, not half-governed: no manifest env, no bridge, no yolo overlay.
+    expect(merged.config.env?.PAPERCLIP_GOVERNANCE_MANIFEST).toBeUndefined();
+    expect(merged.config.env?.PI_CONFIG_FILES).toBeUndefined();
+    expect(merged.config.agentCommand).not.toContain("--extension");
+    expect(events.some((e) => e.level === "warn" && /governance/i.test(e.message ?? ""))).toBe(true);
+    expect(executorFn).toHaveBeenCalledOnce();
   });
 
   it("fails the run early when broker mode lacks env", async () => {
@@ -837,43 +918,63 @@ describe("resolveOmpAgentCommand", () => {
   it("appends --extension <bridgePath> when env has PAPERCLIP_SKILLS_MANIFEST", () => {
     expect(resolveOmpAgentCommand({
       env: { PAPERCLIP_SKILLS_MANIFEST: "/tmp/manifest.json" },
-    })).toBe("omp acp --extension " + path.join(path.dirname(fileURLToPath(import.meta.url)), "../../dist/skill-bridge.js"));
+    })).toBe("omp acp --extension " + path.join(path.dirname(fileURLToPath(import.meta.url)), "../../dist/paperclip-bridge.js"));
   });
 
-  it("does not append --extension when env lacks PAPERCLIP_SKILLS_MANIFEST", () => {
+  it("does not append --extension when env lacks any manifest env", () => {
     expect(resolveOmpAgentCommand({})).toBe("omp acp");
   });
 
-  it("does not append --extension when PAPERCLIP_SKILLS_MANIFEST is empty string", () => {
+  it("does not append --extension when the manifest envs are empty strings", () => {
     expect(resolveOmpAgentCommand({
-      env: { PAPERCLIP_SKILLS_MANIFEST: "" },
+      env: { PAPERCLIP_SKILLS_MANIFEST: "", PAPERCLIP_GOVERNANCE_MANIFEST: "" },
     })).toBe("omp acp");
+  });
+
+  it("appends --extension when only PAPERCLIP_GOVERNANCE_MANIFEST is set", () => {
+    expect(resolveOmpAgentCommand({
+      env: { PAPERCLIP_GOVERNANCE_MANIFEST: "/tmp/governance.json" },
+    })).toBe("omp acp --extension " + path.join(path.dirname(fileURLToPath(import.meta.url)), "../../dist/paperclip-bridge.js"));
   });
 });
 
-describe("shouldAppendSkillBridgeExtension", () => {
+describe("shouldAppendBridgeExtension", () => {
   it("returns true when manifest env is set and bridgePath is whitespace-free", () => {
-    expect(shouldAppendSkillBridgeExtension(
+    expect(shouldAppendBridgeExtension(
       { env: { PAPERCLIP_SKILLS_MANIFEST: "/tmp/m.json" } },
-      "/opt/omp/dist/skill-bridge.js",
+      "/opt/omp/dist/paperclip-bridge.js",
     )).toBe(true);
   });
 
   it("returns false when manifest env is missing", () => {
-    expect(shouldAppendSkillBridgeExtension({}, "/opt/omp/dist/skill-bridge.js")).toBe(false);
+    expect(shouldAppendBridgeExtension({}, "/opt/omp/dist/paperclip-bridge.js")).toBe(false);
   });
 
   it("returns false when manifest env is empty string", () => {
-    expect(shouldAppendSkillBridgeExtension(
+    expect(shouldAppendBridgeExtension(
       { env: { PAPERCLIP_SKILLS_MANIFEST: "" } },
-      "/opt/omp/dist/skill-bridge.js",
+      "/opt/omp/dist/paperclip-bridge.js",
     )).toBe(false);
   });
 
   it("returns false when bridgePath contains whitespace", () => {
-    expect(shouldAppendSkillBridgeExtension(
+    expect(shouldAppendBridgeExtension(
       { env: { PAPERCLIP_SKILLS_MANIFEST: "/tmp/m.json" } },
-      "/opt/omp dist/skill-bridge.js",
+      "/opt/omp dist/paperclip-bridge.js",
+    )).toBe(false);
+  });
+
+  it("returns true when only the governance manifest env is set", () => {
+    expect(shouldAppendBridgeExtension(
+      { env: { PAPERCLIP_GOVERNANCE_MANIFEST: "/tmp/g.json" } },
+      "/opt/omp/dist/paperclip-bridge.js",
+    )).toBe(true);
+  });
+
+  it("returns false when the governance manifest env is empty", () => {
+    expect(shouldAppendBridgeExtension(
+      { env: { PAPERCLIP_SKILLS_MANIFEST: "", PAPERCLIP_GOVERNANCE_MANIFEST: "" } },
+      "/opt/omp/dist/paperclip-bridge.js",
     )).toBe(false);
   });
 });
@@ -883,26 +984,26 @@ describe("resolveBridgeRunMode", () => {
   // so the prose-fallback branch of the run wiring is guarded behind this
   // helper (it takes bridgePath). A whitespace result warns AND leaves the
   // bridge inactive, so prose injection runs and resolveOmpAgentCommand
-  // appends no --extension (shouldAppendSkillBridgeExtension returns false).
+  // appends no --extension (shouldAppendBridgeExtension returns false).
   it("returns whitespace (prose-fallback) mode with a warn when bridgePath has whitespace", () => {
-    const mode = resolveBridgeRunMode("/opt/omp dist/skill-bridge.js");
+    const mode = resolveBridgeRunMode("/opt/omp dist/paperclip-bridge.js");
     expect(mode).toEqual({
       kind: "whitespace",
       warn: "omp skills-as-tools bridge path contains whitespace; falling back to prompt-injected skill instructions",
     });
     // No --extension when the bridge is off (the run wiring warns and falls
     // back to prose injection instead).
-    expect(shouldAppendSkillBridgeExtension(
+    expect(shouldAppendBridgeExtension(
       { env: { PAPERCLIP_SKILLS_MANIFEST: "/tmp/m.json" } },
-      "/opt/omp dist/skill-bridge.js",
+      "/opt/omp dist/paperclip-bridge.js",
     )).toBe(false);
   });
 
   it("returns ok (bridge active) for a whitespace-free bridgePath", () => {
-    expect(resolveBridgeRunMode("/opt/omp/dist/skill-bridge.js")).toEqual({ kind: "ok" });
-    expect(shouldAppendSkillBridgeExtension(
+    expect(resolveBridgeRunMode("/opt/omp/dist/paperclip-bridge.js")).toEqual({ kind: "ok" });
+    expect(shouldAppendBridgeExtension(
       { env: { PAPERCLIP_SKILLS_MANIFEST: "/tmp/m.json" } },
-      "/opt/omp/dist/skill-bridge.js",
+      "/opt/omp/dist/paperclip-bridge.js",
     )).toBe(true);
   });
 });

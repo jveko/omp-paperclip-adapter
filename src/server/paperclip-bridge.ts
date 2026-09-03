@@ -1,12 +1,15 @@
 import { promises as fs } from "node:fs";
 
 /**
- * Lazy-skill bridge: a static omp ExtensionAPI extension loaded via
- * `--extension <dist/skill-bridge.js>`. On `session_start` it registers one
- * zero-arg `loadMode:"essential"` native tool per enabled Paperclip company
- * skill; each tool's `execute()` returns the skill's SKILL.md **on demand**,
- * re-reading the file fresh per call so skill content edits land on the next
- * invocation even in a warm session.
+ * Paperclip bridge: the adapter's one static omp ExtensionAPI extension, loaded
+ * via `--extension <dist/paperclip-bridge.js>`. Today it carries the v0.7
+ * lazy-skill lane: on `session_start` it registers one zero-arg
+ * `loadMode:"essential"` native tool per enabled Paperclip company skill, and
+ * each tool's `execute()` returns the skill's SKILL.md **on demand**, re-reading
+ * the file fresh per call so skill content edits land on the next invocation
+ * even in a warm session. The v0.8 governance lanes attach to this same
+ * extension (their manifest arrives as PAPERCLIP_GOVERNANCE_MANIFEST), which is
+ * why the file is not named after skills alone.
  *
  * Self-contained on purpose: runtime imports are node builtins only, so esbuild
  * bundles this file cleanly and omp loads it via dynamic `import()`. The types
@@ -54,13 +57,13 @@ function isSkillManifestEntry(value: unknown): value is SkillManifestEntry {
 }
 
 /**
- * Register the skill bridge on `pi`. The manifest path is read from
+ * Register the paperclip bridge on `pi`. The manifest path is read from
  * `PAPERCLIP_SKILLS_MANIFEST` at `session_start`; when it is unset, unreadable,
  * or unparseable we no-op (no throw) — the bridge also loads in the adapter's
  * side-channel omp children, which never receive the manifest env and must
  * silently skip registration.
  */
-export default function registerSkillBridge(pi: BridgePi): void {
+export default function registerPaperclipBridge(pi: BridgePi): void {
   pi.on("session_start", async () => {
     const manifestPath = process.env.PAPERCLIP_SKILLS_MANIFEST;
     if (!manifestPath) return;

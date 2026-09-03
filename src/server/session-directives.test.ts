@@ -72,7 +72,7 @@ describe("getSessionConfigSchema", () => {
       "sessionBrowser", "sessionForceFreshToken", "sessionForkSourceId",
       "sessionForkToken", "sessionMaxRuns", "sessionMaxAgeHours",
       "credentialMode", "thinking", "fallbackChain", "usageReport",
-      "skillsAsTools",
+      "skillsAsTools", "governancePolicy",
     ]);
     for (const field of schema.fields) expect(field.hint).toContain("next run");
   });
@@ -92,6 +92,16 @@ describe("getSessionConfigSchema", () => {
     expect(t.options.map((o: { value: string }) => o.value)).toEqual([
       "default", "off", "auto", "minimal", "low", "medium", "high", "xhigh", "max",
     ]);
+  });
+  it("exposes the v0.8 governance policy as a textarea (empty = off)", () => {
+    const byKey = Object.fromEntries(getSessionConfigSchema().fields.map((f) => [f.key, f]));
+    const g = byKey.governancePolicy;
+    expect(g.type).toBe("textarea");
+    expect(g.default).toBeUndefined();
+    expect(g.hint).toMatch(/guardrails/i);
+    expect(g.hint).toMatch(/budgetCapUsd/);
+    expect(g.hint).toMatch(/approvedEndpoints/);
+    expect(g.hint).toMatch(/approvalRequired/);
   });
 });
 

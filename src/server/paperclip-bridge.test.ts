@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import registerSkillBridge from "./skill-bridge.js";
+import registerPaperclipBridge from "./paperclip-bridge.js";
 
 /* ------------------------------------------------------------------ */
 /*  Mock pi                                                           */
@@ -37,7 +37,7 @@ function makeMockPi(): {
       registered.push(tool);
     },
   };
-  registerSkillBridge(pi); // sync — registers the session_start handler
+  registerPaperclipBridge(pi); // sync — registers the session_start handler
   return { registered, handler: () => handler!() };
 }
 
@@ -48,7 +48,7 @@ function makeMockPi(): {
 async function captureTools(
   skills: { name: string; toolName: string; description: string; markdown: string }[],
 ): Promise<CapturedTool[]> {
-  const dir = path.join(tmpdir(), `skill-bridge-test-${randomUUID()}`);
+  const dir = path.join(tmpdir(), `paperclip-bridge-test-${randomUUID()}`);
   await fs.mkdir(dir, { recursive: true });
 
   const entries: {
@@ -84,7 +84,7 @@ async function captureTools(
 /*  Tests                                                             */
 /* ------------------------------------------------------------------ */
 
-describe("registerSkillBridge", () => {
+describe("registerPaperclipBridge", () => {
   afterEach(() => {
     delete process.env.PAPERCLIP_SKILLS_MANIFEST;
   });
@@ -137,7 +137,7 @@ describe("registerSkillBridge", () => {
   });
 
   it("re-reads markdown per execute() — staleness guard", async () => {
-    const dir = path.join(tmpdir(), `skill-bridge-test-${randomUUID()}`);
+    const dir = path.join(tmpdir(), `paperclip-bridge-test-${randomUUID()}`);
     await fs.mkdir(dir, { recursive: true });
 
     const mdPath = path.join(dir, "stale.md");
@@ -212,7 +212,7 @@ describe("registerSkillBridge", () => {
   });
 
   it("no-ops when manifest JSON is not an array", async () => {
-    const dir = path.join(tmpdir(), `skill-bridge-test-${randomUUID()}`);
+    const dir = path.join(tmpdir(), `paperclip-bridge-test-${randomUUID()}`);
     await fs.mkdir(dir, { recursive: true });
     const manifestPath = path.join(dir, "not-an-array.json");
     await fs.writeFile(manifestPath, JSON.stringify({ not: "an array" }), "utf8");
@@ -223,7 +223,7 @@ describe("registerSkillBridge", () => {
   });
 
   it("skips malformed manifest entries without failing registration", async () => {
-    const dir = path.join(tmpdir(), `skill-bridge-test-${randomUUID()}`);
+    const dir = path.join(tmpdir(), `paperclip-bridge-test-${randomUUID()}`);
     await fs.mkdir(dir, { recursive: true });
 
     // Write a manifest with a mix of valid and invalid entries

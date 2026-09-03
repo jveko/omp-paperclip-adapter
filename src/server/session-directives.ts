@@ -126,6 +126,8 @@ export function getSessionConfigSchema(): AdapterConfigSchema {
         hint: `Emit an omp-usage work product with cost estimates. ${NEXT_RUN}` },
       { key: "skillsAsTools", label: "Expose skills as on-demand tools", type: "toggle", default: false,
         hint: `Register each enabled company skill as a native omp tool that returns its instructions on demand, instead of injecting all skill text into the prompt. Reduces context use. ${NEXT_RUN}` },
+      { key: "governancePolicy", label: "Governance policy (YAML/JSON)", type: "textarea",
+        hint: `Rules the run's omp child enforces through the paperclip bridge: guardrails (pathScopes, bashDeny, denyTools, argRevisions), budgetCapUsd, approvedEndpoints, approvalRequired. Empty = off. While set, the omp permission proxy auto-approves so the bridge is the single gate; a document that cannot be parsed is skipped with a warning rather than run ungoverned. Adding or clearing the policy rotates the session (fingerprint change), so rule edits land on the next rotation. ${NEXT_RUN}` },
     ],
   };
 }
