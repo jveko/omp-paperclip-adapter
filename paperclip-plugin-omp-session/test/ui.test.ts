@@ -70,6 +70,7 @@ const OVERVIEW = {
       },
       usage: { prompt_tokens: 1500, completion_tokens: 800 },
       costUsd: 7,
+      model: "gpt-4o",
     },
     {
       id: "run-2",
@@ -83,6 +84,7 @@ const OVERVIEW = {
       },
       usage: { prompt_tokens: 500, completion_tokens: 100 },
       costUsd: 3,
+      model: null,
     },
   ],
   summary: {
@@ -135,6 +137,10 @@ describe("OmpSessionOverview detailTab", () => {
     // Per-run data: status badges with mapped variants
     expect(html).toContain('data-status="ok">completed');
     expect(html).toContain('data-status="error">failed');
+    // Model column: non-null on run 1, em-dash placeholder on the null run
+    expect(html).toContain("Model");
+    expect(html).toContain(">gpt-4o<");
+    expect(html).toContain("<td>\u2014</td>");
     // Cost per run
     expect(html).toContain("$7.00");
     expect(html).toContain("$3.00");

@@ -18,6 +18,7 @@ interface RunOverview {
   sessionRuntime: SessionRuntime | null;
   usage: Record<string, number> | null;
   costUsd: number;
+  model: string | null;
 }
 
 interface OmpSessionOverview {
@@ -82,6 +83,7 @@ describe("omp-session-overview data handler", () => {
     stubDb(harness, [RUN_1, RUN_2], [
       { run_id: "run-1", model: "gpt-4", cost_cents: 500 },
       { run_id: "run-1", model: "gpt-4", cost_cents: 200 },
+      { run_id: "run-1", model: null, cost_cents: 0 },
       { run_id: "run-2", model: "claude-3", cost_cents: 300 },
     ]);
 
@@ -104,8 +106,9 @@ describe("omp-session-overview data handler", () => {
       mcpServerCount: 2,
     });
     expect(r1.usage).toEqual({ prompt_tokens: 1500, completion_tokens: 800 });
-    // 500 + 200 cents = 700 -> 7.00 USD
+    // 500 + 200 + 0 cents (one NULL-model event) = 700 -> 7.00 USD
     expect(r1.costUsd).toBe(7);
+    expect(r1.model).toBe("gpt-4");
 
     const r2 = overview.runs[1];
     expect(r2.id).toBe("run-2");
@@ -117,6 +120,7 @@ describe("omp-session-overview data handler", () => {
     });
     expect(r2.usage).toEqual({ prompt_tokens: 500, completion_tokens: 100 });
     expect(r2.costUsd).toBe(3);
+    expect(r2.model).toBe("claude-3");
 
     // 30 min + 5 min = 2100 seconds
     expect(overview.summary.totalSessionSeconds).toBe(2100);
@@ -157,6 +161,37 @@ describe("omp-session-overview data handler", () => {
     expect(overview.summary.totalCostUsd).toBe(2);
   });
 
+  it("joins distinct per-run models in first-seen order (failover retries)", async () => {
+    const harness = await makeHarness();
+    stubDb(harness, [RUN_1], [
+      { run_id: "run-1", model: "gpt-4", cost_cents: 100 },
+      { run_id: "run-1", model: "gpt-4", cost_cents: 100 },
+      { run_id: "run-1", model: "claude-3", cost_cents: 100 },
+    ]);
+
+    const overview = await harness.getData<OmpSessionOverview>(
+      "omp-session-overview",
+      { agentId: "test-agent-1" },
+    );
+
+    // duplicates dropped, first-seen order kept (fallbackChain retries span models)
+    expect(overview.runs[0].model).toBe("gpt-4, claude-3");
+  });
+
+  it("leaves model null when every cost event has a null model", async () => {
+    const harness = await makeHarness();
+    stubDb(harness, [RUN_1], [{ run_id: "run-1", model: null, cost_cents: 42 }]);
+
+    const overview = await harness.getData<OmpSessionOverview>(
+      "omp-session-overview",
+      { agentId: "test-agent-1" },
+    );
+
+    expect(overview.runs[0].model).toBeNull();
+    // cost summing must survive a missing model
+    expect(overview.runs[0].costUsd).toBeCloseTo(0.42);
+  });
+
   it("degrades gracefully on malformed usage_json", async () => {
     const harness = await makeHarness();
     stubDb(harness, [{ ...RUN_1, usage_json: "not-json" }], []);
@@ -168,6 +203,8 @@ describe("omp-session-overview data handler", () => {
 
     expect(overview.runs).toHaveLength(1);
     expect(overview.runs[0].usage).toBeNull();
+    // no cost_events at all -> model is null, not undefined/throwing
+    expect(overview.runs[0].model).toBeNull();
     // Other fields still populated
     expect(overview.runs[0].sessionRuntime).toEqual({
       fork: { requested: "sess-a", applied: true, activeSessionId: "sess-a" },
@@ -187,6 +224,7 @@ describe("omp-session-overview data handler", () => {
 
     expect(overview.runs[0].sessionRuntime).toBeNull();
     expect(overview.runs[0].usage).toEqual({ prompt_tokens: 1500, completion_tokens: 800 });
+    expect(overview.runs[0].model).toBeNull();
   });
 
   it("returns an empty overview when agentId is missing", async () => {

@@ -24,6 +24,8 @@ interface RunOverview {
   sessionRuntime: SessionRuntime | null;
   usage: Record<string, number> | null;
   costUsd: number;
+  // Nullable: cost_events.model is NULL when the provider reported none.
+  model: string | null;
 }
 
 interface OmpSessionOverview {
@@ -91,6 +93,10 @@ function formatSessionRuntime(rt: SessionRuntime | null): string {
   if (rt.rotation) parts.push(`rot:${rt.rotation.reason}`);
   if (rt.mcpServerCount != null) parts.push(`mcp:${rt.mcpServerCount}`);
   return parts.join(" ") || "\u2014";
+}
+
+function formatModel(model: string | null): string {
+  return model || "\u2014";
 }
 
 // -- Component ---------------------------------------------------------------
@@ -183,6 +189,12 @@ export function OmpSessionOverview({ context }: PluginDetailTabProps) {
             header: "Usage",
             width: "240px",
             render: (v) => formatUsage(v as Record<string, number> | null),
+          },
+          {
+            key: "model",
+            header: "Model",
+            width: "160px",
+            render: (v) => formatModel(v as string | null),
           },
           {
             key: "costUsd",

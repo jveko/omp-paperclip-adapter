@@ -31,6 +31,10 @@ interface RunOverview {
   sessionRuntime: SessionRuntime | null;
   usage: Record<string, number> | null;
   costUsd: number;
+  // Distinct non-null cost_events.model values for the run, first-seen order,
+  // joined with ", " (a failover run can span models); null when every event
+  // has a NULL model or the run has no cost events.
+  model: string | null;
 }
 
 interface OmpSessionOverview {
@@ -130,11 +134,18 @@ const plugin = definePlugin({
         [agentId, runs.map((r) => r.id)],
       );
 
-      // Build cost map: run_id -> totalCents
+      // Build cost map: run_id -> totalCents, and model map: run_id ->
+      // distinct non-null models in row order. cost_events.model is nullable.
       const costByRun = new Map<string, number>();
+      const modelsByRun = new Map<string, Set<string>>();
       for (const row of costRows) {
         const cents = typeof row.cost_cents === "number" ? row.cost_cents : 0;
         costByRun.set(row.run_id, (costByRun.get(row.run_id) ?? 0) + cents);
+        if (row.model) {
+          const models = modelsByRun.get(row.run_id) ?? new Set<string>();
+          models.add(row.model);
+          modelsByRun.set(row.run_id, models);
+        }
       }
 
       // Summary cost is scoped to the SAME recent-runs window as Runs/Duration
@@ -170,6 +181,7 @@ const plugin = definePlugin({
         }
 
         const runCost = costByRun.get(row.id) ?? 0;
+        const runModels = modelsByRun.get(row.id);
 
         parsedRuns.push({
           id: row.id,
@@ -179,6 +191,7 @@ const plugin = definePlugin({
           sessionRuntime,
           usage,
           costUsd: runCost / 100,
+          model: runModels && runModels.size > 0 ? [...runModels].join(", ") : null,
         });
 
         // Accumulate totals
