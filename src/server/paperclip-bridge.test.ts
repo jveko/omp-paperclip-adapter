@@ -18,27 +18,104 @@ interface CapturedTool {
   execute: () => Promise<{ content: { type: string; text: string }[] }>;
 }
 
+/** Structural mirror of the omp `tool_call` event the guardrail handler reads. */
+interface ToolCallEvent {
+  type: "tool_call";
+  toolCallId: string;
+  toolName: string;
+  input: Record<string, unknown>;
+}
+
+interface ToolCallContext {
+  cwd: string;
+}
+
+interface ToolCallResult {
+  block?: boolean;
+  reason?: string;
+  input?: Record<string, unknown>;
+}
+
+type GuardrailHandler = (
+  event: ToolCallEvent,
+  ctx: ToolCallContext,
+) => ToolCallResult | undefined | void;
+
+/** Wide enough to hold any subscription the bridge makes. */
+type CapturedHandler = (event?: unknown, ctx?: unknown) => unknown;
+
 interface MockPi {
-  on: (event: string, handler: () => Promise<void>) => void;
+  on(event: "session_start", handler: () => void | Promise<void>): void;
+  on(event: "tool_call", handler: GuardrailHandler): void;
   registerTool: (tool: CapturedTool) => void;
 }
 
+interface MockPiHandle {
+  registered: CapturedTool[];
+  /** Subscribed omp event names — lets tests assert lane decoupling. */
+  events: () => string[];
+  /** Runs the `session_start` handler (the bridge's only async entry point). */
+  sessionStart: () => Promise<void>;
+  /** Runs the guardrail `tool_call` handler; throws when it was never registered. */
+  toolCall: (
+    toolName: string,
+    input: Record<string, unknown>,
+    ctx?: ToolCallContext,
+  ) => ToolCallResult | undefined;
+  /** Invokes the tool_call subscription with an arbitrary (possibly invalid) payload. */
+  toolCallRaw: (event: unknown, ctx: unknown) => unknown;
+}
+
+function makeMockPiFull(): MockPiHandle {
+  const registered: CapturedTool[] = [];
+  const handlers: Record<string, CapturedHandler> = {};
+  const pi: MockPi = {
+    on(event: string, handler: CapturedHandler) {
+      handlers[event] = handler;
+    },
+    registerTool(tool) {
+      registered.push(tool);
+    },
+  };
+  registerPaperclipBridge(pi); // sync — subscribes the lane handlers
+  const subscription = (event: string): CapturedHandler | undefined => handlers[event];
+  // A function's parameter types are not observable at runtime, so each
+  // subscription is narrowed to the event contract it was stored under.
+  const guardrail = (): GuardrailHandler => {
+    const captured = subscription("tool_call");
+    if (!captured) throw new Error("tool_call handler was never registered");
+    return captured as GuardrailHandler;
+  };
+  return {
+    registered,
+    events: () => Object.keys(handlers),
+    sessionStart: async () => {
+      await subscription("session_start")?.();
+    },
+    toolCall(toolName, input, ctx = { cwd: process.cwd() }) {
+      const event: ToolCallEvent = {
+        type: "tool_call",
+        toolCallId: "call-1",
+        toolName,
+        input,
+      };
+      return guardrail()(event, ctx) ?? undefined;
+    },
+    toolCallRaw: (event, ctx) => {
+      // Deliberately malformed payloads: the guardrail must not throw on them.
+      const call = guardrail() as (event: unknown, ctx: unknown) => unknown;
+      return call(event, ctx);
+    },
+  };
+}
+
+/** Skills-lane shim: the v0.7 tests only ever need session_start + registerTool. */
 function makeMockPi(): {
   registered: CapturedTool[];
   handler: () => Promise<void>;
 } {
-  const registered: CapturedTool[] = [];
-  let handler: (() => Promise<void>) | undefined;
-  const pi: MockPi = {
-    on: (_event, h) => {
-      handler = h;
-    },
-    registerTool: (tool) => {
-      registered.push(tool);
-    },
-  };
-  registerPaperclipBridge(pi); // sync — registers the session_start handler
-  return { registered, handler: () => handler!() };
+  const full = makeMockPiFull();
+  return { registered: full.registered, handler: full.sessionStart };
 }
 
 /* ------------------------------------------------------------------ */
@@ -84,11 +161,12 @@ async function captureTools(
 /*  Tests                                                             */
 /* ------------------------------------------------------------------ */
 
-describe("registerPaperclipBridge", () => {
-  afterEach(() => {
-    delete process.env.PAPERCLIP_SKILLS_MANIFEST;
-  });
+afterEach(() => {
+  delete process.env.PAPERCLIP_SKILLS_MANIFEST;
+  delete process.env.PAPERCLIP_GOVERNANCE_MANIFEST;
+});
 
+describe("registerPaperclipBridge", () => {
   it("registers one tool per skill with loadMode=essential and empty parameters", async () => {
     const registered = await captureTools([
       {
@@ -256,5 +334,342 @@ describe("registerPaperclipBridge", () => {
     expect(registered).toHaveLength(2);
     expect(registered[0].name).toBe("good");
     expect(registered[1].name).toBe("also_good");
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Governance fixtures                                                */
+/* ------------------------------------------------------------------ */
+
+interface GovernanceFixture {
+  pi: MockPiHandle;
+  /** Manifest file path (so tests can rewrite the policy in place). */
+  file: string;
+  /** The run's working directory. */
+  cwd: string;
+  /** The single allowed root for pathScopes tests. */
+  root: string;
+}
+
+interface GovernanceDirs {
+  dir: string;
+  cwd: string;
+  root: string;
+}
+
+/** A policy document, or a builder given the fixture's directories. */
+type GovernancePolicyDoc =
+  | Record<string, unknown>
+  | ((dirs: GovernanceDirs) => Record<string, unknown>);
+
+/**
+ * Writes `<tmp>/governance.json` with the policy, points
+ * PAPERCLIP_GOVERNANCE_MANIFEST at it, loads the bridge and fires
+ * session_start — the shape a governed run child actually sees. Passing
+ * `skillToolNames` also materializes a skills manifest, for the coexistence
+ * case where one agent runs both lanes.
+ */
+async function governanceFixture(
+  policy: GovernancePolicyDoc,
+  skillToolNames: string[] = [],
+): Promise<GovernanceFixture> {
+  const dir = path.join(tmpdir(), `paperclip-bridge-gov-${randomUUID()}`);
+  const cwd = path.join(dir, "work");
+  const root = path.join(dir, "sandbox");
+  await fs.mkdir(cwd, { recursive: true });
+  await fs.mkdir(root, { recursive: true });
+
+  const file = path.join(dir, "governance.json");
+  const doc = typeof policy === "function" ? policy({ dir, cwd, root }) : policy;
+  await fs.writeFile(file, JSON.stringify(doc, null, 2), "utf8");
+  process.env.PAPERCLIP_GOVERNANCE_MANIFEST = file;
+
+  if (skillToolNames.length > 0) {
+    const skillsFile = path.join(dir, "skills-manifest.json");
+    await fs.writeFile(
+      skillsFile,
+      JSON.stringify(
+        skillToolNames.map((toolName) => ({
+          name: toolName,
+          toolName,
+          description: `${toolName} skill`,
+          markdownPath: path.join(dir, `${toolName}.md`),
+        })),
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    for (const toolName of skillToolNames) {
+      const markdown = path.join(dir, `${toolName}.md`);
+      await fs.writeFile(markdown, `# ${toolName}`, "utf8");
+    }
+    process.env.PAPERCLIP_SKILLS_MANIFEST = skillsFile;
+  }
+
+  const pi = makeMockPiFull();
+  await pi.sessionStart();
+  return { pi, file, cwd, root };
+}
+
+/** Rewrite the manifest in place, rotating mtime so the staleness check fires. */
+async function rewriteGovernance(file: string, doc: unknown): Promise<void> {
+  const before = await fs.stat(file);
+  await fs.writeFile(file, JSON.stringify(doc, null, 2), "utf8");
+  const when = new Date(before.mtimeMs + 5_000);
+  await fs.utimes(file, when, when);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Guardrail rules                                                    */
+/* ------------------------------------------------------------------ */
+
+describe("governance guardrails (tool_call)", () => {
+  it("pathScopes: blocks write outside the allow root, allows inside", async () => {
+    const { pi, cwd, root } = await governanceFixture(({ root: allowed }) => ({
+      guardrails: { pathScopes: { allow: [allowed] } },
+    }));
+
+    const blocked = pi.toolCall("write", { path: path.join(root, "..", "escape.txt"), content: "x" }, { cwd });
+    expect(blocked?.block).toBe(true);
+    expect(typeof blocked?.reason).toBe("string");
+    expect(blocked?.reason?.length).toBeGreaterThan(0);
+    expect(blocked?.input).toBeUndefined();
+
+    expect(
+      pi.toolCall("write", { path: path.join(root, "ok.txt"), content: "x" }, { cwd }),
+    ).toBeUndefined();
+
+    // Relative paths resolve against the run's cwd, so a cwd-relative target
+    // inside the root is allowed and one outside it is not.
+    expect(pi.toolCall("write", { path: "ok.txt", content: "x" }, { cwd: root })).toBeUndefined();
+    expect(pi.toolCall("write", { path: "../out.txt", content: "x" }, { cwd: root })?.block).toBe(true);
+  });
+
+  it("pathScopes: with no allow list the run cwd is the implicit root", async () => {
+    const { pi, cwd } = await governanceFixture({
+      guardrails: { pathScopes: { denyOutside: true } },
+    });
+
+    expect(pi.toolCall("write", { path: "src/a.ts" }, { cwd })).toBeUndefined();
+    expect(pi.toolCall("edit", { path: "src/a.ts" }, { cwd })).toBeUndefined();
+    expect(pi.toolCall("write", { path: "/etc/hosts" }, { cwd })?.block).toBe(true);
+  });
+
+  it("pathScopes: guards read and every derived edit path", async () => {
+    const { pi, cwd, root } = await governanceFixture(({ root: allowed }) => ({
+      guardrails: { pathScopes: { allow: [allowed] } },
+    }));
+
+    expect(pi.toolCall("read", { path: path.join(cwd, "secret.env") }, { cwd })?.block).toBe(true);
+    expect(pi.toolCall("read", { path: path.join(root, "a.txt") }, { cwd })).toBeUndefined();
+    // Hashline edit normalizes to `paths` with more than one target.
+    const mixed = pi.toolCall(
+      "edit",
+      { paths: [path.join(root, "a.txt"), path.join(cwd, "b.txt")] },
+      { cwd },
+    );
+    expect(mixed?.block).toBe(true);
+    expect(pi.toolCall("edit", { paths: [path.join(root, "a.txt")] }, { cwd })).toBeUndefined();
+    // omp's file tools accept the Claude-style `file_path` alias, so the gate
+    // must read it too — otherwise rewording the argument escapes the rail.
+    expect(pi.toolCall("write", { file_path: path.join(cwd, "s.txt"), content: "x" }, { cwd })?.block).toBe(true);
+    expect(pi.toolCall("write", { file_path: path.join(root, "s.txt"), content: "x" }, { cwd })).toBeUndefined();
+  });
+
+  it("pathScopes: a symlinked ancestor into the sandbox still resolves outside", async () => {
+    const { pi, cwd, root } = await governanceFixture(({ root: allowed }) => ({
+      guardrails: { pathScopes: { allow: [allowed] } },
+    }));
+
+    const outside = path.resolve(root, "..", "outside");
+    const link = path.join(root, "link");
+    await fs.mkdir(outside, { recursive: true });
+    try {
+      await fs.symlink(outside, link, "dir");
+    } catch (err) {
+      // Filesystems without symlink rights (or a pre-existing link) cannot
+      // exercise the ancestor realpath; skip rather than report a false fail.
+      if (err instanceof Error && /EPERM|ENOSYS|EEXIST/.test(err.message)) return;
+      throw err;
+    }
+    expect(pi.toolCall("write", { path: path.join(link, "f.txt"), content: "x" }, { cwd })?.block).toBe(true);
+  });
+
+  it("bashDeny: matches whole commands and compound segments", async () => {
+    const { pi, cwd } = await governanceFixture({
+      guardrails: { bashDeny: ["rm\\s+-rf\\s+/"] },
+    });
+
+    expect(pi.toolCall("bash", { command: "rm -rf /" }, { cwd })?.block).toBe(true);
+    expect(pi.toolCall("bash", { command: "echo ok && ls" }, { cwd })).toBeUndefined();
+    // The dangerous segment is buried in a compound line.
+    const compound = pi.toolCall("bash", { command: "cd /tmp; echo hi && rm -rf / --no-preserve-root" }, { cwd });
+    expect(compound?.block).toBe(true);
+    expect(compound?.reason).toContain("rm\\s+-rf\\s+/");
+    // Non-bash tools carry no `command`: the rule cannot fire on them.
+    expect(pi.toolCall("write", { path: "rm -rf /", content: "x" }, { cwd })).toBeUndefined();
+  });
+
+  it("denyTools: blocks exact tool names only", async () => {
+    const { pi, cwd } = await governanceFixture({
+      guardrails: { denyTools: ["web_search", "mcp__github__search_prs"] },
+    });
+
+    expect(pi.toolCall("web_search", { query: "x" }, { cwd })?.block).toBe(true);
+    expect(pi.toolCall("mcp__github__search_prs", {}, { cwd })?.block).toBe(true);
+    expect(pi.toolCall("web_search_extra", {}, { cwd })).toBeUndefined();
+    expect(pi.toolCall("grep", { pattern: "x" }, { cwd })).toBeUndefined();
+  });
+
+  it("control tools are never blocked; task is not a control tool", async () => {
+    const { pi, cwd } = await governanceFixture({
+      guardrails: {
+        denyTools: ["yield", "goal", "think", "todo", "hub", "task"],
+        bashDeny: [".*"],
+        pathScopes: { allow: ["/forbidden-root"] },
+      },
+    });
+
+    for (const tool of ["yield", "goal", "think", "todo", "hub"]) {
+      expect(pi.toolCall(tool, { command: "rm -rf /", path: "/etc/hosts" }, { cwd })).toBeUndefined();
+    }
+    // `task` IS subject to the guardrails (it is only special to the T3 budget gate).
+    expect(pi.toolCall("task", {}, { cwd })?.block).toBe(true);
+  });
+
+  it("argRevisions: merge into the executed args of simple tools", async () => {
+    const { pi, cwd } = await governanceFixture({
+      guardrails: {
+        argRevisions: {
+          bash: { timeout: 30 },
+          write: { path: "/sandboxed/notes.md" },
+        },
+      },
+    });
+
+    const revised = pi.toolCall("bash", { command: "make", timeout: 600 }, { cwd });
+    expect(revised?.block).toBeUndefined();
+    expect(revised?.input).toEqual({ command: "make", timeout: 30 });
+    expect(
+      pi.toolCall("write", { path: "/tmp/x.md", content: "hi" }, { cwd })?.input,
+    ).toEqual({ path: "/sandboxed/notes.md", content: "hi" });
+    // Untouched tool calls are not revised at all.
+    expect(pi.toolCall("read", { path: "/tmp/x.md" }, { cwd })).toBeUndefined();
+  });
+
+  it("argRevisions: skipped for hashline edit, whose raw args the event cannot show", async () => {
+    const { pi, cwd } = await governanceFixture({
+      guardrails: { argRevisions: { edit: { path: "/sandboxed/x" } } },
+    });
+
+    // `event.input.path` for edit can be a gate-only derived field; replacing
+    // raw execution args from it would corrupt the call, so it is not revised.
+    expect(pi.toolCall("edit", { path: "a.ts", input: "PUT 1.=1:\n+x" }, { cwd })).toBeUndefined();
+  });
+
+  it("re-reads the manifest when its mtime moves (warm-session staleness)", async () => {
+    const { pi, file, cwd } = await governanceFixture({
+      guardrails: { denyTools: ["alpha_x"] },
+    });
+
+    expect(pi.toolCall("alpha_x", {}, { cwd })?.block).toBe(true);
+
+    // Same byte length: only the mtime fingerprint can reveal the edit.
+    await rewriteGovernance(file, { guardrails: { denyTools: ["alpha_y"] } });
+
+    expect(pi.toolCall("alpha_x", {}, { cwd })).toBeUndefined();
+    expect(pi.toolCall("alpha_y", {}, { cwd })?.block).toBe(true);
+  });
+
+  /* ---------------- decoupling + fail-soft ---------------- */
+
+  it("governance-only run (skillsAsTools off): guardrail is armed without the skills manifest", async () => {
+    delete process.env.PAPERCLIP_SKILLS_MANIFEST;
+    const { pi, cwd } = await governanceFixture({ guardrails: { denyTools: ["bash"] } });
+
+    expect(pi.events()).toContain("tool_call");
+    expect(pi.registered).toHaveLength(0);
+    expect(pi.toolCall("bash", { command: "ls" }, { cwd })?.block).toBe(true);
+  });
+
+  it("skills-only run: tools register and no guardrail handler is installed", async () => {
+    delete process.env.PAPERCLIP_GOVERNANCE_MANIFEST;
+    const registered = await captureTools([
+      { name: "Solo", toolName: "paperclip_skill_solo", description: "d", markdown: "# Solo" },
+    ]);
+    expect(registered).toHaveLength(1);
+
+    // And the reverse direction of the decoupling: no `tool_call` subscription.
+    const pi = makeMockPiFull();
+    await pi.sessionStart();
+    expect(pi.events()).not.toContain("tool_call");
+    expect(pi.registered).toHaveLength(1);
+  });
+
+  it("both lanes coexist on one agent: skills register AND the guardrail blocks", async () => {
+    const { pi, cwd } = await governanceFixture(
+      { guardrails: { denyTools: ["bash"] } },
+      ["paperclip_skill_coexist"],
+    );
+
+    expect(pi.registered.map((tool) => tool.name)).toEqual(["paperclip_skill_coexist"]);
+    expect((await pi.registered[0].execute()).content[0].text).toBe(
+      "# paperclip_skill_coexist",
+    );
+    expect(pi.toolCall("bash", { command: "ls" }, { cwd })?.block).toBe(true);
+  });
+
+  it("no governance manifest: no tool_call subscription, skills lane unaffected", async () => {
+    const pi = makeMockPiFull();
+    await pi.sessionStart();
+    expect(pi.events()).not.toContain("tool_call");
+
+    process.env.PAPERCLIP_GOVERNANCE_MANIFEST = "";
+    const blank = makeMockPiFull();
+    await blank.sessionStart();
+    expect(blank.events()).not.toContain("tool_call");
+  });
+
+  it("unreadable or unparseable governance manifest: no handler, no throw", async () => {
+    process.env.PAPERCLIP_GOVERNANCE_MANIFEST = "/nonexistent/governance.json";
+    const missing = makeMockPiFull();
+    await expect(missing.sessionStart()).resolves.toBeUndefined();
+    expect(missing.events()).not.toContain("tool_call");
+
+    const dir = path.join(tmpdir(), `paperclip-bridge-gov-${randomUUID()}`);
+    await fs.mkdir(dir, { recursive: true });
+    const junk = path.join(dir, "governance.json");
+    await fs.writeFile(junk, "{not json", "utf8");
+    process.env.PAPERCLIP_GOVERNANCE_MANIFEST = junk;
+    const junky = makeMockPiFull();
+    await junky.sessionStart();
+    expect(junky.events()).not.toContain("tool_call");
+  });
+
+  it("manifest with no guardrails still arms the handler and allows everything", async () => {
+    const { pi, cwd } = await governanceFixture({ budgetCapUsd: 5 });
+    expect(pi.events()).toContain("tool_call");
+    expect(pi.toolCall("bash", { command: "rm -rf /" }, { cwd })).toBeUndefined();
+    expect(pi.toolCall("write", { path: "/etc/hosts", content: "x" }, { cwd })).toBeUndefined();
+  });
+
+  it("malformed events and broken rules never throw", async () => {
+    const { pi, cwd } = await governanceFixture({
+      guardrails: {
+        bashDeny: ["(unclosed"],
+        denyTools: "not-an-array",
+        pathScopes: { allow: ["/tmp"] },
+        argRevisions: "nope",
+      },
+    });
+
+    expect(() => pi.toolCall("bash", { command: "ls" }, { cwd })).not.toThrow();
+    expect(() => pi.toolCall("write", {}, { cwd })).not.toThrow();
+    expect(() => pi.toolCall("read", { path: 42 }, { cwd })).not.toThrow();
+    expect(() => pi.toolCall("edit", { paths: ["a", 7] }, { cwd })).not.toThrow();
+    expect(() => pi.toolCallRaw({ toolName: "write" }, undefined)).not.toThrow();
+    expect(() => pi.toolCallRaw(undefined, undefined)).not.toThrow();
+    expect(() => pi.toolCallRaw({ toolName: "edit", input: null }, { cwd: 7 })).not.toThrow();
   });
 });

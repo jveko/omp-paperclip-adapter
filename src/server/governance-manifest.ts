@@ -26,7 +26,14 @@ export const GOVERNANCE_MANIFEST_FILE = "governance.json";
  * older adapter.
  */
 export interface GovernancePolicy {
-  /** Guardrail rule families: pathScopes, bashDeny, denyTools, argRevisions. */
+  /**
+   * Guardrail rule families, interpreted by the bridge's `tool_call` handler:
+   * `pathScopes` (`{ allow: [roots], denyOutside }`, or a bare root/root list;
+   * no allow list means the run cwd), `bashDeny` (regex sources matched against
+   * whole and compound bash commands), `denyTools` (exact tool names) and
+   * `argRevisions` (`{ [tool]: partialArgs }` merged into the executed args of
+   * the plain-argument tools). Unknown keys are kept for a newer bridge.
+   */
   guardrails?: Record<string, unknown>;
   /** Soft per-process USD cap; finite and > 0 to be enforceable. */
   budgetCapUsd?: number;
