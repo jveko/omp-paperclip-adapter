@@ -35,7 +35,11 @@ export interface GovernancePolicy {
    * the plain-argument tools). Unknown keys are kept for a newer bridge.
    */
   guardrails?: Record<string, unknown>;
-  /** Soft per-process USD cap; finite and > 0 to be enforceable. */
+  /**
+   * Soft USD cap enforced per bridge session epoch (fresh module per
+   * `session/new`, so subagents each get their own cap); finite and > 0 to
+   * be enforceable. Accumulates across runs only under a warm handle.
+   */
   budgetCapUsd?: number;
   /** Provider ids allowed by endpoint routing. */
   approvedEndpoints?: string[];

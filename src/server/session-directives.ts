@@ -127,7 +127,7 @@ export function getSessionConfigSchema(): AdapterConfigSchema {
       { key: "skillsAsTools", label: "Expose skills as on-demand tools", type: "toggle", default: false,
         hint: `Register each enabled company skill as a native omp tool that returns its instructions on demand, instead of injecting all skill text into the prompt. Reduces context use. ${NEXT_RUN}` },
       { key: "governancePolicy", label: "Governance policy (YAML/JSON)", type: "textarea",
-        hint: `Rules the run's omp child enforces through the paperclip bridge: guardrails (pathScopes, bashDeny, denyTools, argRevisions), budgetCapUsd, approvedEndpoints, approvalRequired. Empty = off. While set, the omp permission proxy auto-approves so the bridge is the single gate; a document that cannot be parsed is skipped with a warning rather than run ungoverned. Adding or clearing the policy rotates the session (fingerprint change), so rule edits land on the next rotation. ${NEXT_RUN}` },
+        hint: `Rules the run's omp child enforces through the paperclip bridge: guardrails (pathScopes, bashDeny, denyTools, argRevisions), budgetCapUsd, approvedEndpoints, approvalRequired. budgetCapUsd is a soft PER-SESSION cap: each omp session — subagents included — gets its own cap (with N in-process subagents the effective ceiling can be (1+N)×cap), and cost only accumulates across runs while a warm handle is reused (cold children make it per-run by default); past it, mutating tools block and read-only/control tools stay open. Empty = off. While set, the omp permission proxy auto-approves so the bridge is the single gate; a document that cannot be parsed is skipped with a warning rather than run ungoverned. Adding or clearing the policy rotates the session (fingerprint change), so rule edits land on the next rotation. ${NEXT_RUN}` },
     ],
   };
 }
@@ -188,6 +188,10 @@ export function buildSessionSnapshotWorkProduct(
       sessions: snapshot.sessions,
       total: snapshot.total,
       byCwd: snapshot.byCwd,
+      // Omitted, not empty, when omp's ACP mode has no subagent surface, so a
+      // card from an older/newer omp is byte-identical to one from before the
+      // field existed.
+      ...(snapshot.subagents ? { subagents: snapshot.subagents } : {}),
       currentSessionId: context.currentSessionId,
       capturedAt: context.capturedAt,
       runId: context.runId,

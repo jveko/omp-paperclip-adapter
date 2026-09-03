@@ -192,6 +192,25 @@ describe("buildSessionSnapshotWorkProduct", () => {
     expect(wp.summary).toContain("sess-a");
     expect(wp.metadata).toMatchObject({ currentSessionId: "sess-b", runId: "run-1" });
   });
+  it("carries subagents into metadata only when the snapshot has them", () => {
+    const base = {
+      projects: [], sessions: [], total: 0, byCwd: [],
+    };
+    const context = { currentSessionId: null, runId: "run-1", capturedAt: "2026-08-28T02:00:00Z" };
+    const withSubagents = buildSessionSnapshotWorkProduct(
+      {
+        ...base,
+        subagents: [{
+          id: "sub-1", index: 0, agent: "scout", status: "running",
+          description: "map the repo", parentToolCallId: "tool-call-1", lastUpdate: 1,
+        }],
+      },
+      context,
+    );
+    expect(withSubagents.metadata).toMatchObject({ subagents: [{ id: "sub-1", agent: "scout" }] });
+    const without = buildSessionSnapshotWorkProduct(base, context);
+    expect("subagents" in without.metadata).toBe(false);
+  });
   it("does not throw on an unparseable updatedAt and reports unknown time", () => {
     const wp = buildSessionSnapshotWorkProduct(
       {

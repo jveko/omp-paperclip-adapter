@@ -12,10 +12,13 @@ import path from "node:path";
  *   SKILL.md **on demand**, re-reading the file fresh per call so content edits
  *   land on the next invocation even in a warm session.
  * - **Governance (v0.8)** — on `session_start`, subscribe a `tool_call`
- *   guardrail armed by `PAPERCLIP_GOVERNANCE_MANIFEST` (governance.json). The
- *   gate evaluates path scopes, bash deny patterns, denied tool names and
- *   argument revisions, and is deliberately independent of the skills lane: a
- *   governance-only agent (skillsAsTools off) must still be enforced.
+ *   guardrail and a `message_end` cost tally armed by
+ *   `PAPERCLIP_GOVERNANCE_MANIFEST` (governance.json). The gate evaluates
+ *   path scopes, bash deny patterns, denied tool names and argument
+ *   revisions; the tally enforces `budgetCapUsd` as a soft per-session cap
+ *   that blocks mutating tools past the cap. The whole lane is deliberately
+ *   independent of the skills lane: a governance-only agent (skillsAsTools
+ *   off) must still be enforced.
  *
  * omp's `#beforeToolCall` awaits this handler before the tool runs and before
  * any approval proxy, and fail-closes (blocks the call) if a handler throws or
@@ -71,6 +74,14 @@ interface BridgeToolCallResult {
   input?: Record<string, unknown>;
 }
 
+/** Structural mirror of the `usage.cost` slice of omp's message_end event. */
+interface BridgeMessageEndEvent {
+  type: "message_end";
+  message?: { usage?: { cost?: { total?: number } } };
+}
+
+type BridgeMessageEndHandler = (event: BridgeMessageEndEvent) => void;
+
 type BridgeToolCallHandler = (
   event: BridgeToolCallEvent,
   ctx: BridgeToolCallContext,
@@ -80,6 +91,7 @@ type BridgeToolCallHandler = (
 interface BridgePi {
   on(event: "session_start", handler: () => void | Promise<void>): unknown;
   on(event: "tool_call", handler: BridgeToolCallHandler): unknown;
+  on(event: "message_end", handler: BridgeMessageEndHandler): unknown;
   registerTool(tool: BridgeTool): void;
 }
 
@@ -118,6 +130,45 @@ const CONTROL_TOOLS: Record<string, true> = {
   todo: true,
   hub: true,
 };
+
+/* ------------------------------------------------------------------ */
+/*  Soft cost budget                                                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Per-session running USD total and its latched over-cap flag. Module scope
+ * IS the session scope: omp re-imports this extension with a cache-busted
+ * specifier on every `session/new`, so each session — a subagent included —
+ * starts a fresh zeroed copy and enforces its own cap. Honest ceiling: an
+ * agent with N in-process subagents can spend up to (1+N)×cap, and with the
+ * default cold child (`warmHandleIdleMs=0`) the cap is per-run; it only
+ * accumulates across runs under an operator-configured warm handle. The gate
+ * is advisory and coarse (cooperation with `budgetExceeded` is the design,
+ * not a hard request-level abort): read-only provider calls keep flowing.
+ */
+let runningCost = 0;
+let budgetExceeded = false;
+
+/**
+ * Tools that stay callable once the cap is reached. The budget gate is
+ * DENY-BY-COMPLEMENT: anything not listed here is blocked — `write`, `edit`,
+ * `bash`, `task` (spawns cost, and subagents get their own cap so they are
+ * no escape hatch), `ast_edit`, `memory_edit`, any `mcp__*`. Control tools
+ * never reach this check: the allowlist short-circuit in
+ * `evaluateGuardrails` runs first, so an over-budget agent can always
+ * `yield` and finish its run.
+ */
+const BUDGET_READ_ONLY: Record<string, true> = {
+  read: true,
+  grep: true,
+  glob: true,
+  lsp: true,
+};
+
+/** Trim float-noise off a USD total for the block reason. */
+function usd(value: number): string {
+  return Number(value.toFixed(6)).toString();
+}
 
 /**
  * Tools whose execution target is a path (or a derived list of paths).
@@ -164,6 +215,8 @@ interface GuardrailRules {
   bashDeny: BashDenyRule[];
   denyTools: Record<string, true>;
   argRevisions: Record<string, Record<string, unknown>>;
+  /** Soft per-session USD cap, hoisted from the document root; 0 = budget lane off. */
+  budgetCapUsd: number;
   /** Memoized realpath'd roots, valid only for `rootsCwd`. */
   rootsCwd: string | null;
   roots: string[] | null;
@@ -229,11 +282,19 @@ function normalizeGuardrails(document: Record<string, unknown>): GuardrailRules 
     }
   }
 
+  // `budgetCapUsd` sits at the document root in both the canonical and the
+  // shorthand shape; only a finite positive number arms the budget lane.
+  const rawCap =
+    typeof document.budgetCapUsd === "string" ? Number(document.budgetCapUsd) : document.budgetCapUsd;
+  const budgetCapUsd =
+    typeof rawCap === "number" && Number.isFinite(rawCap) && rawCap > 0 ? rawCap : 0;
+
   return {
     pathScopes: normalizePathScopes(bag.pathScopes),
     bashDeny,
     denyTools,
     argRevisions,
+    budgetCapUsd,
     rootsCwd: null,
     roots: null,
   };
@@ -314,7 +375,7 @@ function isWithin(root: string, target: string): boolean {
  * hashline `paths` list. Missing an alias here would make the rail
  * bypassable by rewording the argument. The gate covers the three built-in
  * file tools; other file-touching tools (`ast_edit`, MCP writes) are held by
- * `denyTools`, which is also where the T3 budget gate widens the net.
+ * `denyTools`, and past the cost cap by the budget gate's deny-complement.
  */
 function inputPaths(input: Record<string, unknown>): string[] {
   return [...stringList(input.path), ...stringList(input.file_path), ...stringList(input.paths)];
@@ -337,6 +398,16 @@ function evaluateGuardrails(
     block: true,
     reason: `paperclip governance: ${toolName} blocked — ${detail}`,
   });
+
+  // Budget gate — deliberately AFTER the control-tool short-circuit: an
+  // over-cap agent must still be able to yield/goal/todo its way out of the
+  // run. Deny-by-complement: only `BUDGET_READ_ONLY` passes; `task`, every
+  // `mcp__*` and every other non-read tool waits.
+  if (budgetExceeded && !BUDGET_READ_ONLY[toolName]) {
+    return blocked(
+      `budget cap reached (${usd(runningCost)} spent > ${usd(rules.budgetCapUsd)} USD this session)`,
+    );
+  }
 
   if (rules.denyTools[toolName]) {
     return blocked("the tool is listed in the governance policy's denyTools");
@@ -404,6 +475,21 @@ function installGovernanceLane(pi: BridgePi): void {
     } catch {
       // Never throw: omp turns a throwing handler into a blanket block.
       return undefined;
+    }
+  });
+
+  // The tally reads the cap from the same cached rules as the gate, so a
+  // manifest edit that lowers `budgetCapUsd` flips the latch at the next
+  // message even when no new cost arrives.
+  pi.on("message_end", (event) => {
+    try {
+      const total = event?.message?.usage?.cost?.total ?? 0;
+      if (typeof total === "number" && Number.isFinite(total)) runningCost += total;
+      const current = currentGuardrails(process.env.PAPERCLIP_GOVERNANCE_MANIFEST ?? file);
+      const cap = current?.budgetCapUsd ?? 0;
+      if (cap > 0 && runningCost > cap) budgetExceeded = true;
+    } catch {
+      // Never throw; a missed message only loosens an already-coarse cap.
     }
   });
 }

@@ -6,6 +6,13 @@ const rl = readline.createInterface({ input: process.stdin });
 const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
 const mode = process.env.FAKE_ACP_MODE ?? "";
 
+// Shape emitted by real omp for any `_omp/*` method it does not implement.
+const unknownExtMethod = (method) => ({
+  code: -32603,
+  message: "Internal error",
+  data: { details: `Unknown ACP ext method: ${method}` },
+});
+
 rl.on("line", (line) => {
   let msg;
   try { msg = JSON.parse(line); } catch { return; }
@@ -61,8 +68,36 @@ rl.on("line", (line) => {
         { sessionId: "sess-a", cwd: msg.params?.cwd ?? "/w", title: "First",
           updatedAt: "2026-08-28T00:00:00Z", _meta: { messageCount: 3, size: 120 } },
       ] } });
+    } else if (msg.method === "_omp/subagents") {
+      // Real omp 18.1.6 answers this with the unknown-method error below (its
+      // ACP mode has no subagent bridge; only RPC mode subscribes the
+      // task:subagent:* EventBus channels). These modes simulate the day the
+      // upstream `_omp/subagents` extMethod ships — payloads mirror
+      // RpcSubagentSnapshot, including fields the consumer must normalize away.
+      if (mode === "subagents") {
+        send({ jsonrpc: "2.0", id: msg.id, result: { subagents: [
+          { id: "sub-1", index: 0, agent: "scout", agentSource: "builtin", status: "running",
+            description: "map the repo", task: "read files", sessionFile: "/s/sub-1.jsonl",
+            parentToolCallId: "tool-call-1", lastUpdate: 1756368000000,
+            progress: { totalItems: 4, completed: 1, toolCalls: 9, tokens: 1200 } },
+          { id: "sub-2", index: 1, agent: "task", agentSource: "user", status: "completed",
+            parentToolCallId: "tool-call-2", lastUpdate: 1756368060000 },
+        ] } });
+        return;
+      }
+      if (mode === "subagentsnone") {
+        send({ jsonrpc: "2.0", id: msg.id, result: { subagents: [] } });
+        return;
+      }
+      if (mode === "subagentsjunk") {
+        send({ jsonrpc: "2.0", id: msg.id, result: { subagents: null } });
+        return;
+      }
+      send({ jsonrpc: "2.0", id: msg.id, error: unknownExtMethod(msg.method) });
     } else {
-      send({ jsonrpc: "2.0", id: msg.id, result: {} });
+      // Verified against omp 18.1.6: an unrecognized `_omp/*` method is a
+      // JSON-RPC error, not an empty result.
+      send({ jsonrpc: "2.0", id: msg.id, error: unknownExtMethod(msg.method) });
     }
   } else if (msg.method === "session/fork") {
     if (mode === "forkerror") {

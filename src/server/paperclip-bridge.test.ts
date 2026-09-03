@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
@@ -41,12 +41,21 @@ type GuardrailHandler = (
   ctx: ToolCallContext,
 ) => ToolCallResult | undefined | void;
 
+/** Structural mirror of the `message_end` cost slice the budget handler reads. */
+interface MessageEndEvent {
+  type: "message_end";
+  message?: { usage?: { cost?: { total?: number } } };
+}
+
+type MessageEndHandler = (event: MessageEndEvent) => void;
+
 /** Wide enough to hold any subscription the bridge makes. */
 type CapturedHandler = (event?: unknown, ctx?: unknown) => unknown;
 
 interface MockPi {
   on(event: "session_start", handler: () => void | Promise<void>): void;
   on(event: "tool_call", handler: GuardrailHandler): void;
+  on(event: "message_end", handler: MessageEndHandler): void;
   registerTool: (tool: CapturedTool) => void;
 }
 
@@ -64,9 +73,15 @@ interface MockPiHandle {
   ) => ToolCallResult | undefined;
   /** Invokes the tool_call subscription with an arbitrary (possibly invalid) payload. */
   toolCallRaw: (event: unknown, ctx: unknown) => unknown;
+  /** Fires the `message_end` subscription with an assistant message costing `total` USD. */
+  messageEnd: (total: unknown) => void;
+  /** Invokes the message_end subscription with an arbitrary (possibly invalid) payload. */
+  messageEndRaw: (event: unknown) => unknown;
 }
 
-function makeMockPiFull(): MockPiHandle {
+function makeMockPiFull(
+  register: (pi: MockPi) => void = registerPaperclipBridge,
+): MockPiHandle {
   const registered: CapturedTool[] = [];
   const handlers: Record<string, CapturedHandler> = {};
   const pi: MockPi = {
@@ -77,7 +92,7 @@ function makeMockPiFull(): MockPiHandle {
       registered.push(tool);
     },
   };
-  registerPaperclipBridge(pi); // sync — subscribes the lane handlers
+  register(pi); // sync — subscribes the lane handlers
   const subscription = (event: string): CapturedHandler | undefined => handlers[event];
   // A function's parameter types are not observable at runtime, so each
   // subscription is narrowed to the event contract it was stored under.
@@ -85,6 +100,12 @@ function makeMockPiFull(): MockPiHandle {
     const captured = subscription("tool_call");
     if (!captured) throw new Error("tool_call handler was never registered");
     return captured as GuardrailHandler;
+  };
+
+  const messageEndCall = (): ((event: unknown) => unknown) => {
+    const captured = subscription("message_end");
+    if (!captured) throw new Error("message_end handler was never registered");
+    return captured as (event: unknown) => unknown;
   };
   return {
     registered,
@@ -106,6 +127,10 @@ function makeMockPiFull(): MockPiHandle {
       const call = guardrail() as (event: unknown, ctx: unknown) => unknown;
       return call(event, ctx);
     },
+    messageEnd: (total) => {
+      messageEndCall()({ type: "message_end", message: { usage: { cost: { total } } } });
+    },
+    messageEndRaw: (event) => messageEndCall()(event),
   };
 }
 
@@ -372,6 +397,7 @@ type GovernancePolicyDoc =
 async function governanceFixture(
   policy: GovernancePolicyDoc,
   skillToolNames: string[] = [],
+  register: (pi: MockPi) => void = registerPaperclipBridge,
 ): Promise<GovernanceFixture> {
   const dir = path.join(tmpdir(), `paperclip-bridge-gov-${randomUUID()}`);
   const cwd = path.join(dir, "work");
@@ -407,7 +433,7 @@ async function governanceFixture(
     process.env.PAPERCLIP_SKILLS_MANIFEST = skillsFile;
   }
 
-  const pi = makeMockPiFull();
+  const pi = makeMockPiFull(register);
   await pi.sessionStart();
   return { pi, file, cwd, root };
 }
@@ -671,5 +697,166 @@ describe("governance guardrails (tool_call)", () => {
     expect(() => pi.toolCallRaw({ toolName: "write" }, undefined)).not.toThrow();
     expect(() => pi.toolCallRaw(undefined, undefined)).not.toThrow();
     expect(() => pi.toolCallRaw({ toolName: "edit", input: null }, { cwd: 7 })).not.toThrow();
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Soft cost budget (message_end + budget gate)                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * omp re-imports the extension with a cache-busted specifier on every
+ * `session/new`, so each session epoch gets a FRESH bridge module — and a
+ * fresh module-level `runningCost`. This is a module-loading boundary test,
+ * so a static import cannot work: it would hand back the already-instantiated
+ * module; `vi.resetModules()` + a late dynamic `import()` is the only way to
+ * observe a second instance in-process.
+ */
+async function importFreshBridge(): Promise<(pi: MockPi) => void> {
+  vi.resetModules();
+  const mod: unknown = await import("./paperclip-bridge.js");
+  if (!mod || typeof mod !== "object" || !("default" in mod)) {
+    throw new Error("fresh bridge import lost its default export");
+  }
+  // The narrowed `in` read is `unknown`; the assert documents the one shape
+  // this test file imports — the bridge's default `(pi) => void` registration.
+  return mod.default as (pi: MockPi) => void;
+}
+
+/** A governance fixture armed by its own fresh bridge module instance. */
+async function budgetFixture(policy: GovernancePolicyDoc): Promise<GovernanceFixture> {
+  return governanceFixture(policy, [], await importFreshBridge());
+}
+
+describe("soft cost budget (message_end)", () => {
+  const MUTATING_TOOLS = [
+    "write",
+    "edit",
+    "bash",
+    "task",
+    "ast_edit",
+    "delete_file",
+    "move",
+    "memory_edit",
+    "mcp__github__create_pr",
+  ];
+  const PAST_CAP_TOOLS = [
+    "read",
+    "grep",
+    "glob",
+    "lsp",
+    "yield",
+    "goal",
+    "think",
+    "todo",
+    "hub",
+  ];
+
+  it("accumulates usage.cost.total and blocks mutating tools once over the cap", async () => {
+    const { pi, cwd } = await budgetFixture({ budgetCapUsd: 2 });
+    expect(pi.events()).toContain("message_end");
+
+    pi.messageEnd(1.5); // still under $2
+    expect(pi.toolCall("write", { path: "a.ts", content: "x" }, { cwd })).toBeUndefined();
+
+    pi.messageEnd(0.6); // $2.10 > $2: the gate latches
+    for (const tool of MUTATING_TOOLS) {
+      const res = pi.toolCall(tool, { path: "a.ts", content: "x", command: "ls" }, { cwd });
+      expect(res?.block, tool).toBe(true);
+      expect(res?.reason, tool).toContain("budget cap reached");
+    }
+  });
+
+  it("past the cap, read-only and control tools stay available (deny-by-complement)", async () => {
+    const { pi, cwd } = await budgetFixture({ budgetCapUsd: 1 });
+    pi.messageEnd(5);
+    for (const tool of PAST_CAP_TOOLS) {
+      expect(pi.toolCall(tool, { path: "a.ts", command: "rm -rf /" }, { cwd }), tool).toBeUndefined();
+    }
+  });
+
+  it("under the cap everything is allowed", async () => {
+    const { pi, cwd } = await budgetFixture({ budgetCapUsd: 5 });
+    pi.messageEnd(4.999);
+    expect(pi.toolCall("write", { path: "a.ts", content: "x" }, { cwd })).toBeUndefined();
+    expect(pi.toolCall("bash", { command: "make" }, { cwd })).toBeUndefined();
+    expect(pi.toolCall("task", { prompt: "x" }, { cwd })).toBeUndefined();
+  });
+
+  it("no enforceable cap (absent, 0, or junk) never blocks", async () => {
+    for (const policy of [
+      {},
+      { budgetCapUsd: 0 },
+      { budgetCapUsd: -3 },
+      { budgetCapUsd: "abc" },
+      { budgetCapUsd: null },
+      { guardrails: { denyTools: ["nope_x"] }, budgetCapUsd: 0 },
+    ]) {
+      const { pi, cwd } = await budgetFixture(policy);
+      pi.messageEnd(1_000_000);
+      expect(pi.toolCall("write", { path: "a.ts", content: "x" }, { cwd })).toBeUndefined();
+      expect(pi.toolCall("bash", { command: "ls" }, { cwd })).toBeUndefined();
+    }
+  });
+
+  it("per-session isolation: fresh modules start at zero and do not aggregate", async () => {
+    const first = await budgetFixture({ budgetCapUsd: 2 });
+    const second = await budgetFixture({ budgetCapUsd: 2 });
+
+    // An aggregating design would see $3.0 across the two and latch; per
+    // session (subagents get their own cap) each is individually in budget.
+    first.pi.messageEnd(1.5);
+    second.pi.messageEnd(1.5);
+    expect(first.pi.toolCall("write", { path: "a.ts", content: "x" }, { cwd: first.cwd })).toBeUndefined();
+    expect(second.pi.toolCall("write", { path: "a.ts", content: "x" }, { cwd: second.cwd })).toBeUndefined();
+
+    // Crossing the first session's cap latches ONLY the first module.
+    first.pi.messageEnd(1);
+    expect(first.pi.toolCall("write", { path: "a.ts", content: "x" }, { cwd: first.cwd })?.block).toBe(true);
+    expect(second.pi.toolCall("write", { path: "a.ts", content: "x" }, { cwd: second.cwd })).toBeUndefined();
+  });
+
+  it("a lowered cap lands on manifest reload and flips the gate at the next message_end", async () => {
+    const { pi, file, cwd } = await budgetFixture({ budgetCapUsd: 10 });
+    pi.messageEnd(3);
+    expect(pi.toolCall("write", { path: "a.ts", content: "x" }, { cwd })).toBeUndefined();
+
+    await rewriteGovernance(file, { budgetCapUsd: 2 });
+    pi.messageEnd(0);
+    expect(pi.toolCall("write", { path: "a.ts", content: "x" }, { cwd })?.block).toBe(true);
+  });
+
+  it("message_end is fail-soft: junk events and non-numeric costs never throw or poison the tally", async () => {
+    const { pi, cwd } = await budgetFixture({ budgetCapUsd: 2 });
+    expect(() => pi.messageEndRaw(undefined)).not.toThrow();
+    expect(() => pi.messageEndRaw({})).not.toThrow();
+    expect(() => pi.messageEndRaw({ message: { usage: { cost: {} } } })).not.toThrow();
+    expect(() => pi.messageEnd("lots")).not.toThrow();
+    expect(() => pi.messageEnd(Number.NaN)).not.toThrow();
+    expect(() => pi.messageEnd(Number.POSITIVE_INFINITY)).not.toThrow();
+
+    // Only finite numeric totals accumulated: the tally is still 0.
+    expect(pi.toolCall("write", { path: "a.ts", content: "x" }, { cwd })).toBeUndefined();
+    pi.messageEnd(2.5);
+    expect(pi.toolCall("write", { path: "a.ts", content: "x" }, { cwd })?.block).toBe(true);
+  });
+
+  it("budget lane is governance-scoped: without a manifest nothing subscribes", async () => {
+    delete process.env.PAPERCLIP_GOVERNANCE_MANIFEST;
+    const pi = makeMockPiFull();
+    await pi.sessionStart();
+    expect(pi.events()).not.toContain("message_end");
+    expect(pi.events()).not.toContain("tool_call");
+  });
+
+  it("budget gate coexists with guardrails: guardrail blocks keep their own reasons", async () => {
+    const { pi, cwd } = await budgetFixture({
+      guardrails: { denyTools: ["web_search"] },
+      budgetCapUsd: 2,
+    });
+    expect(pi.toolCall("web_search", { query: "x" }, { cwd })?.reason).toContain("denyTools");
+    pi.messageEnd(3);
+    // Over cap, even a non-denied tool blocks — with the BUDGET reason.
+    expect(pi.toolCall("write", { path: "a.ts", content: "x" }, { cwd })?.reason).toContain("budget cap reached");
   });
 });
