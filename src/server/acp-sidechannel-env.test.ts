@@ -123,7 +123,8 @@ describe("side-channel env threading", () => {
         command: "omp",
         sessionForkSourceId: "sess-a", sessionForkToken: "t-gov",
         fallbackChain: "brokerco/main",
-        governancePolicy: "approvedEndpoints: [brokerco]",
+        // A bridge rail carries the gate; the routing lever is this test's point.
+        governancePolicy: "guardrails:\n  denyTools:\n    - web_search\napprovedEndpoints: [brokerco]",
       },
     }));
     expect(mocks.forkOmpSession).toHaveBeenCalledTimes(1);

@@ -35,7 +35,7 @@ import { materializeFailoverOverlay } from "./failover-config.js";
 import { ompEnv } from "./omp-env.js";
 import { forkOmpSession, queryOmpSessions } from "./session-intel.js";
 import { materializeSkillManifest } from "./skill-manifest.js";
-import { materializeGovernanceManifest } from "./governance-manifest.js";
+import { governancePolicyActive, materializeGovernanceManifest } from "./governance-manifest.js";
 import { materializeGovernanceOverlay } from "./governance-overlay.js";
 import {
   bumpRunCounter, consumeToken, loadState, rotateIfTripped, saveState,
@@ -45,8 +45,8 @@ import {
   buildUsageWorkProduct, estimateCostPerHeartbeat, fetchBrokerUsage, usageDigest,
 } from "./usage-report.js";
 import {
-  buildSessionSnapshotWorkProduct, postWorkProduct,
-  readSessionIntelConfig, resolveRunDirective, validateCredentialMode,
+  buildSessionSnapshotWorkProduct, postWorkProduct, readSessionIntelConfig,
+  resolveRunDirective, sessionSnapshotDigestInput, validateCredentialMode,
   validThinkingLevel, validateThinkingLevel,
 } from "./session-directives.js";
 
@@ -105,6 +105,23 @@ export function resolveBridgeRunMode(bridgePath: string): BridgeRunMode {
     };
   }
   return { kind: "ok" };
+}
+
+/**
+ * Is governance ARMED for this run — i.e. will the bridge extension actually
+ * load in the run child AND actually hold a policy file?
+ *
+ * This is the single gate's precondition and the only legitimate reason to fold
+ * `tools.approvalMode: yolo` into the run overlay: that key switches OFF omp's
+ * own permission proxy, so emitting it while the manifest never landed (an
+ * unwritable state dir) or the extension never loaded (a whitespace-bearing
+ * install path the adapter's /\s+/ command tokenizer cannot carry) leaves the
+ * run with NO gate at all — every guardrail, budget and approval rule silently
+ * absent. Exported as a test seam: the real install's bridgePath can never carry
+ * whitespace, so the branch is otherwise unobservable in-process.
+ */
+export function isGovernanceArmed(manifestPath: string | null, bridgePath: string): boolean {
+  return manifestPath !== null && resolveBridgeRunMode(bridgePath).kind === "ok";
 }
 
 export function resolveOmpAgentCommand(config: Record<string, unknown>): string {
@@ -550,13 +567,13 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
         }
       }
     }
-    // Governance substrate (v0.8): when the operator sets governancePolicy,
-    // materialize it into the agent's state dir and hand the path to the run
-    // child via PAPERCLIP_GOVERNANCE_MANIFEST. That env both arms the bridge's
-    // --extension (shouldAppendBridgeExtension) and — through the governance
-    // overlay folded below — carries tools.approvalMode:yolo, making the bridge
-    // the run's only deterministic permission gate. An unparseable document
-    // warns and the run proceeds ungoverned rather than dying on a policy typo.
+    // Governance substrate (v0.8): when the operator sets governancePolicy AND
+    // that policy carries a rule the bridge can enforce, materialize it into the
+    // agent's state dir and hand the path to the run child via
+    // PAPERCLIP_GOVERNANCE_MANIFEST. That env arms the --extension append, and
+    // the armed bridge — through the governance overlay folded below — is what
+    // may take the run's single permission gate. An unparseable document warns
+    // and the run proceeds ungoverned rather than dying on a policy typo.
     const governanceManifest = await materializeGovernanceManifest(
       ctx.config,
       intelDir,
@@ -570,14 +587,24 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
         ...(ctx.config.env ?? {}),
         PAPERCLIP_GOVERNANCE_MANIFEST: governanceManifest,
       };
-      // Governance has no prose-injection fallback: without the extension
-      // loaded the policy is decoration, so say so instead of staying quiet.
-      if (resolveBridgeRunMode(bridgePath).kind === "whitespace") {
-        await ctx.onEvent?.({
-          eventType: "run.system", stream: "system", level: "warn",
-          message: "omp governance policy is set but the bridge extension path contains whitespace; guardrails are not enforced",
-        });
-      }
+    }
+    // Governance is ARMED only when the policy really reached a bridge that will
+    // really load: a manifest path AND a whitespace-free extension path (the
+    // adapter's naive /\s+/ command tokenizer cannot carry the flag otherwise).
+    // Anything less and the single gate must NOT move: `approvalMode: yolo`
+    // switches off omp's own permission gate, so emitting it unarmed leaves the
+    // run with no gate at all and no guardrail, budget or approval rule in force.
+    const governanceArmed = isGovernanceArmed(governanceManifest, bridgePath);
+    if (!governanceArmed && governancePolicyActive(ctx.config)) {
+      // Governance has no prose-injection fallback: without the extension loaded
+      // the policy is decoration, so say which half failed and what it cost.
+      const why = governanceManifest === null
+        ? "the governance manifest could not be written"
+        : "the bridge extension path contains whitespace, so --extension was not appended";
+      await ctx.onEvent?.({
+        eventType: "run.system", stream: "system", level: "warn",
+        message: `omp governance policy enforces nothing: ${why}; governance is not armed, so omp's own approval gate stays in force`,
+      });
     }
     // Endpoint routing (v0.8 T4): approvedEndpoints becomes omp's declarative
     // disabledProviders, computed as the catalog complement minus every provider
@@ -595,6 +622,9 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
       {
         models,
         configuredModel: rawModel ? (resolveModel(rawModel) ?? rawModel) : null,
+        // The gate relaxation rides the armed bridge and nothing else: an
+        // unarmed run keeps omp's own approval behavior and only routes.
+        armed: governanceArmed,
       },
       (message) => ctx.onEvent?.({
         eventType: "run.system", stream: "system", level: "warn", message,
@@ -827,11 +857,9 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
         { cwd: sessionCwd },
       );
       if (query.ok) {
-        const digest = snapshotDigest({
-          projects: query.snapshot.projects,
-          ids: query.snapshot.sessions.map((s) => [s.sessionId, s.updatedAt]),
-          current: usedSessionId,
-        });
+        const digest = snapshotDigest(
+          sessionSnapshotDigestInput(query.snapshot, usedSessionId),
+        );
         if (digest !== intelState.lastSnapshotDigest) {
           const posted = await postWorkProduct(
             { authToken: ctx.authToken, issueId },

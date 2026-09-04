@@ -1,7 +1,7 @@
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import {
   afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi,
@@ -19,7 +19,7 @@ import {
   resolveOmpAgentCommand,
   resolveOmpBillingIdentity,
   resolveSessionCwd,
-  shouldAppendBridgeExtension,
+  shouldAppendBridgeExtension, isGovernanceArmed,
 } from "./acp.js";
 import { runWithFreshSessionRetry, withRetryChain } from "./retry.js";
 import * as sessionState from "./session-state.js";
@@ -260,7 +260,9 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     await createOmpAcpExecutor()(baseCtx({
       config: {
         command: `${process.execPath} ${fakeAcp}`,
-        governancePolicy: "approvedEndpoints: [omi]",
+        // A real rail carries the gate; the routing lever fails for want of a
+        // catalog and degrades alone.
+        governancePolicy: "guardrails:\n  denyTools:\n    - web_search\napprovedEndpoints: [omi]",
       },
       onEvent: async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); },
     }));
@@ -325,6 +327,103 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     expect(merged.config.agentCommand).not.toContain("--extension");
     expect(events.some((e) => e.level === "warn" && /governance/i.test(e.message ?? ""))).toBe(true);
     expect(executorFn).toHaveBeenCalledOnce();
+  });
+
+  // P1-1 (v0.8 final review): `tools.approvalMode: yolo` used to be folded
+  // whenever a policy PARSED, even when it never reached the run child. omp's
+  // own permission gate then sat disabled with no bridge handler installed —
+  // every guardrail, budget and approval rule silently absent.
+  it("unarmed governance still routes but never relaxes the approval gate", async () => {
+    modelsMocks.listOmpModels.mockImplementation(async () => [
+      { id: "prov/m", label: "M", priced: false },
+      { id: "omi/r", label: "R", priced: false },
+      { id: "axon-compat/q", label: "Q", priced: false },
+    ]);
+    const intel = sessionIntelDir("co-1", "agent-1");
+    // A DIRECTORY where governance.json must be written: the manifest write
+    // fails (EISDIR) while the routing overlay in the same dir still lands.
+    await mkdir(path.join(intel, GOVERNANCE_MANIFEST_FILE), { recursive: true });
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const events: { level?: string; message?: string }[] = [];
+    await createOmpAcpExecutor()(baseCtx({
+      config: {
+        command: `${process.execPath} ${fakeAcp}`,
+        model: "prov/m",
+        governancePolicy: "guardrails:\n  denyTools:\n    - web_search\napprovedEndpoints:\n  - prov\n  - omi",
+      },
+      onEvent: async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); },
+    }));
+    const merged = executorFn.mock.calls[0][0];
+    // Bridge not armed: no manifest env, therefore no --extension append.
+    expect(merged.config.env?.PAPERCLIP_GOVERNANCE_MANIFEST).toBeUndefined();
+    expect(merged.config.agentCommand).not.toContain("--extension");
+    const overlay = await readFile(path.join(intel, GOVERNANCE_CONFIG_FILE), "utf8");
+    // Routing is omp's own config lever, so it survives; the gate does not move.
+    expect(overlay).toContain('disabledProviders:\n  - "axon-compat"');
+    expect(overlay).not.toContain("approvalMode");
+    expect(overlay).not.toMatch(/^tools:/m);
+    expect(events.some((e) => e.level === "warn" && /not armed/i.test(e.message ?? ""))).toBe(true);
+  });
+
+  it("unarmed governance with no routing folds no overlay at all", async () => {
+    const intel = sessionIntelDir("co-1", "agent-1");
+    await mkdir(path.join(intel, GOVERNANCE_MANIFEST_FILE), { recursive: true });
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    await createOmpAcpExecutor()(baseCtx({
+      config: {
+        command: `${process.execPath} ${fakeAcp}`,
+        governancePolicy: "guardrails:\n  denyTools:\n    - web_search",
+      },
+    }));
+    const merged = executorFn.mock.calls[0][0];
+    expect(merged.config.env?.PI_CONFIG_FILES).toBeUndefined();
+  });
+
+  it("a policy whose guardrails normalize to nothing never arms the bridge", async () => {
+    const events: { level?: string; message?: string }[] = [];
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    await createOmpAcpExecutor()(baseCtx({
+      config: {
+        command: `${process.execPath} ${fakeAcp}`,
+        governancePolicy: '{"guardrails":{"denyToolz":"rm -rf","denyTools":[]}}',
+      },
+      onEvent: async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); },
+    }));
+    const merged = executorFn.mock.calls[0][0];
+    const intel = sessionIntelDir("co-1", "agent-1");
+    expect(merged.config.env?.PAPERCLIP_GOVERNANCE_MANIFEST).toBeUndefined();
+    expect(merged.config.env?.PI_CONFIG_FILES).toBeUndefined();
+    expect(merged.config.agentCommand).not.toContain("--extension");
+    await expect(readFile(path.join(intel, GOVERNANCE_CONFIG_FILE), "utf8")).rejects.toThrow();
+    const warn = events.find((e) => e.level === "warn" && /no enforceable rule/i.test(e.message ?? ""));
+    expect(warn).toBeTruthy();
+    expect(warn!.message).toContain("denyToolz");
+  });
+
+  it("an approvedEndpoints-only policy routes without ever arming the gate", async () => {
+    modelsMocks.listOmpModels.mockImplementation(async () => [
+      { id: "prov/m", label: "M", priced: false },
+      { id: "omi/r", label: "R", priced: false },
+      { id: "axon-compat/q", label: "Q", priced: false },
+    ]);
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    await createOmpAcpExecutor()(baseCtx({
+      config: {
+        command: `${process.execPath} ${fakeAcp}`,
+        model: "prov/m",
+        governancePolicy: "approvedEndpoints:\n  - omi",
+      },
+    }));
+    const merged = executorFn.mock.calls[0][0];
+    const intel = sessionIntelDir("co-1", "agent-1");
+    // Routing lands (omp enforces it natively)...
+    expect(merged.config.env?.PI_CONFIG_FILES).toBe(path.join(intel, GOVERNANCE_CONFIG_FILE));
+    const overlay = await readFile(path.join(intel, GOVERNANCE_CONFIG_FILE), "utf8");
+    expect(overlay).toContain('disabledProviders:\n  - "axon-compat"');
+    // ...and the bridge is never armed, so the gate is never relaxed.
+    expect(overlay).not.toContain("approvalMode");
+    expect(merged.config.env?.PAPERCLIP_GOVERNANCE_MANIFEST).toBeUndefined();
+    expect(merged.config.agentCommand).not.toContain("--extension");
   });
 
   it("fails the run early when broker mode lacks env", async () => {
@@ -579,6 +678,52 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
       // second run: identical landscape -> suppressed
       await run(ctx);
       expect(posts).toHaveLength(1);
+    } finally {
+      server.close();
+      server.closeAllConnections();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("re-posts the snapshot card when only the subagent tree changed", async () => {
+    const posts: Array<{ url: string; body: unknown }> = [];
+    const server = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => { body += c; });
+      req.on("end", () => {
+        posts.push({ url: req.url ?? "", body: JSON.parse(body) });
+        res.end(JSON.stringify({ id: "wp" }));
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const addr = server.address();
+    const port = typeof addr === "object" && addr !== null && "port" in addr ? addr.port : 0;
+    try {
+      fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "sess-b", sessionKey: "sk" } });
+      const run = createOmpAcpExecutor();
+      const ctx = baseCtx({
+        authToken: "jwt",
+        config: { command: `${process.execPath} ${fakeAcp}`, usageReport: false },
+      });
+      ctx.context.taskId = "issue-1";
+      vi.stubEnv("PAPERCLIP_API_URL", `http://127.0.0.1:${port}`);
+      await run(ctx);
+      expect(posts).toHaveLength(1);
+      // Same projects, same sessions, same current id: only `_omp/subagents`
+      // now answers. The card renders that tree, so it must be re-posted.
+      vi.stubEnv("FAKE_ACP_MODE", "subagents");
+      await run(ctx);
+      expect(posts).toHaveLength(2);
+      expect(posts[1].body).toMatchObject({
+        metadata: {
+          subagents: expect.arrayContaining([
+            expect.objectContaining({ id: "sub-1", agent: "scout", status: "running" }),
+          ]),
+        },
+      });
+      // An unchanged tree is suppressed again: the key is stable, not noisy.
+      await run(ctx);
+      expect(posts).toHaveLength(2);
     } finally {
       server.close();
       server.closeAllConnections();
@@ -1071,7 +1216,18 @@ describe("resolveBridgeRunMode", () => {
       "/opt/omp/dist/paperclip-bridge.js",
     )).toBe(true);
   });
+
+  it("keeps the approval gate armed only while the manifest and extension both land", () => {
+    // P1-1: the two ways governance can fail to engage, and the one way it does.
+    expect(isGovernanceArmed("/state/governance.json", "/opt/omp/dist/paperclip-bridge.js")).toBe(true);
+    // Unwritable state dir: no manifest, so no handler, so the gate stays put.
+    expect(isGovernanceArmed(null, "/opt/omp/dist/paperclip-bridge.js")).toBe(false);
+    // Whitespace install: the manifest exists but --extension is never appended.
+    expect(isGovernanceArmed("/state/governance.json", "/opt/omp dist/paperclip-bridge.js")).toBe(false);
+    expect(isGovernanceArmed(null, "/opt/omp dist/paperclip-bridge.js")).toBe(false);
+  });
 });
+
 describe("resolveSessionCwd", () => {
   const currentCwd = process.cwd();
 

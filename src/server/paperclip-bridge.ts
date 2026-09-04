@@ -149,18 +149,28 @@ const CONTROL_TOOLS: Record<string, true> = {
 /* ------------------------------------------------------------------ */
 
 /**
- * Per-session running USD total and its latched over-cap flag. Module scope
- * IS the session scope: omp re-imports this extension with a cache-busted
- * specifier on every `session/new`, so each session — a subagent included —
- * starts a fresh zeroed copy and enforces its own cap. Honest ceiling: an
- * agent with N in-process subagents can spend up to (1+N)×cap, and with the
- * default cold child (`warmHandleIdleMs=0`) the cap is per-run; it only
- * accumulates across runs under an operator-configured warm handle. The gate
- * is advisory and coarse (cooperation with `budgetExceeded` is the design,
- * not a hard request-level abort): read-only provider calls keep flowing.
+ * Per-session running USD total. Module scope IS the session scope: omp
+ * re-imports this extension with a cache-busted specifier on every
+ * `session/new`, so each session — a subagent included — starts a fresh zeroed
+ * copy and enforces its own cap. Honest ceiling: an agent with N in-process
+ * subagents can spend up to (1+N)×cap, and with the default cold child
+ * (`warmHandleIdleMs=0`) the cap is per-run; it only accumulates across runs
+ * under an operator-configured warm handle. The gate is advisory and coarse
+ * (cooperation with the over-cap state is the design, not a hard request-level
+ * abort): read-only provider calls keep flowing.
+ *
+ * Being over cap is DERIVED from this tally plus the cap currently on disk, and
+ * deliberately not stored: a latch could only ever be one-way, while policy
+ * edits ARE supported on a warm session (the manifest is re-read on mtime). A
+ * latched flag therefore kept every mutating tool blocked forever after one
+ * expensive message, even once the operator raised or removed the cap.
  */
 let runningCost = 0;
-let budgetExceeded = false;
+
+/** Is the session over its cap right now? A cap of 0 means no cap. */
+function budgetExceeded(capUsd: number): boolean {
+  return capUsd > 0 && runningCost > capUsd;
+}
 
 /**
  * Tools that stay callable once the cap is reached. The budget gate is
@@ -459,8 +469,11 @@ function evaluateGuardrails(
   // Budget gate — deliberately AFTER the control-tool short-circuit: an
   // over-cap agent must still be able to yield/goal/todo its way out of the
   // run. Deny-by-complement: only `BUDGET_READ_ONLY` passes; `task`, every
-  // `mcp__*` and every other non-read tool waits.
-  if (budgetExceeded && !BUDGET_READ_ONLY[toolName]) {
+  // `mcp__*` and every other non-read tool waits. `rules` is re-read on every
+  // call, so raising the cap above the spend or deleting it clears this gate
+  // with no new message required, and `budgetExceeded` guarantees the reason
+  // below always prints a real cap.
+  if (budgetExceeded(rules.budgetCapUsd) && !BUDGET_READ_ONLY[toolName]) {
     return blocked(
       `budget cap reached (${usd(runningCost)} spent > ${usd(rules.budgetCapUsd)} USD this session)`,
     );
@@ -776,16 +789,14 @@ function installGovernanceLane(pi: BridgePi): void {
     }
   });
 
-  // The tally reads the cap from the same cached rules as the gate, so a
-  // manifest edit that lowers `budgetCapUsd` flips the latch at the next
-  // message even when no new cost arrives.
+  // The tally only accumulates: whether the session is OVER cap is derived at
+  // each gate check from the cap on disk, so a raised or removed cap takes
+  // effect on the next tool call instead of waiting for a message that may
+  // never come.
   pi.on("message_end", (event) => {
     try {
       const total = event?.message?.usage?.cost?.total ?? 0;
       if (typeof total === "number" && Number.isFinite(total)) runningCost += total;
-      const current = currentGuardrails(process.env.PAPERCLIP_GOVERNANCE_MANIFEST ?? file);
-      const cap = current?.budgetCapUsd ?? 0;
-      if (cap > 0 && runningCost > cap) budgetExceeded = true;
     } catch {
       // Never throw; a missed message only loosens an already-coarse cap.
     }

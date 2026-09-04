@@ -891,6 +891,47 @@ describe("soft cost budget (message_end)", () => {
     // Over cap, even a non-denied tool blocks — with the BUDGET reason.
     expect(pi.toolCall("write", { path: "a.ts", content: "x" }, { cwd })?.reason).toContain("budget cap reached");
   });
+
+  // P2-3 (v0.8 final review): `budgetExceeded` used to be a one-way latch.
+  // Policy edits are explicitly supported on a warm session (the manifest is
+  // re-read on mtime), so an operator who raised the cap above the spend — or
+  // removed it — left every non-read tool blocked for the rest of the session,
+  // with a reason that read "spent > 0 USD".
+  it("raising the cap above the spend clears the block", async () => {
+    const { pi, file, cwd } = await budgetFixture({ budgetCapUsd: 2 });
+    pi.messageEnd(3);
+    expect(pi.toolCall("write", { path: "a.ts", content: "x" }, { cwd })?.block).toBe(true);
+
+    await rewriteGovernance(file, { budgetCapUsd: 10 });
+    // No new message: the reload alone must clear it.
+    expect(pi.toolCall("write", { path: "a.ts", content: "x" }, { cwd })).toBeUndefined();
+    expect(pi.toolCall("bash", { command: "make" }, { cwd })).toBeUndefined();
+  });
+
+  it("removing the cap clears the block", async () => {
+    const { pi, file, cwd } = await budgetFixture({ budgetCapUsd: 1, guardrails: { denyTools: ["nope_x"] } });
+    pi.messageEnd(5);
+    expect(pi.toolCall("write", { path: "a.ts", content: "x" }, { cwd })?.block).toBe(true);
+
+    await rewriteGovernance(file, { guardrails: { denyTools: ["nope_x"] } });
+    expect(pi.toolCall("write", { path: "a.ts", content: "x" }, { cwd })).toBeUndefined();
+  });
+
+  it("the block reason prints the live cap and spend, never a zero cap", async () => {
+    const { pi, cwd } = await budgetFixture({ budgetCapUsd: 2.5 });
+    pi.messageEnd(4.25);
+    const blocked = pi.toolCall("write", { path: "a.ts", content: "x" }, { cwd });
+    expect(blocked?.block).toBe(true);
+    expect(blocked?.reason).toContain("4.25 spent > 2.5 USD");
+    expect(blocked?.reason).not.toMatch(/>\s*0\s*USD/);
+  });
+
+  it("a cap that is never exceeded across reloads blocks nothing", async () => {
+    const { pi, file, cwd } = await budgetFixture({ budgetCapUsd: 5 });
+    pi.messageEnd(1);
+    await rewriteGovernance(file, { budgetCapUsd: 4 });
+    expect(pi.toolCall("write", { path: "a.ts", content: "x" }, { cwd })).toBeUndefined();
+  });
 });
 
 /* ------------------------------------------------------------------ */

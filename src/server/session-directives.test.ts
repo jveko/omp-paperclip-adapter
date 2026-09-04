@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { getSessionConfigSchema, paperclipApiBase, readSessionIntelConfig, resolveRunDirective, validateCredentialMode, validThinkingLevel, validateThinkingLevel } from "./session-directives.js";
+import { createHash } from "node:crypto";
+import {
+  getSessionConfigSchema, paperclipApiBase, readSessionIntelConfig, resolveRunDirective,
+  sessionSnapshotDigestInput, validateCredentialMode, validThinkingLevel, validateThinkingLevel,
+} from "./session-directives.js";
+import { snapshotDigest } from "./session-state.js";
 
 describe("readSessionIntelConfig", () => {
   it("defaults browser on, usage report on, everything else off", () => {
@@ -289,5 +294,59 @@ describe("postWorkProduct", () => {
       { type: "artifact", provider: "omp-session", title: "t", summary: "s", metadata: {} },
     );
     expect(out).toEqual({ ok: false, error: "no run auth token available" });
+  });
+});
+
+describe("sessionSnapshotDigestInput", () => {
+  // P2-4 (v0.8 final review): the emission key hashed projects, session ids and
+  // the current session only. Once omp answers `_omp/subagents`, a subagent tree
+  // or status change with an otherwise untouched landscape compared equal, so
+  // the updated card was never posted and the board kept stale subagents.
+  const projects = [{ cwd: "/w", sessionCount: 1, lastActivityAt: "u1", lastTitle: "T" }];
+  const sessions = [{
+    sessionId: "s1", cwd: "/w", title: "T", updatedAt: "u1", messageCount: 1, size: 1,
+  }];
+  const subagent = {
+    id: "sub-1", index: 0, agent: "scout", status: "running",
+    description: "map the repo", parentToolCallId: "call-1", lastUpdate: 1,
+  };
+
+  it("hashes a snapshot with no subagents exactly as before the field existed", () => {
+    const legacy = {
+      projects,
+      ids: sessions.map((s) => [s.sessionId, s.updatedAt]),
+      current: "s1",
+    };
+    expect(snapshotDigest(sessionSnapshotDigestInput({ projects, sessions }, "s1")))
+      .toBe(createHash("sha256").update(JSON.stringify(legacy)).digest("hex").slice(0, 16));
+  });
+
+  it("re-emits when only the subagent tree changes", () => {
+    const running = sessionSnapshotDigestInput({ projects, sessions, subagents: [subagent] }, "s1");
+    const done = sessionSnapshotDigestInput(
+      { projects, sessions, subagents: [{ ...subagent, status: "completed" }] },
+      "s1",
+    );
+    expect(snapshotDigest(running)).not.toBe(snapshotDigest(done));
+  });
+
+  it("treats an answered-but-empty tree as a change from no answer, then dedups", () => {
+    const unanswered = sessionSnapshotDigestInput({ projects, sessions }, "s1");
+    const empty = sessionSnapshotDigestInput({ projects, sessions, subagents: [] }, "s1");
+    expect(snapshotDigest(unanswered)).not.toBe(snapshotDigest(empty));
+    expect(snapshotDigest(empty)).toBe(snapshotDigest({ ...empty }));
+  });
+
+  it("is insensitive to the payload's key order", () => {
+    const a = sessionSnapshotDigestInput({ projects, sessions, subagents: [subagent] }, "s1");
+    const b = sessionSnapshotDigestInput({
+      projects,
+      sessions,
+      subagents: [{
+        lastUpdate: 1, parentToolCallId: "call-1", description: "map the repo",
+        status: "running", agent: "scout", index: 0, id: "sub-1",
+      }],
+    }, "s1");
+    expect(snapshotDigest(a)).toBe(snapshotDigest(b));
   });
 });

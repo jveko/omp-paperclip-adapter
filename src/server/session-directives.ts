@@ -199,6 +199,31 @@ export function buildSessionSnapshotWorkProduct(
   };
 }
 
+/**
+ * The landscape the session-snapshot card dedups on: exactly what the card
+ * renders, so a change the board would see can never compare equal.
+ *
+ * `subagents` is part of it because the card carries the tree — an update to it
+ * with an otherwise identical session list is still new information. When omp
+ * answers no `_omp/subagents` the value is `undefined`, which `JSON.stringify`
+ * drops, so today's engines (no subagent bridge) hash to the same bytes they
+ * did before the field existed and no card is re-posted for it. Key order is
+ * fixed by the projection, never by omp's payload.
+ */
+export function sessionSnapshotDigestInput(
+  snapshot: Pick<OmpSessionsSnapshot, "projects" | "sessions" | "subagents">,
+  current: string | null,
+): Record<string, unknown> {
+  return {
+    projects: snapshot.projects,
+    ids: snapshot.sessions.map((s) => [s.sessionId, s.updatedAt]),
+    current,
+    subagents: snapshot.subagents?.map((s) => [
+      s.id, s.index, s.agent, s.status, s.description, s.parentToolCallId, s.lastUpdate,
+    ]),
+  };
+}
+
 export function paperclipApiBase(env: NodeJS.ProcessEnv = process.env): string {
   const explicit = env.PAPERCLIP_API_URL ?? env.PAPERCLIP_RUNTIME_API_URL;
   if (explicit) return explicit.replace(/\/+$/, "").replace(/\/api$/, "");

@@ -74,9 +74,38 @@ export interface GovernancePolicy {
 }
 
 export type GovernanceParse =
-  | { kind: "off" }
-  | { kind: "ok"; policy: GovernancePolicy }
+  | { kind: "off"; vacuous?: string[] }
+  | { kind: "ok"; policy: GovernancePolicy; enforceable: boolean; vacuous?: string[] }
   | { kind: "error"; error: string };
+
+/**
+ * The keys `paperclip-bridge.ts` reads as rules — from the `guardrails` bag when
+ * there is one, from the document root otherwise (its `normalizeGuardrails`
+ * `bag` fallback). Listed in one place so this audit and the handler cannot drift
+ * apart silently: a key outside it is reported to the operator, never guessed at.
+ */
+const RULE_BAG_KEYS = [
+  "pathScopes", "bashDeny", "denyTools", "argRevisions", "approvalRequired",
+] as const;
+
+/** Why a written key carries no rule, phrased for the operator. */
+const INERT_REASON: Record<(typeof RULE_BAG_KEYS)[number], string> = {
+  pathScopes: "no usable scope",
+  bashDeny: "no compilable pattern",
+  denyTools: "no usable tool name",
+  argRevisions: "no usable revision",
+  approvalRequired: "no usable tool rule",
+};
+
+/**
+ * Keys that ARE rules somewhere else in the document but are inert here. The
+ * bridge hoists `budgetCapUsd` and the adapter reads `approvedEndpoints` from
+ * the policy ROOT only, so either one inside `guardrails` enforces nothing.
+ */
+const MISPLACED_REASON: Record<string, string> = {
+  budgetCapUsd: "only read at the policy root, not inside guardrails",
+  approvedEndpoints: "only read at the policy root, not inside guardrails",
+};
 
 /** Signals a malformed document; caught by parseGovernancePolicy, never escapes. */
 class PolicySyntaxError extends Error {}
@@ -338,18 +367,105 @@ function normalizeApprovalRules(value: unknown): GovernanceApprovalRuleInput[] |
 }
 
 /**
- * Normalize a parsed document. Only known keys are validated; a known key with
- * an unusable shape is dropped rather than guessed at, so a typo can't silently
- * weaken a rule. `live` reports whether anything is actually enforceable — an
- * all-empty document must not auto-approve via the overlay fold.
+ * Does this `pathScopes` value restrict anything once the bridge normalizes it?
+ * An allow list only bites when out-of-scope calls are denied, and an empty list
+ * means "the run cwd" — `denyOutside: false` is therefore no rule at all.
  */
-function normalizePolicy(raw: Record<string, unknown>): { policy: GovernancePolicy; live: boolean } {
-  const policy: GovernancePolicy = { ...raw };
-  let live = false;
+function pathScopesEffective(value: unknown): boolean {
+  if (typeof value === "string") return value.trim().length > 0;
+  if (Array.isArray(value)) return cleanStrings(value).length > 0;
+  if (!isPlainObject(value)) return false;
+  return value.denyOutside !== false;
+}
 
-  if (isPlainObject(raw.guardrails) && Object.keys(raw.guardrails).length > 0) {
-    policy.guardrails = raw.guardrails;
-    live = true;
+/** At least one `bashDeny` source the bridge will not skip as unparseable. */
+function bashDenyEffective(value: unknown): boolean {
+  return cleanStrings(value).some((source) => {
+    try {
+      new RegExp(source);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+}
+
+/** Is this `argRevisions` bag a tool→partial-args map with something to merge? */
+function argRevisionsEffective(value: unknown): boolean {
+  return isPlainObject(value)
+    && Object.values(value).some((revision) => isPlainObject(revision) && Object.keys(revision).length > 0);
+}
+
+/**
+ * Audit a guardrails bag in key order, naming every entry that carries no rule:
+ * a family that normalized to nothing, or a key the bridge never reads. Unknown
+ * keys are reported rather than guessed at, because `denyToolz` is a rail the
+ * operator believes exists — and arming auto-approval on the strength of a
+ * document that enforces nothing is the fail-open this audit exists to stop.
+ *
+ * `reportUnknown` is off for the root-shorthand bag: there, unrecognized keys
+ * are documented pass-through for a newer bridge, not operator typos.
+ */
+function auditGuardrails(
+  bag: Record<string, unknown>,
+  reportUnknown: boolean,
+): { enforceable: boolean; vacuous: string[] } {
+  let enforceable = false;
+  const vacuous: string[] = [];
+  const usable: Record<(typeof RULE_BAG_KEYS)[number], boolean> = {
+    pathScopes: pathScopesEffective(bag.pathScopes),
+    bashDeny: bashDenyEffective(bag.bashDeny),
+    denyTools: cleanStrings(bag.denyTools).length > 0,
+    argRevisions: argRevisionsEffective(bag.argRevisions),
+    approvalRequired: normalizeApprovalRules(bag.approvalRequired) !== null,
+  };
+  for (const key of Object.keys(bag)) {
+    const ruleKey = (RULE_BAG_KEYS as readonly string[]).includes(key)
+      ? key as (typeof RULE_BAG_KEYS)[number]
+      : null;
+    if (ruleKey ? usable[ruleKey] : false) {
+      enforceable = true;
+      continue;
+    }
+    if (ruleKey) vacuous.push(`${ruleKey}: ${INERT_REASON[ruleKey]}`);
+    // Non-rule keys are only a typo INSIDE a `guardrails` bag: at the policy
+    // root, `approvedEndpoints` is a real key and anything else the bridge does
+    // not know is documented pass-through for a newer bridge.
+    else if (reportUnknown) {
+      vacuous.push(MISPLACED_REASON[key]
+        ? `${key}: ${MISPLACED_REASON[key]}`
+        : `${key}: not a guardrail key`);
+    }
+  }
+  return { enforceable, vacuous };
+}
+
+/**
+ * Normalize a parsed document and audit what its rules can actually do.
+ *
+ * Only known keys are validated; a known key with an unusable shape is dropped
+ * rather than guessed at, so a typo can't silently weaken a rule. `live` says
+ * the document configured anything at all (a bridge rail or endpoint routing);
+ * `enforceable` says the BRIDGE has a rule to run — the only condition under
+ * which omp's own approval gate may be relaxed. They differ on purpose: a
+ * routing-only policy needs no bridge handler, so it must never arm auto-
+ * approval, and a `{denyTools: []}` policy arms nothing at all.
+ */
+function normalizePolicy(raw: Record<string, unknown>): {
+  policy: GovernancePolicy;
+  live: boolean;
+  enforceable: boolean;
+  vacuous: string[];
+} {
+  const policy: GovernancePolicy = { ...raw };
+  const bag = isPlainObject(raw.guardrails) ? raw.guardrails : null;
+  // Mirrors the bridge's `normalizeGuardrails` bag choice exactly: a canonical
+  // `guardrails` map when there is one, the document root otherwise.
+  const bagIsGuardrails = bag !== null && Object.keys(bag).length > 0;
+  const audit = auditGuardrails(bagIsGuardrails && bag ? bag : raw, bagIsGuardrails);
+
+  if (bagIsGuardrails && bag) {
+    policy.guardrails = bag;
   } else {
     delete policy.guardrails;
   }
@@ -357,7 +473,6 @@ function normalizePolicy(raw: Record<string, unknown>): { policy: GovernancePoli
   const cap = typeof raw.budgetCapUsd === "string" ? Number(raw.budgetCapUsd) : raw.budgetCapUsd;
   if (typeof cap === "number" && Number.isFinite(cap) && cap > 0) {
     policy.budgetCapUsd = cap;
-    live = true;
   } else {
     delete policy.budgetCapUsd;
   }
@@ -365,7 +480,6 @@ function normalizePolicy(raw: Record<string, unknown>): { policy: GovernancePoli
   const endpoints = cleanStrings(raw.approvedEndpoints);
   if (endpoints.length > 0) {
     policy.approvedEndpoints = endpoints;
-    live = true;
   } else {
     delete policy.approvedEndpoints;
   }
@@ -373,19 +487,33 @@ function normalizePolicy(raw: Record<string, unknown>): { policy: GovernancePoli
   const approvals = normalizeApprovalRules(raw.approvalRequired);
   if (approvals) {
     policy.approvalRequired = approvals;
-    live = true;
   } else {
     delete policy.approvalRequired;
   }
 
-  return { policy, live };
+  // The root budget and approval lanes are read off the document by the bridge
+  // itself; an `approvalRequired` inside the bag is already counted by the audit
+  // (the bridge reads `document.approvalRequired ?? bag.approvalRequired`).
+  const enforceable = audit.enforceable
+    || policy.budgetCapUsd !== undefined
+    || policy.approvalRequired !== undefined;
+  const routing = policy.approvedEndpoints !== undefined;
+  return {
+    policy,
+    live: enforceable || routing,
+    enforceable,
+    vacuous: audit.vacuous,
+  };
 }
 
 /**
  * Parse `config.governancePolicy` (JSON or YAML-ish text, or an already-parsed
  * object). `off` means "no governance configured" (absent, blank, or nothing
- * enforceable); `error` means the document was unreadable and the caller should
- * say so. Never throws.
+ * the bridge or the overlay can act on); `error` means the document was
+ * unreadable and the caller must say so rather than run ungoverned silently.
+ * `enforceable` separates "the bridge has rules" from "the operator only asked
+ * for endpoint routing", which is what decides the single-gate relaxation.
+ * Never throws.
  */
 export function parseGovernancePolicy(value: unknown): GovernanceParse {
   if (value === undefined || value === null) return { kind: "off" };
@@ -404,8 +532,10 @@ export function parseGovernancePolicy(value: unknown): GovernanceParse {
   if (!isPlainObject(raw)) {
     return { kind: "error", error: "the policy must be a mapping of keys to values" };
   }
-  const { policy, live } = normalizePolicy(raw);
-  return live ? { kind: "ok", policy } : { kind: "off" };
+  const { policy, live, enforceable, vacuous } = normalizePolicy(raw);
+  const inert = vacuous.length > 0 ? { vacuous } : {};
+  if (!live) return { kind: "off", ...inert };
+  return { kind: "ok", policy, enforceable, ...inert };
 }
 
 /** JSON when the document is JSON-shaped and parses; the YAML-ish reader else. */
@@ -421,17 +551,27 @@ function readDocument(text: string): unknown {
   return parseYamlish(text);
 }
 
-/** True when a policy is configured AND has something enforceable to run. */
+/**
+ * True when a policy is configured AND the bridge has a rule to enforce. This
+ * is the arming predicate, not "the document parsed": endpoint routing is
+ * enforced by omp's own config and never justifies auto-approval on its own.
+ */
 export function governancePolicyActive(config: Record<string, unknown>): boolean {
-  return parseGovernancePolicy(config.governancePolicy).kind === "ok";
+  const parsed = parseGovernancePolicy(config.governancePolicy);
+  return parsed.kind === "ok" && parsed.enforceable;
 }
 
 /**
  * Materialize the governance manifest for the paperclip bridge extension.
- * Returns the path written, or null when governance is off, the document is
- * unreadable, or the write failed — the last two route a `warn` message so the
- * board shows why policy is not in effect. Mirrors the v0.7 skills-manifest
- * fix: create the state dir (recursive) BEFORE writing.
+ * Returns the path written, or null when governance is off, carries no
+ * bridge-enforceable rule (endpoint routing alone), the document is
+ * unreadable, or the write failed — every null-but-configured case routes a
+ * `warn` so the board shows why policy is not in effect. Mirrors the v0.7
+ * skills-manifest fix: create the state dir (recursive) BEFORE writing.
+ *
+ * Writing ONLY an enforceable policy is load-bearing: the returned path is what
+ * arms the `--extension` append and, through it, the single-gate relaxation.
+ * A manifest the bridge would read as zero rules must not exist.
  */
 export async function materializeGovernanceManifest(
   config: Record<string, unknown>,
@@ -439,11 +579,22 @@ export async function materializeGovernanceManifest(
   warn?: (message: string) => void | Promise<void>,
 ): Promise<string | null> {
   const parsed = parseGovernancePolicy(config.governancePolicy);
-  if (parsed.kind === "off") return null;
   if (parsed.kind === "error") {
     await warn?.(`omp governance policy ignored: could not parse governancePolicy (${parsed.error})`);
     return null;
   }
+  if (parsed.vacuous && parsed.vacuous.length > 0) {
+    const listed = parsed.vacuous.join("; ");
+    if (parsed.kind === "ok" && parsed.enforceable) {
+      await warn?.(`omp governance policy ignored key(s) that carry no rule: ${listed}`);
+    } else {
+      await warn?.(
+        `omp governance policy has no enforceable rule after normalization (${listed}); `
+        + "nothing was written, so governance is not armed and omp's own approval gate stays in force",
+      );
+    }
+  }
+  if (parsed.kind !== "ok" || !parsed.enforceable) return null;
   const file = path.join(dir, GOVERNANCE_MANIFEST_FILE);
   try {
     await fs.mkdir(dir, { recursive: true });

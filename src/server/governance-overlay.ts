@@ -160,29 +160,41 @@ export type GovernanceOverlayResult =
 /**
  * Materialize the run-child-only governance overlay: the single-gate key
  * (`tools.approvalMode: yolo`) plus, when routing can be computed safely,
- * `disabledProviders`. Returns "none" when no live policy is configured, so an
- * unparseable or vacuous document never arms auto-approval; "error" (never a
- * throw) when the write fails, mirroring the failover overlay's degrade.
+ * `disabledProviders`. Returns "none" when nothing may be emitted — no live
+ * policy, an unparseable or vacuous document, or a policy with no rule the
+ * bridge can enforce — and "error" (never a throw) when the write fails,
+ * mirroring the failover overlay's degrade.
  *
- * `models` / `configuredModel` come from the run's cached catalog read — this
- * function deliberately does not spawn `omp models ls` itself, because that read
- * must not happen under this file.
+ * `armed` is the gate on the relaxation, and it is deliberately an INPUT rather
+ * than something this function can infer: only the run flow knows whether the
+ * governance manifest actually reached the child and whether `--extension` will
+ * really be appended. Folding `approvalMode: yolo` without that would disable
+ * omp's own permission gate while no handler exists to replace it — every
+ * guardrail, budget and approval rule silently absent. `models` /
+ * `configuredModel` still come from the run's cached catalog read; this function
+ * does not spawn `omp models ls` itself, because that read must not happen under
+ * this file.
  */
 export async function materializeGovernanceOverlay(
   config: Record<string, unknown>,
   dir: string,
-  catalog: { models?: readonly OmpModelInfo[]; configuredModel?: string | null } = {},
+  context: {
+    models?: readonly OmpModelInfo[];
+    configuredModel?: string | null;
+    /** True only when the bridge will enforce this run. Absent = not armed. */
+    armed?: boolean;
+  } = {},
   warn?: (message: string) => void | Promise<void>,
 ): Promise<GovernanceOverlayResult> {
   const parsed = parseGovernancePolicy(config.governancePolicy);
   if (parsed.kind !== "ok") return { status: "none" };
-  const models = catalog.models ?? [];
+  const models = context.models ?? [];
   const approved = parsed.policy.approvedEndpoints;
   const plan: RoutingPlan = approved && approved.length > 0
     ? planEndpointRouting({
         models,
         approvedEndpoints: approved,
-        configuredModel: catalog.configuredModel ?? null,
+        configuredModel: context.configuredModel ?? null,
         fallbackChain: parseFallbackChain(config),
       })
     : { disabled: [], kept: [], skipped: null };
@@ -195,16 +207,25 @@ export async function materializeGovernanceOverlay(
       `omp governance routing kept ${plan.kept.join(", ")} enabled: it serves the configured model or the fallback chain, though approvedEndpoints omits it`,
     );
   }
-  const lines: string[] = [
-    // Single-gate recipe: omp resolves auto-approval from the MERGED settings
-    // view, so this key makes the ACP permission proxy always-allow and leaves
-    // the bridge's tool_call gate as the run's only deterministic deny point.
-    "tools:",
-    "  approvalMode: yolo",
-  ];
+  const lines: string[] = [];
+  // Single-gate recipe: omp resolves auto-approval from the MERGED settings
+  // view, so this key makes the ACP permission proxy always-allow and leaves
+  // the bridge's tool_call gate as the run's only deterministic deny point.
+  // That trade is only sound while the bridge is armed AND has a rule to run:
+  // endpoint routing is enforced by omp itself, so it never pays for itself.
+  const relaxGate = context.armed === true && parsed.enforceable;
+  if (relaxGate) {
+    lines.push(
+      "tools:",
+      "  approvalMode: yolo",
+    );
+  }
   if (plan.disabled.length > 0) {
     lines.push("disabledProviders:", ...plan.disabled.map((p) => `  - ${JSON.stringify(p)}`));
   }
+  // Nothing to say, so nothing to read: an unarmed overlay with no routing must
+  // not become a PI_CONFIG_FILES entry that could still influence the run.
+  if (lines.length === 0) return { status: "none" };
   const file = path.join(dir, GOVERNANCE_CONFIG_FILE);
   try {
     await fs.mkdir(dir, { recursive: true });

@@ -131,12 +131,18 @@ describe("materializeGovernanceOverlay", () => {
     }
   });
 
-  it("carries the single gate for any live policy, with no routing when unapproved", async () => {
+  // P1-1 (v0.8 final review): the single-gate relaxation used to ride on the
+  // policy alone. A policy that could not reach the child (unwritable manifest)
+  // or that the child could not load (whitespace in the extension path) still
+  // turned off omp's own permission gate, leaving no gate at all. `armed` is
+  // now an explicit input: no arming, no relaxation.
+  it("carries the single gate for an armed policy with no routing when unapproved", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "gov-ov-"));
     try {
       const res = await materializeGovernanceOverlay(
         { governancePolicy: "guardrails:\n  denyTools:\n    - web_search" },
         dir,
+        { armed: true },
       );
       expect(res.status).toBe("ok");
       expect(res.status === "ok" && res.path).toBe(path.join(dir, GOVERNANCE_CONFIG_FILE));
@@ -144,6 +150,57 @@ describe("materializeGovernanceOverlay", () => {
       expect(yaml).toMatch(/^tools:\n {2}approvalMode: yolo$/m);
       expect(yaml).not.toContain("disabledProviders");
       expect(res.status === "ok" && res.disabled).toEqual([]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("never relaxes the gate while governance is unarmed, but still routes", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "gov-ov-"));
+    try {
+      const res = await materializeGovernanceOverlay(
+        { governancePolicy: "guardrails:\n  denyTools:\n    - web_search\napprovedEndpoints:\n  - prov\n  - omi" },
+        dir,
+        { models: CATALOG, configuredModel: "prov/m", armed: false },
+      );
+      expect(res.status).toBe("ok");
+      const yaml = await readFile(path.join(dir, GOVERNANCE_CONFIG_FILE), "utf8");
+      // Routing is enforced by omp itself, so it lands; the gate does not move.
+      expect(yaml).toContain('disabledProviders:\n  - "axon-compat"');
+      expect(yaml).not.toContain("approvalMode");
+      expect(yaml).not.toMatch(/^tools:/m);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("writes nothing when an unarmed policy has no routing to apply", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "gov-ov-"));
+    try {
+      const res = await materializeGovernanceOverlay(
+        { governancePolicy: "guardrails:\n  denyTools:\n    - web_search" },
+        dir,
+        { armed: false },
+      );
+      expect(res).toEqual({ status: "none" });
+      await expect(readFile(path.join(dir, GOVERNANCE_CONFIG_FILE), "utf8")).rejects.toThrow();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not relax the gate for a routing-only policy even when armed", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "gov-ov-"));
+    try {
+      const res = await materializeGovernanceOverlay(
+        { governancePolicy: "approvedEndpoints:\n  - prov\n  - omi" },
+        dir,
+        { models: CATALOG, configuredModel: "prov/m", armed: true },
+      );
+      expect(res.status).toBe("ok");
+      const yaml = await readFile(path.join(dir, GOVERNANCE_CONFIG_FILE), "utf8");
+      expect(yaml).toContain('disabledProviders:\n  - "axon-compat"');
+      expect(yaml).not.toContain("approvalMode");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -178,9 +235,13 @@ describe("materializeGovernanceOverlay", () => {
     const warn = vi.fn();
     try {
       const res = await materializeGovernanceOverlay(
-        { governancePolicy: "approvedEndpoints: [brokerco]" },
+        {
+          // A real rail alongside the inert routing lever: the rail is what
+          // pays for the gate, the routing failure only costs the providers.
+          governancePolicy: "guardrails:\n  denyTools:\n    - web_search\napprovedEndpoints: [brokerco]",
+        },
         dir,
-        { models: [], configuredModel: null },
+        { models: [], configuredModel: null, armed: true },
         warn,
       );
       // Still governed (the gate stays armed) — just unrouted.
@@ -247,6 +308,7 @@ describe("materializeGovernanceOverlay", () => {
       const res = await materializeGovernanceOverlay(
         { governancePolicy: "budgetCapUsd: 2" },
         blocker,
+        { armed: true },
       );
       expect(res.status).toBe("error");
       expect(res.status === "error" && res.error.length).toBeGreaterThan(0);

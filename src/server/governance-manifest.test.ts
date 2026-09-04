@@ -129,8 +129,12 @@ describe("parseGovernancePolicy", () => {
     // tools.approvalMode:yolo (auto-approve) for a policy that enforces none.
     expect(parseGovernancePolicy('{"approvalRequired":[{"reason":"oops"},42,"  "]}')).toEqual({
       kind: "off",
+      vacuous: ["approvalRequired: no usable tool rule"],
     });
-    expect(parseGovernancePolicy("approvalRequired: []")).toEqual({ kind: "off" });
+    expect(parseGovernancePolicy("approvalRequired: []")).toEqual({
+      kind: "off",
+      vacuous: ["approvalRequired: no usable tool rule"],
+    });
   });
 
   it("drops a non-string reason/risk instead of stringifying it", () => {
@@ -141,6 +145,135 @@ describe("parseGovernancePolicy", () => {
     if (res.kind !== "ok") return;
     expect(res.policy.approvalRequired).toEqual([{ tool: "bash" }]);
   });
+
+  // P1-2 (v0.8 final review): a non-empty `guardrails` object used to be the
+  // whole test for "live". That arms auto-approval on an inert policy — the
+  // bridge normalizes `{denyTools: []}` or a typo'd key to zero rules, so the
+  // run ends up with omp's own permission gate off and nothing enforcing.
+  it("is off when guardrails normalizes to nothing enforceable", () => {
+    const inert = [
+      '{"guardrails":{"denyTools":[]}}',
+      '{"guardrails":{"denyToolz":"rm -rf"}}',
+      '{"guardrails":{"budgetCapUsd":5}}',
+      '{"guardrails":{"bashDeny":["("]}}',
+      '{"guardrails":{"bashDeny":["","  "]}}',
+      '{"guardrails":{"pathScopes":{"allow":["w"],"denyOutside":false}}}',
+      '{"guardrails":{"argRevisions":{}}}',
+      '{"guardrails":{"argRevisions":{"bash":{}}}}',
+      '{"guardrails":{"denyTools":[null,7]}}',
+    ];
+    for (const doc of inert) {
+      expect(parseGovernancePolicy(doc), doc).toEqual({
+        kind: "off",
+        vacuous: expect.any(Array),
+      });
+    }
+  });
+
+  it("names the guardrails keys that carried no rule", () => {
+    const res = parseGovernancePolicy(
+      '{"guardrails":{"denyTools":[],"denyToolz":"x","budgetCapUsd":5}}',
+    );
+    expect(res.kind).toBe("off");
+    if (res.kind !== "off") return;
+    expect(res.vacuous).toEqual([
+      "denyTools: no usable tool name",
+      "denyToolz: not a guardrail key",
+      "budgetCapUsd: only read at the policy root, not inside guardrails",
+    ]);
+  });
+
+  it("is live when at least one guardrail family has something to enforce", () => {
+    const armed = [
+      { guardrails: { denyTools: ["web_search"] } },
+      { guardrails: { bashDeny: ["(rm|sudo)"] } },
+      { guardrails: { pathScopes: { allow: ["worktree"] } } },
+      { guardrails: { pathScopes: {} } },
+      { guardrails: { argRevisions: { bash: { command: "make" } } } },
+    ];
+    for (const doc of armed) {
+      const res = parseGovernancePolicy(doc);
+      expect(res.kind, JSON.stringify(doc)).toBe("ok");
+      if (res.kind !== "ok") continue;
+      expect(res.vacuous).toBeUndefined();
+    }
+  });
+
+  it("flags an inert key inside an otherwise live guardrails bag", () => {
+    const res = parseGovernancePolicy(
+      '{"guardrails":{"denyTools":["web_search"],"denyToolz":"x"}}',
+    );
+    expect(res.kind).toBe("ok");
+    if (res.kind !== "ok") return;
+    expect(res.vacuous).toEqual(["denyToolz: not a guardrail key"]);
+  });
+
+  it("counts an approval rule written inside the guardrails bag as a rule", () => {
+    // The bridge reads `document.approvalRequired ?? bag.approvalRequired`, so
+    // this really does hold a tool — disarming on it would be a false negative.
+    const res = parseGovernancePolicy('{"guardrails":{"approvalRequired":["bash"]}}');
+    expect(res.kind).toBe("ok");
+    if (res.kind !== "ok") return;
+    expect(res.enforceable).toBe(true);
+    expect(res.vacuous).toBeUndefined();
+  });
+
+  it("does not count an unusable approval rule inside the bag", () => {
+    expect(parseGovernancePolicy('{"guardrails":{"approvalRequired":[{"risk":"high"}]}}'))
+      .toEqual({ kind: "off", vacuous: ["approvalRequired: no usable tool rule"] });
+  });
+});
+
+describe("materializeGovernanceManifest rule audit", () => {
+  it("warns and writes nothing when the guardrails bag carried no rule", async () => {
+    await withDir(async (dir) => {
+      const warn = vi.fn();
+      const res = await materializeGovernanceManifest(
+        { governancePolicy: '{"guardrails":{"denyToolz":"rm -rf"}}' },
+        dir,
+        warn,
+      );
+      expect(res).toBeNull();
+      expect(await exists(path.join(dir, GOVERNANCE_MANIFEST_FILE))).toBe(false);
+      expect(warn).toHaveBeenCalledOnce();
+      const message = String(warn.mock.calls[0][0]);
+      expect(message).toMatch(/no enforceable rule/i);
+      expect(message).toMatch(/denyToolz/);
+    });
+  });
+
+  it("warns about an inert key while still writing a live policy", async () => {
+    await withDir(async (dir) => {
+      const warn = vi.fn();
+      const file = await materializeGovernanceManifest(
+        { governancePolicy: '{"guardrails":{"denyTools":["web_search"],"denyToolz":1}}' },
+        dir,
+        warn,
+      );
+      expect(file).toBe(path.join(dir, GOVERNANCE_MANIFEST_FILE));
+      const message = String(warn.mock.calls[0]?.[0] ?? "");
+      expect(warn).toHaveBeenCalledOnce();
+      expect(message).toMatch(/ignored key/i);
+      expect(message).toMatch(/denyToolz/);
+    });
+  });
+
+  it("does not arm the bridge for a routing-only policy", async () => {
+    // approvedEndpoints is consumed by the overlay in THIS process; the bridge
+    // never reads it. Writing a manifest for it would install a handler with
+    // zero rules behind a relaxed approval gate.
+    await withDir(async (dir) => {
+      const warn = vi.fn();
+      const file = await materializeGovernanceManifest(
+        { governancePolicy: "approvedEndpoints: [brokerco]" },
+        dir,
+        warn,
+      );
+      expect(file).toBeNull();
+      expect(await exists(path.join(dir, GOVERNANCE_MANIFEST_FILE))).toBe(false);
+      expect(warn).not.toHaveBeenCalled();
+    });
+  });
 });
 
 describe("governancePolicyActive", () => {
@@ -149,6 +282,8 @@ describe("governancePolicyActive", () => {
     expect(governancePolicyActive({ governancePolicy: "guardrails: {}" })).toBe(false);
     expect(governancePolicyActive({ governancePolicy: "{ broken" })).toBe(false);
     expect(governancePolicyActive({ governancePolicy: "budgetCapUsd: 2" })).toBe(true);
+    // Routing is enforced in this process, not by the bridge: it never arms.
+    expect(governancePolicyActive({ governancePolicy: "approvedEndpoints: [omi]" })).toBe(false);
   });
 });
 
