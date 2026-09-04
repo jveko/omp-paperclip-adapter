@@ -19,6 +19,19 @@ import path from "node:path";
 /** Fixed manifest filename (overwritten in place on every run with a policy). */
 export const GOVERNANCE_MANIFEST_FILE = "governance.json";
 
+/** One `approvalRequired` rule as an operator writes it (T5). */
+export interface GovernanceApprovalRule {
+  /** Exact tool name, or a `prefix*` pattern such as `mcp__*`. */
+  tool: string;
+  /** Optional note surfaced on the board card with the request. */
+  reason?: string;
+  /** Optional risk label; the request reports `high` when unset. */
+  risk?: string;
+}
+
+/** A rule may also be written as just the tool name. */
+export type GovernanceApprovalRuleInput = string | GovernanceApprovalRule;
+
 /**
  * Normalized policy. The known keys are what the governance handlers read;
  * anything else the operator wrote is passed through untouched (the bridge owns
@@ -47,8 +60,16 @@ export interface GovernancePolicy {
    * bridge never reads this key.
    */
   approvedEndpoints?: string[];
-  /** Rules that need a human approval before the call runs. */
-  approvalRequired?: unknown[];
+  /**
+   * Tools a human must approve before the bridge lets them run (T5). Kept in
+   * the shape the operator wrote — a bare tool name or a
+   * `{ tool, reason?, risk? }` object, where `tool` may end in `*` for a prefix
+   * pattern such as `mcp__*` — and validated so a rule that can never match
+   * (no usable `tool`) is dropped rather than guessed at. The bridge's
+   * `tool_call` handler posts a `request_board_approval` and blocks the call;
+   * that is ADVISORY — approving wakes a NEW run, this one never resumes.
+   */
+  approvalRequired?: GovernanceApprovalRuleInput[];
   [key: string]: unknown;
 }
 
@@ -288,16 +309,32 @@ function cleanStrings(value: unknown): string[] {
     .filter((item) => item.length > 0);
 }
 
-/** Approval rules arrive as a list, a single rule object, or a tool name. */
-function ruleList(value: unknown): unknown[] | null {
-  if (Array.isArray(value)) {
-    const kept = value.filter((item) =>
-      (typeof item === "string" && item.trim().length > 0) || isPlainObject(item));
-    return kept.length > 0 ? kept : null;
+/**
+ * Validate `approvalRequired` rules (T5). Accepted shapes: a bare tool name, a
+ * `{ tool, reason?, risk? }` object, or a list of either — a single rule object
+ * or string is read as a one-item list. A rule is kept only when it can name a
+ * tool: an object without a usable `tool` is dropped rather than guessed at,
+ * because an approval rule that never matches is a silently missing rail, and
+ * a document whose only content was such a rule must not count as live.
+ */
+function normalizeApprovalRules(value: unknown): GovernanceApprovalRuleInput[] | null {
+  const items = Array.isArray(value) ? value : [value];
+  const kept: GovernanceApprovalRuleInput[] = [];
+  for (const item of items) {
+    if (typeof item === "string") {
+      const tool = item.trim();
+      if (tool) kept.push(tool);
+      continue;
+    }
+    if (!isPlainObject(item)) continue;
+    const tool = typeof item.tool === "string" ? item.tool.trim() : "";
+    if (!tool) continue;
+    const rule: GovernanceApprovalRule = { ...item, tool };
+    if ("reason" in item && typeof item.reason !== "string") delete rule.reason;
+    if ("risk" in item && typeof item.risk !== "string") delete rule.risk;
+    kept.push(rule);
   }
-  if (typeof value === "string") return value.trim() ? [value.trim()] : null;
-  if (isPlainObject(value)) return [value];
-  return null;
+  return kept.length > 0 ? kept : null;
 }
 
 /**
@@ -333,7 +370,7 @@ function normalizePolicy(raw: Record<string, unknown>): { policy: GovernancePoli
     delete policy.approvedEndpoints;
   }
 
-  const approvals = ruleList(raw.approvalRequired);
+  const approvals = normalizeApprovalRules(raw.approvalRequired);
   if (approvals) {
     policy.approvalRequired = approvals;
     live = true;

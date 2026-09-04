@@ -109,6 +109,38 @@ describe("parseGovernancePolicy", () => {
     expect(res.policy.approvedEndpoints).toEqual(["x"]);
     expect(res.policy.allowDebug).toBe(true);
   });
+
+  it("keeps approvalRequired rules that can name a tool, in either writing", () => {
+    const res = parseGovernancePolicy({
+      approvalRequired: [" bash ", { tool: "mcp__*", reason: "external side effects" }, { risk: "high" }],
+    });
+    expect(res.kind).toBe("ok");
+    if (res.kind !== "ok") return;
+    // The junk rule (no `tool`) is dropped: a rail that can never match is
+    // worse than no rail, because the operator believes it is enforcing.
+    expect(res.policy.approvalRequired).toEqual([
+      "bash",
+      { tool: "mcp__*", reason: "external side effects" },
+    ]);
+  });
+
+  it("is off when approvalRequired holds nothing usable", () => {
+    // A document whose only content was unusable rules must not fold
+    // tools.approvalMode:yolo (auto-approve) for a policy that enforces none.
+    expect(parseGovernancePolicy('{"approvalRequired":[{"reason":"oops"},42,"  "]}')).toEqual({
+      kind: "off",
+    });
+    expect(parseGovernancePolicy("approvalRequired: []")).toEqual({ kind: "off" });
+  });
+
+  it("drops a non-string reason/risk instead of stringifying it", () => {
+    const res = parseGovernancePolicy({
+      approvalRequired: [{ tool: "bash", reason: 7, risk: null }],
+    });
+    expect(res.kind).toBe("ok");
+    if (res.kind !== "ok") return;
+    expect(res.policy.approvalRequired).toEqual([{ tool: "bash" }]);
+  });
 });
 
 describe("governancePolicyActive", () => {

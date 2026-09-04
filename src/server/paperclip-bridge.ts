@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { promises as fs, readFileSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 
@@ -19,12 +20,18 @@ import path from "node:path";
  *   that blocks mutating tools past the cap. The whole lane is deliberately
  *   independent of the skills lane: a governance-only agent (skillsAsTools
  *   off) must still be enforced.
+ * - **Human approval (v0.8 T5, advisory)** — a tool call that matches an
+ *   `approvalRequired` rule (and passed every guardrail) posts a
+ *   `request_board_approval` to the Paperclip control plane and blocks the
+ *   call. This is the one path where the handler awaits: it is self-bound to
+ *   ~10s, far under omp's 30s `toolCallTimeoutMs`, and never polls.
  *
  * omp's `#beforeToolCall` awaits this handler before the tool runs and before
  * any approval proxy, and fail-closes (blocks the call) if a handler throws or
  * outlives `extensionHandlers.toolCallTimeoutMs` — so the handler stays
- * synchronous, allocation-light and throw-free: the only I/O is a `stat` of the
- * manifest plus, when its mtime moved, one small read.
+ * synchronous and throw-free on the guardrail path (its only I/O is a `stat`
+ * of the manifest plus, when its mtime moved, one small read), and the
+ * approval path bounds its own network wait.
  *
  * Self-contained on purpose: runtime imports are node builtins only, so esbuild
  * bundles this file cleanly and omp loads it via dynamic `import()`. The types
@@ -82,10 +89,16 @@ interface BridgeMessageEndEvent {
 
 type BridgeMessageEndHandler = (event: BridgeMessageEndEvent) => void;
 
+/**
+ * Structural mirror of omp's `tool_call` handler contract. It is normally
+ * synchronous (the guardrail path is pure), and returns a promise ONLY on the
+ * approval path — omp awaits whatever a handler returns, and the approval
+ * handler bounds itself well inside `toolCallTimeoutMs`.
+ */
 type BridgeToolCallHandler = (
   event: BridgeToolCallEvent,
   ctx: BridgeToolCallContext,
-) => BridgeToolCallResult | undefined;
+) => BridgeToolCallResult | undefined | Promise<BridgeToolCallResult | undefined>;
 
 /** Structural subset of omp's ExtensionAPI. */
 interface BridgePi {
@@ -210,6 +223,19 @@ interface PathScopeRule {
   denyOutside: boolean;
 }
 
+/**
+ * One `approvalRequired` rule. `tool` is an exact tool name or a prefix
+ * pattern ending in `*` (`mcp__*`); `reason` and `risk` are advisory text for
+ * the board card. A rule can also be written as just the tool name.
+ */
+interface ApprovalRule {
+  tool: string;
+  reason?: string;
+  risk: string;
+  /** Compiled matcher for `tool` (exact or prefix), so matching stays cheap. */
+  matches: (toolName: string) => boolean;
+}
+
 interface GuardrailRules {
   pathScopes: PathScopeRule | null;
   bashDeny: BashDenyRule[];
@@ -217,9 +243,35 @@ interface GuardrailRules {
   argRevisions: Record<string, Record<string, unknown>>;
   /** Soft per-session USD cap, hoisted from the document root; 0 = budget lane off. */
   budgetCapUsd: number;
+  /** Tools held for a human; empty = approval lane off (hoisted from root). */
+  approvalRequired: ApprovalRule[];
   /** Memoized realpath'd roots, valid only for `rootsCwd`. */
   rootsCwd: string | null;
   roots: string[] | null;
+}
+
+/**
+ * Normalize `approvalRequired`: a list of bare tool names and/or
+ * `{ tool, reason?, risk? }` rules. A rule that cannot name a tool is dropped
+ * — a rail that never matches is worse than no rail, because the operator
+ * believes it exists.
+ */
+function normalizeApprovalRules(value: unknown): ApprovalRule[] {
+  const items = Array.isArray(value) ? value : value === undefined || value === null ? [] : [value];
+  const rules: ApprovalRule[] = [];
+  for (const item of items) {
+    const raw = typeof item === "string" ? { tool: item } : item;
+    if (!isRecord(raw)) continue;
+    const tool = typeof raw.tool === "string" ? raw.tool.trim() : "";
+    if (tool === "") continue;
+    const reason = typeof raw.reason === "string" && raw.reason.trim() ? raw.reason.trim() : undefined;
+    const risk = typeof raw.risk === "string" && raw.risk.trim() ? raw.risk.trim() : "high";
+    const matches = tool.endsWith("*")
+      ? (name: string): boolean => name.startsWith(tool.slice(0, -1))
+      : (name: string): boolean => name === tool;
+    rules.push({ tool, reason, risk, matches });
+  }
+  return rules;
 }
 
 /**
@@ -289,12 +341,17 @@ function normalizeGuardrails(document: Record<string, unknown>): GuardrailRules 
   const budgetCapUsd =
     typeof rawCap === "number" && Number.isFinite(rawCap) && rawCap > 0 ? rawCap : 0;
 
+  // `approvalRequired` is a document-root key in the materialized manifest and
+  // may also be written inside the `guardrails` bag by hand.
+  const approvalRequired = normalizeApprovalRules(document.approvalRequired ?? bag.approvalRequired);
+
   return {
     pathScopes: normalizePathScopes(bag.pathScopes),
     bashDeny,
     denyTools,
     argRevisions,
     budgetCapUsd,
+    approvalRequired,
     rootsCwd: null,
     roots: null,
   };
@@ -449,6 +506,228 @@ function evaluateGuardrails(
 }
 
 /* ------------------------------------------------------------------ */
+/*  Human approval (advisory, no poll)                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Self-bound for the approval POST. omp caps a `tool_call` handler at
+ * `extensionHandlers.toolCallTimeoutMs` (default 30s) and does NOT cancel the
+ * handler promise when it expires — it leaks. So the approval call bounds
+ * itself to a third of that: a slow or black-holed control plane must never
+ * turn a governed run into a stall.
+ */
+const APPROVAL_TIMEOUT_MS = 10_000;
+
+/** A failed approval POST is not retried for this long (model retry-loops). */
+const APPROVAL_RETRY_MS = 30_000;
+
+/** Bound on the dedup cache: a long session must not grow it without limit. */
+const APPROVAL_CACHE_MAX = 256;
+
+type ApprovalAttempt =
+  | { state: "pending"; approvalId: string; at: number }
+  | { state: "failed"; detail: string; at: number };
+
+/**
+ * Per-session approval dedup, keyed on `tool + args hash`: an identical call
+ * re-asks the board only after the negative's short retry window, never after
+ * a pending one. A pending entry holds for the whole session because the
+ * bridge cannot see the board's verdict without polling — impossible inside
+ * the handler cap — so the block reason tells the model to re-run instead.
+ *
+ * Same module-scope-per-session reasoning as `runningCost`: omp cache-busts
+ * this extension on every `session/new`, so the NEW run an approval wakes
+ * starts clean and can legitimately request the granted action again.
+ */
+const approvalAttempts = new Map<string, ApprovalAttempt>();
+
+/** Deterministic JSON encoding: key-sorted, so equal args hash equal. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  if (isRecord(value)) {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(",")}}`;
+  }
+  if (value === null || typeof value !== "object") {
+    return typeof value === "string" || typeof value === "number" || typeof value === "boolean"
+      ? JSON.stringify(value)
+      : JSON.stringify(String(value));
+  }
+  return "null";
+}
+
+/** Short stable digest of the executed args, for the board card and dedup. */
+function argumentsHash(args: Record<string, unknown>): string {
+  return createHash("sha256").update(canonicalJson(args)).digest("hex").slice(0, 16);
+}
+
+/**
+ * Record one approval outcome, evicting the oldest when the cache is full so
+ * a long warm session cannot grow it without bound.
+ */
+function rememberAttempt(key: string, attempt: ApprovalAttempt): void {
+  if (approvalAttempts.size >= APPROVAL_CACHE_MAX) {
+    const oldest = approvalAttempts.keys().next();
+    if (!oldest.done) approvalAttempts.delete(oldest.value);
+  }
+  approvalAttempts.set(key, attempt);
+}
+
+/**
+ * The normalized API root. `PAPERCLIP_API_URL` may or may not carry the
+ * `/api` suffix (the board and the CLI write both forms), so trailing slashes
+ * and a trailing `/api` are stripped exactly as `paperclipApiBase` does —
+ * otherwise the call lands on `/api/api/companies/...` and 404s.
+ */
+function paperclipApiRoot(raw: string): string {
+  return raw.replace(/\/+$/, "").replace(/\/api$/, "");
+}
+
+/** First string-shaped id in an approvals response, whatever envelope it uses. */
+function approvalIdFrom(body: unknown): string | null {
+  if (!isRecord(body)) return null;
+  for (const candidate of [
+    body.id,
+    isRecord(body.approval) ? body.approval.id : undefined,
+    isRecord(body.data) ? body.data.id : undefined,
+  ]) {
+    if (typeof candidate === "string" && candidate !== "") return candidate;
+  }
+  return null;
+}
+
+/**
+ * POST a `request_board_approval` for one gated call and block it.
+ *
+ * ADVISORY BY DESIGN (Phase B): Paperclip resolves an approval by firing
+ * `heartbeat.wakeup(reason:"approval_approved")`, which starts a NEW run —
+ * nothing resumes THIS one, and a poll/hold is impossible inside the 30s
+ * handler cap. So the block reason is written to tell the model what actually
+ * happens. `runId` is deliberately absent from the payload: the run child's
+ * `PAPERCLIP_RUN_ID` is spawn-time and stale under a warm handle, so an id
+ * there would be a lie on the board.
+ *
+ * Fail-closed: any error — transport, non-2xx (a status-only recovery run's
+ * 403 is expected), unparseable reply — still blocks the call, because an
+ * ungoverned action must never slip through a failed approval round-trip.
+ */
+async function holdForApproval(
+  toolName: string,
+  args: Record<string, unknown>,
+  rule: ApprovalRule,
+): Promise<BridgeToolCallResult> {
+  const held = (detail: string): BridgeToolCallResult => ({
+    block: true,
+    reason: `paperclip governance: ${toolName} requires approval — ${detail}`,
+  });
+
+  // One shape for every failure: cache it (so the retry window applies), tell
+  // the model it failed, and stay blocked.
+  const fail = (key: string, detail: string): BridgeToolCallResult => {
+    if (key !== "") rememberAttempt(key, { state: "failed", detail, at: Date.now() });
+    return held(`approval request failed (${detail}) — will retry on next attempt`);
+  };
+
+  let key = "";
+  try {
+    const hash = argumentsHash(args);
+    key = `${toolName}\u0000${hash}`;
+    const seen = approvalAttempts.get(key);
+    if (seen && (seen.state === "pending" || Date.now() - seen.at < APPROVAL_RETRY_MS)) {
+      return held(
+        seen.state === "pending"
+          ? `approval ${seen.approvalId} pending (requested earlier this session); re-run once it is approved to perform this action`
+          : `the previous request failed (${seen.detail}) and is not retried yet`,
+      );
+    }
+
+    const api = (process.env.PAPERCLIP_API_URL ?? "").trim();
+    const companyId = (process.env.PAPERCLIP_COMPANY_ID ?? "").trim();
+    const token = (process.env.PAPERCLIP_API_KEY ?? "").trim();
+    const taskId = (process.env.PAPERCLIP_TASK_ID ?? "").trim();
+    if (!api || !companyId || !token) {
+      // This path only exists once a governance manifest has armed the lane,
+      // so a missing control-plane env is a governance failure, not an absent
+      // policy: hold the call instead of letting it run ungoverned.
+      return fail(key, "governance env unavailable: PAPERCLIP_API_URL / PAPERCLIP_COMPANY_ID / PAPERCLIP_API_KEY");
+    }
+    if (typeof fetch !== "function") return fail(key, "no fetch in this runtime");
+
+    const url = `${paperclipApiRoot(api)}/api/companies/${encodeURIComponent(companyId)}/approvals`;
+    const body = {
+      type: "request_board_approval",
+      payload: {
+        tool: toolName,
+        argumentsHash: hash,
+        risk: rule.risk,
+        source: "omp_governance",
+        ...(rule.reason ? { reason: rule.reason } : {}),
+      },
+      // Top-level, not inside `payload`: `issueIds` is what links the card to
+      // the task. Absent for a board-triggered run with no issue.
+      issueIds: taskId ? [taskId] : undefined,
+    };
+
+    // Race the fetch against our own timer rather than trusting
+    // `AbortSignal.timeout` alone: the signal cancels the socket, the timer
+    // guarantees this handler returns even if the fetch never settles — an
+    // expired omp handler is not cancelled, it leaks.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`no response after ${APPROVAL_TIMEOUT_MS}ms`)),
+        APPROVAL_TIMEOUT_MS,
+      );
+      timer.unref();
+    });
+    let response: Response;
+    try {
+      response = await Promise.race([
+        fetch(url, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(APPROVAL_TIMEOUT_MS),
+        }),
+        deadline,
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const raw = await response.text().catch(() => "");
+    if (!response.ok) {
+      // A status-only recovery run answers 403 here; expected, and still a hold.
+      const snippet = raw.slice(0, 160).trim();
+      return fail(key, `HTTP ${response.status}${snippet === "" ? "" : `: ${snippet}`}`);
+    }
+
+    let parsed: unknown = null;
+    try {
+      parsed = raw === "" ? null : JSON.parse(raw);
+    } catch {
+      parsed = null;
+    }
+    // A 2xx means the board took it, id or no id: never re-POST on a parse
+    // hiccup, or a chatty model would mint duplicate approvals.
+    const approvalId = approvalIdFrom(parsed) ?? "queued";
+    rememberAttempt(key, { state: "pending", approvalId, at: Date.now() });
+    return held(
+      `approval ${approvalId} requested; re-run after it is approved to perform this action (approving wakes a NEW run — this one does not resume)`,
+    );
+  } catch (err) {
+    // Never throw: an exception escaping a tool_call handler is omp's signal
+    // for a blanket block with no reason, which teaches the model nothing.
+    return fail(key, err instanceof Error ? err.message : String(err));
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Lane installation                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -471,7 +750,26 @@ function installGovernanceLane(pi: BridgePi): void {
     try {
       const current = currentGuardrails(process.env.PAPERCLIP_GOVERNANCE_MANIFEST ?? file);
       if (!current) return undefined;
-      return evaluateGuardrails(event, ctx, current);
+      const guard = evaluateGuardrails(event, ctx, current);
+      // A deny outranks approval: never ask a human to approve what policy
+      // already forbids, and never spend a board slot on it.
+      if (guard?.block || current.approvalRequired.length === 0) return guard;
+      const toolName = typeof event?.toolName === "string" ? event.toolName : "";
+      // The control-tool allowlist outranks approval too — holding `yield`
+      // for a human strands the run exactly like denying it would.
+      const rule =
+        toolName === "" || CONTROL_TOOLS[toolName]
+          ? null
+          : (current.approvalRequired.find((candidate) => candidate.matches(toolName)) ?? null);
+      if (!rule) return guard;
+      // The approval round-trip is the lane's only awaited path, and it is
+      // self-bound: hold the call, post the request, never poll.
+      const executed = isRecord(guard?.input)
+        ? guard.input
+        : isRecord(event?.input)
+          ? event.input
+          : {};
+      return holdForApproval(toolName, executed, rule);
     } catch {
       // Never throw: omp turns a throwing handler into a blanket block.
       return undefined;

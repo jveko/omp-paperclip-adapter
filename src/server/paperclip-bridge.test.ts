@@ -39,7 +39,7 @@ interface ToolCallResult {
 type GuardrailHandler = (
   event: ToolCallEvent,
   ctx: ToolCallContext,
-) => ToolCallResult | undefined | void;
+) => ToolCallResult | undefined | void | Promise<ToolCallResult | undefined>;
 
 /** Structural mirror of the `message_end` cost slice the budget handler reads. */
 interface MessageEndEvent {
@@ -71,6 +71,15 @@ interface MockPiHandle {
     input: Record<string, unknown>,
     ctx?: ToolCallContext,
   ) => ToolCallResult | undefined;
+  /**
+   * Same call, awaited — the shape the approval path needs, since a held call
+   * returns a promise. Also the only way to see a fail-closed approval result.
+   */
+  toolCallAsync: (
+    toolName: string,
+    input: Record<string, unknown>,
+    ctx?: ToolCallContext,
+  ) => Promise<ToolCallResult | undefined>;
   /** Invokes the tool_call subscription with an arbitrary (possibly invalid) payload. */
   toolCallRaw: (event: unknown, ctx: unknown) => unknown;
   /** Fires the `message_end` subscription with an assistant message costing `total` USD. */
@@ -107,21 +116,38 @@ function makeMockPiFull(
     if (!captured) throw new Error("message_end handler was never registered");
     return captured as (event: unknown) => unknown;
   };
+
+  const callGuardrail = (
+    toolName: string,
+    input: Record<string, unknown>,
+    ctx: ToolCallContext,
+  ): ToolCallResult | undefined | void | Promise<ToolCallResult | undefined> => {
+    const event: ToolCallEvent = {
+      type: "tool_call",
+      toolCallId: "call-1",
+      toolName,
+      input,
+    };
+    return guardrail()(event, ctx);
+  };
+
   return {
     registered,
     events: () => Object.keys(handlers),
     sessionStart: async () => {
       await subscription("session_start")?.();
     },
-    toolCall(toolName, input, ctx = { cwd: process.cwd() }) {
-      const event: ToolCallEvent = {
-        type: "tool_call",
-        toolCallId: "call-1",
-        toolName,
-        input,
-      };
-      return guardrail()(event, ctx) ?? undefined;
+    toolCall: (toolName, input, ctx = { cwd: process.cwd() }) => {
+      const outcome = callGuardrail(toolName, input, ctx);
+      // The pure guardrail path must never await — a promise here means the
+      // guardrails started doing I/O, which is the approval lane's only job.
+      if (outcome instanceof Promise) {
+        throw new Error("guardrail path returned a promise; only approval may await");
+      }
+      return outcome ?? undefined;
     },
+    toolCallAsync: async (toolName, input, ctx = { cwd: process.cwd() }) =>
+      (await callGuardrail(toolName, input, ctx)) ?? undefined,
     toolCallRaw: (event, ctx) => {
       // Deliberately malformed payloads: the guardrail must not throw on them.
       const call = guardrail() as (event: unknown, ctx: unknown) => unknown;
@@ -132,9 +158,9 @@ function makeMockPiFull(
     },
     messageEndRaw: (event) => messageEndCall()(event),
   };
+
 }
 
-/** Skills-lane shim: the v0.7 tests only ever need session_start + registerTool. */
 function makeMockPi(): {
   registered: CapturedTool[];
   handler: () => Promise<void>;
@@ -189,6 +215,12 @@ async function captureTools(
 afterEach(() => {
   delete process.env.PAPERCLIP_SKILLS_MANIFEST;
   delete process.env.PAPERCLIP_GOVERNANCE_MANIFEST;
+  delete process.env.PAPERCLIP_API_URL;
+  delete process.env.PAPERCLIP_API_KEY;
+  delete process.env.PAPERCLIP_COMPANY_ID;
+  delete process.env.PAPERCLIP_TASK_ID;
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
 });
 
 describe("registerPaperclipBridge", () => {
@@ -858,5 +890,286 @@ describe("soft cost budget (message_end)", () => {
     pi.messageEnd(3);
     // Over cap, even a non-denied tool blocks — with the BUDGET reason.
     expect(pi.toolCall("write", { path: "a.ts", content: "x" }, { cwd })?.reason).toContain("budget cap reached");
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Human approval (T5, advisory)                                      */
+/* ------------------------------------------------------------------ */
+
+interface PostedRequest {
+  url: string;
+  method?: string;
+  headers: Record<string, string>;
+  json: Record<string, unknown>;
+  signal?: unknown;
+}
+
+/**
+ * A real `Response` (Node 18+ ships it globally), so the bridge's `.ok`,
+ * `.status` and `.text()` reads are exercised against the genuine shape.
+ */
+function reply(status: number, body?: unknown): Response {
+  return new Response(body === undefined ? "" : JSON.stringify(body), { status });
+}
+
+/** What the bridge passes to fetch — narrowed to the fields worth asserting. */
+interface FetchInit {
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+  signal?: unknown;
+}
+
+/** Stub the global fetch and record every call it receives. */
+function recordFetch(makeReply: () => Response | Promise<Response>): PostedRequest[] {
+  const calls: PostedRequest[] = [];
+  const impl = (input: string, init?: FetchInit) => {
+    const raw = init?.body;
+    calls.push({
+      url: input,
+      method: init?.method,
+      headers: init?.headers ?? {},
+      json: raw ? (JSON.parse(raw) as Record<string, unknown>) : {},
+      signal: init?.signal,
+    });
+    return Promise.resolve(makeReply());
+  };
+  vi.stubGlobal("fetch", impl);
+  return calls;
+}
+
+/** The run-child control-plane env, with per-test overrides (undefined = unset). */
+function approvalEnv(overrides: Record<string, string | undefined> = {}): void {
+  process.env.PAPERCLIP_API_URL = "http://pb.test:3100/api";
+  process.env.PAPERCLIP_API_KEY = "run-jwt";
+  process.env.PAPERCLIP_COMPANY_ID = "co-1";
+  process.env.PAPERCLIP_TASK_ID = "issue-1";
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
+
+/**
+ * A governance fixture on its OWN fresh bridge module: the approval dedup cache
+ * is module-scoped (module scope IS the session epoch), so tests must not
+ * inherit each other's pending or failed entries.
+ */
+async function approvalFixture(policy: GovernancePolicyDoc): Promise<GovernanceFixture> {
+  return governanceFixture(policy, [], await importFreshBridge());
+}
+
+const APPROVAL_TOOL = "deploy_x";
+
+describe("human approval (advisory tool_call hold)", () => {
+  it("posts a board approval to the normalized URL and blocks pending", async () => {
+    // Both env forms — with and without the trailing /api — must reach the
+    // same endpoint. A naive concat yields /api/api/... and the board 404s.
+    for (const apiUrl of [
+      "http://pb.test:3100",
+      "http://pb.test:3100/",
+      "http://pb.test:3100/api",
+      "http://pb.test:3100/api///",
+    ]) {
+      const { pi, cwd } = await approvalFixture({ approvalRequired: [APPROVAL_TOOL] });
+      approvalEnv({ PAPERCLIP_API_URL: apiUrl });
+      const calls = recordFetch(() => reply(201, { id: "apr-77" }));
+
+      const held = await pi.toolCallAsync(APPROVAL_TOOL, { target: apiUrl }, { cwd });
+      expect(held?.block, apiUrl).toBe(true);
+      expect(held?.reason, apiUrl).toContain("approval apr-77 requested");
+      expect(calls).toHaveLength(1);
+      expect(calls[0].url).toBe("http://pb.test:3100/api/companies/co-1/approvals");
+      expect(calls[0].method).toBe("POST");
+      expect(calls[0].headers.authorization).toBe("Bearer run-jwt");
+      expect(calls[0].headers["content-type"]).toBe("application/json");
+      expect(calls[0].json.type).toBe("request_board_approval");
+      // Board link lives at the top level, not inside payload.
+      expect(calls[0].json.issueIds).toEqual(["issue-1"]);
+      const payload = calls[0].json.payload as Record<string, unknown>;
+      expect(payload.tool).toBe(APPROVAL_TOOL);
+      expect(payload.source).toBe("omp_governance");
+      expect(payload.risk).toBe("high");
+      expect(typeof payload.argumentsHash).toBe("string");
+      // A spawn-stale run id would be a lie on the board under a warm handle.
+      expect(payload.runId).toBeUndefined();
+      expect(calls[0].json.runId).toBeUndefined();
+    }
+  });
+
+  it("carries the rule's reason and risk and omits issueIds with no task", async () => {
+    const { pi, cwd } = await approvalFixture({
+      approvalRequired: [{ tool: APPROVAL_TOOL, reason: "ships to prod", risk: "critical" }],
+    });
+    approvalEnv({ PAPERCLIP_TASK_ID: undefined });
+    const calls = recordFetch(() => reply(200, { approval: { id: "apr-1" } }));
+
+    const held = await pi.toolCallAsync(APPROVAL_TOOL, { target: "a" }, { cwd });
+    expect(held?.reason).toContain("approval apr-1 requested");
+    const payload = calls[0].json.payload as Record<string, unknown>;
+    expect(payload.reason).toBe("ships to prod");
+    expect(payload.risk).toBe("critical");
+    expect("issueIds" in calls[0].json).toBe(false);
+  });
+
+  it("holds a `prefix*` rule to every matching tool", async () => {
+    const { pi, cwd } = await approvalFixture({ approvalRequired: ["mcp__*"] });
+    approvalEnv();
+    const calls = recordFetch(() => reply(201, { id: "apr-2" }));
+
+    expect((await pi.toolCallAsync("mcp__github__create_pr", { title: "x" }, { cwd }))?.block).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(await pi.toolCallAsync("write", { path: "a.ts" }, { cwd })).toBeUndefined();
+    expect(calls).toHaveLength(1);
+  });
+
+  it("dedups an identical retry: one POST, then the pending reason", async () => {
+    const { pi, cwd } = await approvalFixture({ approvalRequired: [APPROVAL_TOOL] });
+    approvalEnv();
+    const calls = recordFetch(() => reply(201, { id: "apr-9" }));
+
+    const first = await pi.toolCallAsync(APPROVAL_TOOL, { target: "same" }, { cwd });
+    const second = await pi.toolCallAsync(APPROVAL_TOOL, { target: "same" }, { cwd });
+    expect(calls).toHaveLength(1);
+    expect(first?.reason).toContain("approval apr-9 requested");
+    expect(second?.block).toBe(true);
+    expect(second?.reason).toContain("approval apr-9 pending");
+  });
+
+  it("hashes the executed args, so a different call is a different request", async () => {
+    const { pi, cwd } = await approvalFixture({ approvalRequired: [APPROVAL_TOOL] });
+    approvalEnv();
+    const calls = recordFetch(() => reply(201, { id: "apr-9" }));
+
+    await pi.toolCallAsync(APPROVAL_TOOL, { target: "one" }, { cwd });
+    await pi.toolCallAsync(APPROVAL_TOOL, { target: "two" }, { cwd });
+    expect(calls).toHaveLength(2);
+  });
+
+  it("fails closed when the POST rejects, and does not re-hammer the board", async () => {
+    const { pi, cwd } = await approvalFixture({ approvalRequired: [APPROVAL_TOOL] });
+    approvalEnv();
+    const calls = recordFetch(() => Promise.reject(new Error("ECONNREFUSED")));
+
+    const first = await pi.toolCallAsync(APPROVAL_TOOL, { target: "x" }, { cwd });
+    const second = await pi.toolCallAsync(APPROVAL_TOOL, { target: "x" }, { cwd });
+    expect(first?.block).toBe(true);
+    expect(first?.reason).toContain("approval request failed");
+    expect(first?.reason).toContain("ECONNREFUSED");
+    expect(second?.block).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(second?.reason).toContain("not retried yet");
+  });
+
+  it("retries a failed request once its window has passed", async () => {
+    const { pi, cwd } = await approvalFixture({ approvalRequired: [APPROVAL_TOOL] });
+    approvalEnv();
+    const calls = recordFetch(() => reply(403, { error: "forbidden" }));
+    const clock = vi.spyOn(Date, "now");
+    const start = 1_800_000_000_000;
+    clock.mockReturnValue(start);
+
+    const denied = await pi.toolCallAsync(APPROVAL_TOOL, { target: "x" }, { cwd });
+    // A 403 (a status-only recovery run) is expected — and still a hold.
+    expect(denied?.block).toBe(true);
+    expect(denied?.reason).toContain("HTTP 403");
+    clock.mockReturnValue(start + 1_000);
+    await pi.toolCallAsync(APPROVAL_TOOL, { target: "x" }, { cwd });
+    expect(calls).toHaveLength(1);
+    clock.mockReturnValue(start + 60_000);
+    await pi.toolCallAsync(APPROVAL_TOOL, { target: "x" }, { cwd });
+    expect(calls).toHaveLength(2);
+  });
+
+  it("denies before it approves: a guardrail block never posts", async () => {
+    const { pi, cwd } = await approvalFixture({
+      guardrails: { denyTools: [APPROVAL_TOOL] },
+      approvalRequired: [APPROVAL_TOOL],
+    });
+    approvalEnv();
+    const calls = recordFetch(() => reply(201, { id: "never" }));
+
+    const res = pi.toolCall(APPROVAL_TOOL, { target: "x" }, { cwd });
+    expect(res?.block).toBe(true);
+    expect(res?.reason).toContain("denyTools");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("control tools are never held for approval", async () => {
+    const { pi, cwd } = await approvalFixture({ approvalRequired: ["yield"] });
+    approvalEnv();
+    const calls = recordFetch(() => reply(201, { id: "never" }));
+
+    expect(await pi.toolCallAsync("yield", { result: "done" }, { cwd })).toBeUndefined();
+    expect(calls).toHaveLength(0);
+  });
+
+  it("no matching rule: the call is allowed and nothing is posted", async () => {
+    const { pi, cwd } = await approvalFixture({ approvalRequired: ["some_other_tool"] });
+    approvalEnv();
+    const calls = recordFetch(() => reply(201, { id: "never" }));
+
+    expect(await pi.toolCallAsync(APPROVAL_TOOL, { target: "x" }, { cwd })).toBeUndefined();
+    expect(calls).toHaveLength(0);
+  });
+
+  it("a governed run with no control-plane env blocks instead of slipping through", async () => {
+    const { pi, cwd } = await approvalFixture({ approvalRequired: [APPROVAL_TOOL] });
+    approvalEnv({ PAPERCLIP_API_URL: undefined, PAPERCLIP_API_KEY: undefined });
+    const calls = recordFetch(() => reply(201, { id: "never" }));
+
+    const held = await pi.toolCallAsync(APPROVAL_TOOL, { target: "x" }, { cwd });
+    expect(held?.block).toBe(true);
+    expect(held?.reason).toContain("governance env unavailable");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("bounds a hanging request itself instead of leaking past omp's handler cap", async () => {
+    const { pi, cwd } = await approvalFixture({ approvalRequired: [APPROVAL_TOOL] });
+    approvalEnv();
+    const calls = recordFetch(() => new Promise<Response>(() => undefined));
+    vi.useFakeTimers();
+
+    const pending = pi.toolCallAsync(APPROVAL_TOOL, { target: "x" }, { cwd });
+    await vi.advanceTimersByTimeAsync(11_000);
+    const held = await pending;
+
+    expect(calls).toHaveLength(1);
+    // The fetch itself is signalled, so the socket dies with the handler.
+    expect(calls[0].signal).toBeInstanceOf(AbortSignal);
+    expect(held?.block).toBe(true);
+    expect(held?.reason).toContain("no response after 10000ms");
+  });
+
+  it("holds a revised call and hashes the EXECUTED args", async () => {
+    // `argRevisions` pins `content` (a revisable tool), so two different
+    // requests execute identical args: ONE approval, not two. And a revision
+    // never outranks the hold — the call is blocked, not rewritten-and-run.
+    const { pi, cwd } = await approvalFixture({
+      guardrails: { argRevisions: { write: { content: "pinned" } } },
+      approvalRequired: ["write"],
+    });
+    approvalEnv();
+    const calls = recordFetch(() => reply(201, { id: "apr-rev" }));
+
+    const first = await pi.toolCallAsync("write", { path: "a.ts", content: "x" }, { cwd });
+    const second = await pi.toolCallAsync("write", { path: "a.ts", content: "y" }, { cwd });
+    expect(first?.block).toBe(true);
+    expect(first?.input).toBeUndefined();
+    expect(calls).toHaveLength(1);
+    expect(second?.reason).toContain("approval apr-rev pending");
+  });
+
+  it("a `*` rule holds every real tool, never a control tool or a bad event", async () => {
+    const { pi, cwd } = await approvalFixture({ approvalRequired: ["*"] });
+    approvalEnv();
+    const calls = recordFetch(() => reply(201, { id: "apr-any" }));
+
+    expect((await pi.toolCallAsync("mcp__x__do", { a: 1 }, { cwd }))?.block).toBe(true);
+    expect(await pi.toolCallAsync("yield", { result: "done" }, { cwd })).toBeUndefined();
+    expect(pi.toolCallRaw(undefined, undefined)).toBeUndefined();
+    expect(pi.toolCallRaw({ toolName: "", input: {} }, { cwd })).toBeUndefined();
+    expect(calls).toHaveLength(1);
   });
 });
