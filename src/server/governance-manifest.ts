@@ -41,7 +41,11 @@ export interface GovernancePolicy {
    * be enforceable. Accumulates across runs only under a warm handle.
    */
   budgetCapUsd?: number;
-  /** Provider ids allowed by endpoint routing. */
+  /**
+   * Provider ids allowed by endpoint routing. The adapter writes the complement
+   * to the run child as omp's `disabledProviders` (governance-overlay.ts); the
+   * bridge never reads this key.
+   */
   approvedEndpoints?: string[];
   /** Rules that need a human approval before the call runs. */
   approvalRequired?: unknown[];

@@ -1,9 +1,12 @@
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { createOmpAcpExecutor } from "./acp.js";
+import { FAILOVER_CONFIG_FILE } from "./failover-config.js";
+import { GOVERNANCE_CONFIG_FILE } from "./governance-overlay.js";
+import { sessionIntelDir } from "./session-state.js";
 
 // Regression guards for env threading into the fork and session-query side
 // channels. The fork and query call sites in createOmpAcpExecutor must forward
@@ -106,5 +109,37 @@ describe("side-channel env threading", () => {
     expect(mocks.forkOmpSession).toHaveBeenCalledTimes(1);
     const ompArg = mocks.forkOmpSession.mock.calls[0][0] as { env?: Record<string, string> };
     expect(ompArg.env?.PI_CONFIG_FILES).toBeTruthy();
+  });
+
+  it("keeps the governance routing overlay out of the fork side channel while the run child gets it", async () => {
+    // Same invariant as the catalog probe, on the other side channel: ompEnv's
+    // overlayPath is the failover file ONLY. Routing keys reaching a side
+    // channel would filter the model list the next run's complement is built
+    // from. The run child still receives both overlays.
+    const executor = vi.fn(async () => ({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } }));
+    mocks.createAcpxEngineExecutor.mockReturnValue(executor);
+    await createOmpAcpExecutor()(baseCtx({
+      config: {
+        command: "omp",
+        sessionForkSourceId: "sess-a", sessionForkToken: "t-gov",
+        fallbackChain: "brokerco/main",
+        governancePolicy: "approvedEndpoints: [brokerco]",
+      },
+    }));
+    expect(mocks.forkOmpSession).toHaveBeenCalledTimes(1);
+    const forkArg = mocks.forkOmpSession.mock.calls[0][0] as { env?: Record<string, string> };
+    const forkPi = forkArg.env?.PI_CONFIG_FILES ?? "";
+    expect(forkPi).toContain(FAILOVER_CONFIG_FILE);
+    expect(forkPi).not.toContain(GOVERNANCE_CONFIG_FILE);
+    for (const file of forkPi.split(path.delimiter)) {
+      const yaml = await readFile(file, "utf8");
+      expect(yaml).not.toContain("disabledProviders");
+      expect(yaml).not.toContain("approvalMode");
+    }
+    const merged = executor.mock.calls[0][0] as { config?: { env?: Record<string, string> } };
+    expect(merged.config?.env?.PI_CONFIG_FILES).toBe([
+      path.join(sessionIntelDir("co-1", "agent-1"), FAILOVER_CONFIG_FILE),
+      path.join(sessionIntelDir("co-1", "agent-1"), GOVERNANCE_CONFIG_FILE),
+    ].join(path.delimiter));
   });
 });

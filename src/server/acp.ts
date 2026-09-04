@@ -36,6 +36,7 @@ import { ompEnv } from "./omp-env.js";
 import { forkOmpSession, queryOmpSessions } from "./session-intel.js";
 import { materializeSkillManifest } from "./skill-manifest.js";
 import { materializeGovernanceManifest } from "./governance-manifest.js";
+import { materializeGovernanceOverlay } from "./governance-overlay.js";
 import {
   bumpRunCounter, consumeToken, loadState, rotateIfTripped, saveState,
   sessionIntelDir, snapshotDigest,
@@ -552,11 +553,10 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     // Governance substrate (v0.8): when the operator sets governancePolicy,
     // materialize it into the agent's state dir and hand the path to the run
     // child via PAPERCLIP_GOVERNANCE_MANIFEST. That env both arms the bridge's
-    // --extension (shouldAppendBridgeExtension) and — because
-    // materializeFailoverOverlay reads the same config — folds
-    // tools.approvalMode:yolo into the overlay, making the bridge the run's
-    // only deterministic permission gate. An unparseable document warns and the
-    // run proceeds ungoverned rather than dying on a policy typo.
+    // --extension (shouldAppendBridgeExtension) and — through the governance
+    // overlay folded below — carries tools.approvalMode:yolo, making the bridge
+    // the run's only deterministic permission gate. An unparseable document
+    // warns and the run proceeds ungoverned rather than dying on a policy typo.
     const governanceManifest = await materializeGovernanceManifest(
       ctx.config,
       intelDir,
@@ -579,19 +579,57 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
         });
       }
     }
-    const config = buildOmpAcpConfig(ctx.config, resolveModel, resolveCost);
-    // Fold the failover overlay into config BEFORE engineConfig is derived: the
-    // fork branch rebuilds engineConfig as { ...config, warmHandleIdleMs: 50 },
-    // so an overlay added only to engineConfig would be silently dropped by the
-    // fork spread — PI_CONFIG_FILES must ride on `config` to survive it.
-    if (failoverOverlayPath) {
-      const operatorPi =
-        typeof (ctx.config.env as Record<string, unknown> | undefined)?.PI_CONFIG_FILES === "string"
-          ? (ctx.config.env as Record<string, unknown>).PI_CONFIG_FILES as string
-          : "";
-      const mergedPi = [operatorPi, failoverOverlayPath].filter(Boolean).join(path.delimiter);
-      if (mergedPi) config.env = { ...(config.env ?? {}), PI_CONFIG_FILES: mergedPi };
+    // Endpoint routing (v0.8 T4): approvedEndpoints becomes omp's declarative
+    // disabledProviders, computed as the catalog complement minus every provider
+    // this run must keep. It rides in its OWN overlay file, folded only into the
+    // RUN child's PI_CONFIG_FILES: `disabledProviders` filters `omp models ls`,
+    // and the side channels above read the failover overlay — if routing keys
+    // lived there, our own filter would shrink the catalog the complement is
+    // computed from and the disabled set would oscillate between runs. Cold
+    // children (default warmHandleIdleMs 0) re-read the file every run, so
+    // changing approvedEndpoints takes effect on the next run.
+    const rawModel = firstNonEmptyString(ctx.config.model);
+    const governanceOverlay = await materializeGovernanceOverlay(
+      ctx.config,
+      intelDir,
+      {
+        models,
+        configuredModel: rawModel ? (resolveModel(rawModel) ?? rawModel) : null,
+      },
+      (message) => ctx.onEvent?.({
+        eventType: "run.system", stream: "system", level: "warn", message,
+      }),
+    );
+    const governanceOverlayPath =
+      governanceOverlay.status === "ok" ? governanceOverlay.path : null;
+    if (governanceOverlay.status === "error") {
+      // Ungoverned routing, not a failed run: the gate key is lost with the
+      // file, so say which halves of governance did not land.
+      await ctx.onEvent?.({
+        eventType: "run.system", stream: "system", level: "warn",
+        message: `omp governance overlay write failed: ${governanceOverlay.error}; continuing without the single gate or endpoint routing`,
+      });
+    } else if (governanceOverlay.status === "ok" && governanceOverlay.disabled.length > 0) {
+      await ctx.onEvent?.({
+        eventType: "run.system", stream: "system", level: "info",
+        message: `omp governance routing disabled ${governanceOverlay.disabled.length} provider(s) for this run: ${governanceOverlay.disabled.join(", ")}`,
+      });
     }
+    const config = buildOmpAcpConfig(ctx.config, resolveModel, resolveCost);
+    // Fold every overlay this run owns into config BEFORE engineConfig is
+    // derived: the fork branch rebuilds engineConfig as
+    // { ...config, warmHandleIdleMs: 50 }, so an overlay added only to
+    // engineConfig would be silently dropped by the fork spread — PI_CONFIG_FILES
+    // must ride on `config` to survive it. The order is the precedence order:
+    // operator file, then the failover chain, then governance routing.
+    const operatorPi =
+      typeof (ctx.config.env as Record<string, unknown> | undefined)?.PI_CONFIG_FILES === "string"
+        ? (ctx.config.env as Record<string, unknown>).PI_CONFIG_FILES as string
+        : "";
+    const mergedPi = [operatorPi, failoverOverlayPath, governanceOverlayPath]
+      .filter(Boolean)
+      .join(path.delimiter);
+    if (mergedPi) config.env = { ...(config.env ?? {}), PI_CONFIG_FILES: mergedPi };
     // Ephemeral skills: when the bridge is active, skill content is delivered
     // on demand via the registered native tools, so prose injection is skipped
     // (bridge and prose are mutually exclusive). Otherwise materialize the

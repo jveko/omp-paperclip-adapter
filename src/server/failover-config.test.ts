@@ -5,12 +5,17 @@ import { describe, expect, it } from "vitest";
 import { FAILOVER_CONFIG_FILE, materializeFailoverOverlay } from "./failover-config.js";
 
 describe("materializeFailoverOverlay", () => {
-  it("returns none when there is no fallback chain and no governance policy", async () => {
+  it("returns none when there is no fallback chain", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "fov-"));
     try {
       expect(await materializeFailoverOverlay({}, dir)).toEqual({ status: "none" });
       expect(await materializeFailoverOverlay({ fallbackChain: "   \n\n  " }, dir)).toEqual({ status: "none" });
-      expect(await materializeFailoverOverlay({ governancePolicy: "   " }, dir)).toEqual({ status: "none" });
+      // v0.8: a live governance policy alone no longer arms this file — the
+      // single gate moved to the governance overlay, which the side channels
+      // never read.
+      expect(await materializeFailoverOverlay({ governancePolicy: "budgetCapUsd: 2" }, dir)).toEqual({
+        status: "none",
+      });
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -57,7 +62,7 @@ describe("materializeFailoverOverlay", () => {
     }
   });
 
-  it("folds the governance single-gate key into the SAME overlay as the chain", async () => {
+  it("carries ONLY the chain when a live governance policy is also set", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "fov-"));
     try {
       const res = await materializeFailoverOverlay(
@@ -69,44 +74,26 @@ describe("materializeFailoverOverlay", () => {
       );
       expect(res.status).toBe("ok");
       const yaml = await readFile(res.status === "ok" ? res.path : "", "utf8");
-      // One overlay file carries both concerns, because PI_CONFIG_FILES gets a
-      // single path appended (later sections must not clobber the chain).
       expect(yaml).toContain("fallbackChains");
       expect(yaml).toContain('"brokerco/main"');
-      expect(yaml).toMatch(/^tools:\n {2}approvalMode: yolo$/m);
+      // This file is folded into the SIDE-CHANNEL env too (ompEnv overlayPath),
+      // and omp honors `disabledProviders` when listing models: governance keys
+      // living here would filter the very catalog routing is computed from, so
+      // the failover overlay must stay free of both.
+      expect(yaml).not.toMatch(/^tools:/m);
+      expect(yaml).not.toContain("approvalMode");
+      expect(yaml).not.toContain("disabledProviders");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
   });
 
-  it("writes the overlay for governance alone (no fallback chain)", async () => {
+  it("writes nothing for governance alone (the gate lives in the other overlay)", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "fov-"));
     try {
-      const res = await materializeFailoverOverlay({ governancePolicy: "budgetCapUsd: 2" }, dir);
-      expect(res).toEqual({ status: "ok", path: path.join(dir, FAILOVER_CONFIG_FILE) });
-      const yaml = await readFile(path.join(dir, FAILOVER_CONFIG_FILE), "utf8");
-      expect(yaml).toContain("approvalMode: yolo");
-      expect(yaml).not.toContain("retry:");
-    } finally {
-      await rm(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("never auto-approves for a vacuous or malformed policy", async () => {
-    const dir = await mkdtemp(path.join(os.tmpdir(), "fov-"));
-    try {
-      // Nothing enforceable (or unparseable) must not flip the run to yolo.
-      for (const governancePolicy of ["guardrails: {}", "{ broken", "whoKnows: 1"]) {
+      for (const governancePolicy of ["budgetCapUsd: 2", "approvedEndpoints: [brokerco]"]) {
         expect(await materializeFailoverOverlay({ governancePolicy }, dir)).toEqual({ status: "none" });
       }
-      const withChain = await materializeFailoverOverlay(
-        { fallbackChain: "brokerco/main", governancePolicy: "guardrails: {}" },
-        dir,
-      );
-      expect(withChain.status).toBe("ok");
-      const yaml = await readFile(withChain.status === "ok" ? withChain.path : "", "utf8");
-      expect(yaml).toContain("fallbackChains");
-      expect(yaml).not.toContain("approvalMode");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

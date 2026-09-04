@@ -26,15 +26,18 @@ import * as sessionState from "./session-state.js";
 import { loadState, saveState, sessionIntelDir } from "./session-state.js";
 import { FAILOVER_CONFIG_FILE } from "./failover-config.js";
 import { GOVERNANCE_MANIFEST_FILE } from "./governance-manifest.js";
+import { GOVERNANCE_CONFIG_FILE } from "./governance-overlay.js";
 const engineMocks = vi.hoisted(() => ({
   createAcpxEngineExecutor: vi.fn(),
 }));
 
 const modelsMocks = vi.hoisted(() => ({
-  listOmpModels: vi.fn(async () => [
+  defaultModels: [
     { id: "prov/m", label: "M", cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } },
-  ]),
+  ],
+  listOmpModels: vi.fn(),
 }));
+modelsMocks.listOmpModels.mockImplementation(async () => modelsMocks.defaultModels);
 
 
 const skillManifestMocks = vi.hoisted(() => ({
@@ -116,6 +119,9 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     serverUtilsMocks.resolvePaperclipDesiredSkillNames.mockReturnValue([]);
     serverUtilsMocks.readPaperclipSkillMarkdown.mockResolvedValue(null);
     skillManifestMocks.materializeSkillManifest.mockReset();
+    // The routing tests swap in a bigger catalog; restore the default one so no
+    // test's mockImplementation leaks into the next.
+    modelsMocks.listOmpModels.mockImplementation(async () => modelsMocks.defaultModels);
     // Each test starts from a pristine state dir: the shared tmpRoot would
     // otherwise leak fork/force-fresh consumption and snapshot digests across
     // tests (the fixture asserts on those state transitions).
@@ -201,11 +207,70 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     // Governance alone arms the bridge even with skillsAsTools off — once.
     expect(merged.config.agentCommand).toContain(`--extension ${bridgePath}`);
     expect(merged.config.agentCommand.match(/--extension/g)).toHaveLength(1);
-    // The same policy folds the single-gate key into the one overlay file, and
-    // that overlay is what PI_CONFIG_FILES carries.
-    expect(merged.config.env?.PI_CONFIG_FILES).toBe(path.join(intel, FAILOVER_CONFIG_FILE));
-    expect(await readFile(path.join(intel, FAILOVER_CONFIG_FILE), "utf8"))
+    // The single-gate key now rides in the governance overlay (run-child only),
+    // which is the sole PI_CONFIG_FILES entry this run owns.
+    expect(merged.config.env?.PI_CONFIG_FILES).toBe(path.join(intel, GOVERNANCE_CONFIG_FILE));
+    expect(await readFile(path.join(intel, GOVERNANCE_CONFIG_FILE), "utf8"))
       .toContain("approvalMode: yolo");
+  });
+
+  it("approvedEndpoints routes the run child: guard-kept providers stay, the rest disables", async () => {
+    modelsMocks.listOmpModels.mockImplementation(async () => [
+      { id: "prov/m", label: "M", priced: false },
+      { id: "omi/r", label: "R", priced: false },
+      { id: "chainco/b", label: "B", priced: false },
+      { id: "axon-compat/q", label: "Q", priced: false },
+    ]);
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const events: { level?: string; message?: string }[] = [];
+    await createOmpAcpExecutor()(baseCtx({
+      config: {
+        command: `${process.execPath} ${fakeAcp}`,
+        model: "prov/m",
+        governancePolicy: "approvedEndpoints:\n  - omi",
+        fallbackChain: "chainco/backup",
+        env: { PI_CONFIG_FILES: "/op/x.yml" },
+      },
+      onEvent: async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); },
+    }));
+    const merged = executorFn.mock.calls[0][0];
+    const intel = sessionIntelDir("co-1", "agent-1");
+    // Three overlays, precedence order: operator file, failover chain, routing.
+    expect(merged.config.env?.PI_CONFIG_FILES).toBe([
+      "/op/x.yml",
+      path.join(intel, FAILOVER_CONFIG_FILE),
+      path.join(intel, GOVERNANCE_CONFIG_FILE),
+    ].join(path.delimiter));
+    const overlay = await readFile(path.join(intel, GOVERNANCE_CONFIG_FILE), "utf8");
+    expect(overlay).toContain("disabledProviders:\n  - \"axon-compat\"");
+    // Approved (omi), configured-model (prov) and chained (chainco) providers
+    // all stay reachable; only the unapproved remainder is cut off.
+    expect(overlay).not.toMatch(/- "omi"/);
+    expect(overlay).not.toMatch(/- "prov"/);
+    expect(overlay).not.toMatch(/- "chainco"/);
+    // The guard is not silent: the board learns which providers it protected...
+    expect(events.some((e) => e.level === "warn" && /kept chainco, prov/.test(e.message ?? ""))).toBe(true);
+    // ...and what actually got disabled.
+    expect(events.some((e) => /disabled 1 provider\(s\).*axon-compat/.test(e.message ?? ""))).toBe(true);
+  });
+
+  it("routes nothing without a catalog: gate stays armed, routing warns", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const events: { level?: string; message?: string }[] = [];
+    await createOmpAcpExecutor()(baseCtx({
+      config: {
+        command: `${process.execPath} ${fakeAcp}`,
+        governancePolicy: "approvedEndpoints: [omi]",
+      },
+      onEvent: async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); },
+    }));
+    const intel = sessionIntelDir("co-1", "agent-1");
+    const merged = executorFn.mock.calls[0][0];
+    expect(merged.config.env?.PI_CONFIG_FILES).toBe(path.join(intel, GOVERNANCE_CONFIG_FILE));
+    const overlay = await readFile(path.join(intel, GOVERNANCE_CONFIG_FILE), "utf8");
+    expect(overlay).not.toContain("disabledProviders");
+    expect(overlay).toContain("approvalMode: yolo");
+    expect(events.some((e) => e.level === "warn" && /routing skipped/.test(e.message ?? ""))).toBe(true);
   });
 
   it("without governancePolicy the run keeps its v0.7 shape (no manifest, no yolo)", async () => {

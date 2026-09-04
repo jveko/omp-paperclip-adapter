@@ -102,6 +102,11 @@ describe("getSessionConfigSchema", () => {
     expect(g.hint).toMatch(/budgetCapUsd/);
     expect(g.hint).toMatch(/approvedEndpoints/);
     expect(g.hint).toMatch(/approvalRequired/);
+    // T4 routing must be documented as a guarded complement, not a silent cut:
+    // the lever is disabledProviders, and the model/chain providers survive it.
+    expect(g.hint).toMatch(/disabledProviders/);
+    expect(g.hint).toMatch(/never disabled/);
+    expect(g.hint).toMatch(/warm handle/);
   });
 });
 
