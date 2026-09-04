@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.8.0 — 2026-09-03
+
+Governance & control: the omp employee runs *under policy*. Builds on the v0.7 bridge into a
+governance extension. Mostly adapter-local; two capabilities honestly capped (advisory approval,
+upstream-gated subagent view).
+
+- **Guardrail policy engine** — a `governancePolicy` board field arms a `tool_call` handler in the
+  bridge (the ONLY deterministic deny point on Paperclip's `approve-all` path): confine writes to the
+  worktree (with realpath + symlink caveat), bash deny-lists, deny-tools, arg revision. Control tools
+  (`yield`/`goal`/`think`/`todo`/`hub`) are never blocked so a run can't be stranded; the policy is
+  re-read on mtime change (a warm session won't go stale).
+- **Single-gate overlay** — folding `tools.approvalMode: yolo` into a run-child-only config makes the
+  bridge the sole gate (no double-prompt with the ACP proxy).
+- **Soft cost budget** — `message_end` accumulates per-session cost; past `budgetCapUsd`, mutating
+  tools block (deny-by-complement) while read/control stay open. Honest: per-session (subagents get
+  their own cap → up to (1+N)×cap), per-run by default (cold child), accumulates only under warm handles.
+- **Endpoint routing** — `approvedEndpoints` emits a `disabledProviders` allow-list. Kept in a SEPARATE
+  governance overlay folded only into the run child, never the side-channel `omp models ls` chain
+  (the disabled list would otherwise shrink the catalog and oscillate) — verified live on omp 18.1.6;
+  configured-model and fallback-chain providers are never disabled.
+- **Advisory human approval** — an `approvalRequired` rule POSTs a `request_board_approval` (the run
+  JWT can create + poll, not decide) then blocks with a pending reason; approving wakes a NEW run
+  (no in-run hold under the 30s fail-closed handler cap). Fail-closed on POST error/403, deduped so a
+  model retry doesn't spam the board. Auto-resume deferred to the cross-run resume work.
+- **Session panel** surfaces per-run `model` (from `cost_events`, null-safe); v0.7 already had cost.
+- **Subagent observability** — upstream ask drafted (`docs/upstream/omp-acp-subagent-bridge.md`; ACP
+  lacks the RPC-mode subagent bridge) + a capability-gated consumer that no-ops until omp ships it.
+
+
 ## 0.7.0 — 2026-09-01
 
 Native integration: skills as on-demand tools, and a board session panel — both adapter-local, no

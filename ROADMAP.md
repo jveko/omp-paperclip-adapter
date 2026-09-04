@@ -162,6 +162,15 @@ Paperclip config. Track upstream; don't build.
 
 ## Completed
 
+- **2026-09-03 — v0.8.0 (Governance & control).** Guardrail `tool_call` engine (path/bash/deny/revise,
+  control-tool-allowlist, mtime re-read) via the paperclip bridge as the sole deny point
+  (`approvalMode:yolo` overlay single-gate); soft per-session cost budget (`message_end`); endpoint
+  allow-listing via a side-channel-isolated `disabledProviders` governance overlay (live-verified on
+  18.1.6); advisory human-approval round-trip (fail-closed, deduped, no auto-resume pending the resume
+  fix); session panel per-run model; subagent-observability upstream ask + gated stub. Adapter-local
+  except the two honestly-deferred items.
+
+
 - **2026-09-01 — v0.7.0 (Native integration).** Lazy-skill bridge (`skillsAsTools` field; a static
   omp ExtensionAPI extension registers each enabled company skill as an essential on-demand tool
   returning its `SKILL.md`, replacing eager prompt-injection; manifest handoff via `config.env`;
