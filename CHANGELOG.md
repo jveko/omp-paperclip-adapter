@@ -20,10 +20,14 @@ upstream-gated subagent view).
   governance overlay folded only into the run child, never the side-channel `omp models ls` chain
   (the disabled list would otherwise shrink the catalog and oscillate) — verified live on omp 18.1.6;
   configured-model and fallback-chain providers are never disabled.
-- **Advisory human approval** — an `approvalRequired` rule POSTs a `request_board_approval` (the run
-  JWT can create + poll, not decide) then blocks with a pending reason; approving wakes a NEW run
-  (no in-run hold under the 30s fail-closed handler cap). Fail-closed on POST error/403, deduped so a
-  model retry doesn't spam the board. Auto-resume deferred to the cross-run resume work.
+- **Advisory human approval** — an `approvalRequired` rule POSTs a `request_board_approval` (mirroring
+  Paperclip's own tool-gateway shape; the run JWT can create + read, never decide) and holds the call
+  with a pending reason — it can never wait on a human, since a `tool_call` handler is capped at ~30 s
+  and fail-closed. A human decision wakes a NEW run, and because a warm `session/load` neither
+  re-imports the bridge nor re-fires `session_start`, the pending branch **re-reads the verdict**
+  (one bounded `GET /api/approvals/:id`) so the granted action actually executes instead of looping on
+  its own stale cache; every other outcome (pending, rejected, unreadable, 403) holds, fail-closed.
+  Deduped per tool+argument-hash so a model retry can't spam the board.
 - **Session panel** surfaces per-run `model` (from `cost_events`, null-safe); v0.7 already had cost.
 - **Subagent observability** — upstream ask drafted (`docs/upstream/omp-acp-subagent-bridge.md`; ACP
   lacks the RPC-mode subagent bridge) + a capability-gated consumer that no-ops until omp ships it.
