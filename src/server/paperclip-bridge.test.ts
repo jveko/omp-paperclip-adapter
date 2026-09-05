@@ -962,19 +962,26 @@ interface FetchInit {
   signal?: unknown;
 }
 
-/** Stub the global fetch and record every call it receives. */
-function recordFetch(makeReply: () => Response | Promise<Response>): PostedRequest[] {
+/**
+ * Stub the global fetch and record every call it receives. The reply factory
+ * sees the request, so one double serves both the approval POST and the
+ * pending-entry status GET.
+ */
+function recordFetch(
+  makeReply: (request: PostedRequest) => Response | Promise<Response>,
+): PostedRequest[] {
   const calls: PostedRequest[] = [];
   const impl = (input: string, init?: FetchInit) => {
     const raw = init?.body;
-    calls.push({
+    const request: PostedRequest = {
       url: input,
       method: init?.method,
       headers: init?.headers ?? {},
       json: raw ? (JSON.parse(raw) as Record<string, unknown>) : {},
       signal: init?.signal,
-    });
-    return Promise.resolve(makeReply());
+    };
+    calls.push(request);
+    return Promise.resolve(makeReply(request));
   };
   vi.stubGlobal("fetch", impl);
   return calls;
@@ -1211,6 +1218,204 @@ describe("human approval (advisory tool_call hold)", () => {
     expect(await pi.toolCallAsync("yield", { result: "done" }, { cwd })).toBeUndefined();
     expect(pi.toolCallRaw(undefined, undefined)).toBeUndefined();
     expect(pi.toolCallRaw({ toolName: "", input: {} }, { cwd })).toBeUndefined();
+    expect(calls).toHaveLength(1);
+  });
+
+  /* ---- warm-handle pending-entry verdict resolution (v0.8 deadlock fix) ---- */
+
+  // A warm handle (`warmHandleIdleMs > 0`, operator-configured) keeps THIS
+  // module — and its pending key — alive across the run an approval wakes:
+  // `session/load` of a live record neither re-imports the extension nor
+  // re-fires `session_start`. An unconditional pending hold therefore loops
+  // the approved action forever, so the pending branch must resolve the
+  // board's verdict via one bounded status read. 31_000 is the bridge's
+  // APPROVAL_RETRY_MS window plus a millisecond.
+  const AGED_MS = 31_000;
+
+  /** Seed a pending entry for `{ target: "x" }` at `start`; returns the calls. */
+  async function seedPending(
+    pi: MockPiHandle,
+    cwd: string,
+    start: number,
+    makeReply: (request: PostedRequest) => Response | Promise<Response>,
+  ): Promise<PostedRequest[]> {
+    const clock = vi.spyOn(Date, "now");
+    clock.mockReturnValue(start);
+    const calls = recordFetch(makeReply);
+    const first = await pi.toolCallAsync(APPROVAL_TOOL, { target: "x" }, { cwd });
+    expect(first?.block).toBe(true);
+    expect(first?.reason).toContain("approval apr-1 requested");
+    clock.mockReturnValue(start + AGED_MS);
+    return calls;
+  }
+
+  it("WARM RESUME: a stale pending entry resolves APPROVED and lets the action run", async () => {
+    const { pi, cwd } = await approvalFixture({ approvalRequired: [APPROVAL_TOOL] });
+    approvalEnv();
+    const calls = await seedPending(pi, cwd, 1_800_000_000_000, (request) =>
+      request.method === "GET"
+        ? reply(200, { id: "apr-1", companyId: "co-1", type: "request_board_approval", status: "approved" })
+        : reply(201, { id: "apr-1" }),
+    );
+
+    // The approval woken a run that RESUMED this warm session: the identical
+    // call must now run, not quote the stale hold again.
+    const woken = await pi.toolCallAsync(APPROVAL_TOOL, { target: "x" }, { cwd });
+    expect(woken).toBeUndefined();
+
+    // One bounded GET on the stored id, and NO second approval POST.
+    const gets = calls.filter((call) => call.method === "GET");
+    expect(calls.filter((call) => call.method === "POST")).toHaveLength(1);
+    expect(gets).toHaveLength(1);
+    expect(gets[0].url).toBe("http://pb.test:3100/api/approvals/apr-1");
+    expect(gets[0].headers.authorization).toBe("Bearer run-jwt");
+
+    // The entry was cleared: a LATER identical call requests afresh — a grant
+    // licenses one execution, not the rest of the session.
+    const next = await pi.toolCallAsync(APPROVAL_TOOL, { target: "x" }, { cwd });
+    expect(next?.block).toBe(true);
+    expect(next?.reason).toContain("approval apr-1 requested");
+    expect(calls.filter((call) => call.method === "POST")).toHaveLength(2);
+  });
+
+  it("the APPROVED verdict returns the guard's own revision, not a bare allow", async () => {
+    // `write` is revisable, so the guard handed to the approval round-trip is
+    // `{ input: … }`. An approved stale entry must let the call run WITH that
+    // operator revision — not a bare allow that drops it, and not a block.
+    const { pi, cwd } = await approvalFixture({
+      guardrails: { argRevisions: { write: { content: "pinned" } } },
+      approvalRequired: ["write"],
+    });
+    approvalEnv();
+    const clock = vi.spyOn(Date, "now");
+    const start = 1_800_000_000_000;
+    clock.mockReturnValue(start);
+    const calls = recordFetch((request) =>
+      request.method === "GET" ? reply(200, { status: "approved" }) : reply(201, { id: "apr-1" }),
+    );
+    const first = await pi.toolCallAsync("write", { path: "a.ts", content: "x" }, { cwd });
+    expect(first?.block).toBe(true);
+    expect(calls).toHaveLength(1);
+
+    clock.mockReturnValue(start + AGED_MS);
+    const woken = await pi.toolCallAsync("write", { path: "a.ts", content: "x" }, { cwd });
+    expect(woken?.block).toBeFalsy();
+    expect(woken?.input).toEqual({ path: "a.ts", content: "pinned" });
+    expect(calls.filter((call) => call.method === "GET")).toHaveLength(1);
+  });
+
+  for (const [status, phrase] of [
+    ["rejected", "rejected"],
+    ["revision_requested", "revision requested"],
+    ["cancelled", "cancelled"],
+  ] as const) {
+    it(`a stale pending entry resolved ${status} names the outcome and clears the entry`, async () => {
+      const { pi, cwd } = await approvalFixture({ approvalRequired: [APPROVAL_TOOL] });
+      approvalEnv();
+      const calls = await seedPending(pi, cwd, 1_800_000_000_000, (request) =>
+        request.method === "GET" ? reply(200, { id: "apr-1", status }) : reply(201, { id: "apr-1" }),
+      );
+
+      const held = await pi.toolCallAsync(APPROVAL_TOOL, { target: "x" }, { cwd });
+      expect(held?.block).toBe(true);
+      expect(held?.reason).toContain(phrase);
+      expect(calls.filter((call) => call.method === "POST")).toHaveLength(1);
+
+      // Entry cleared: a later call may request afresh (a fresh POST), rather
+      // than reciting the closed verdict forever.
+      const again = await pi.toolCallAsync(APPROVAL_TOOL, { target: "x" }, { cwd });
+      expect(again?.block).toBe(true);
+      expect(again?.reason).toContain("approval apr-1 requested");
+      expect(calls.filter((call) => call.method === "POST")).toHaveLength(2);
+    });
+  }
+
+  it("keeps holding when the status says pending, and the refreshed stamp dedups the next burst", async () => {
+    const { pi, cwd } = await approvalFixture({ approvalRequired: [APPROVAL_TOOL] });
+    approvalEnv();
+    const calls = await seedPending(pi, cwd, 1_800_000_000_000, (request) =>
+      request.method === "GET" ? reply(200, { id: "apr-1", status: "pending" }) : reply(201, { id: "apr-1" }),
+    );
+
+    const held = await pi.toolCallAsync(APPROVAL_TOOL, { target: "x" }, { cwd });
+    expect(held?.block).toBe(true);
+    expect(held?.reason).toContain("approval apr-1 still pending");
+    expect(calls).toHaveLength(2); // POST + one GET
+
+    // The fetch refreshed `at`: an immediate second call dedups in-window —
+    // NO extra network, still held.
+    const burst = await pi.toolCallAsync(APPROVAL_TOOL, { target: "x" }, { cwd });
+    expect(burst?.block).toBe(true);
+    expect(burst?.reason).toContain("approval apr-1 pending");
+    expect(calls).toHaveLength(2);
+  });
+
+  for (const [label, getReply] of [
+    ["a rejecting status fetch", () => Promise.reject(new Error("ECONNRESET"))],
+    ["an HTTP 500 status read", () => reply(500, { error: "boom" })],
+    ["an unparseable status body", () => new Response("<<not json>>", { status: 200 })],
+    ["an unrecognized status value", () => reply(200, { status: "rogue" })],
+  ] as const) {
+    it(`fail-closed: ${label} keeps the call held and never throws`, async () => {
+      const { pi, cwd } = await approvalFixture({ approvalRequired: [APPROVAL_TOOL] });
+      approvalEnv();
+      const calls = await seedPending(pi, cwd, 1_800_000_000_000, (request) =>
+        request.method === "GET" ? getReply() : reply(201, { id: "apr-1" }),
+      );
+
+      const held = await pi.toolCallAsync(APPROVAL_TOOL, { target: "x" }, { cwd });
+      expect(held?.block).toBe(true);
+      expect(held?.reason).toContain("approval apr-1 still pending");
+      expect(calls.filter((call) => call.method === "POST")).toHaveLength(1);
+    });
+  }
+
+  it("fail-closed: control-plane env gone at re-check time still holds, without fetching", async () => {
+    const { pi, cwd } = await approvalFixture({ approvalRequired: [APPROVAL_TOOL] });
+    approvalEnv();
+    const calls = await seedPending(pi, cwd, 1_800_000_000_000, (request) =>
+      request.method === "GET" ? reply(200, { status: "approved" }) : reply(201, { id: "apr-1" }),
+    );
+
+    delete process.env.PAPERCLIP_API_KEY;
+    const held = await pi.toolCallAsync(APPROVAL_TOOL, { target: "x" }, { cwd });
+    expect(held?.block).toBe(true);
+    expect(held?.reason).toContain("approval apr-1 still pending");
+    expect(calls.filter((call) => call.method === "GET")).toHaveLength(0);
+  });
+
+  it("reads the verdict from any envelope shape the board may use", async () => {
+    for (const body of [
+      { status: "approved" },
+      { approval: { status: "approved" } },
+      { data: { status: "approved" } },
+    ] as const) {
+      const { pi, cwd } = await approvalFixture({ approvalRequired: [APPROVAL_TOOL] });
+      approvalEnv();
+      await seedPending(pi, cwd, 1_800_000_000_000, (request) =>
+        request.method === "GET" ? reply(200, body) : reply(201, { id: "apr-1" }),
+      );
+      expect(await pi.toolCallAsync(APPROVAL_TOOL, { target: "x" }, { cwd })).toBeUndefined();
+    }
+  });
+
+  it("burst dedup: identical retries inside the window cost exactly one network interaction", async () => {
+    const { pi, cwd } = await approvalFixture({ approvalRequired: [APPROVAL_TOOL] });
+    approvalEnv();
+    const clock = vi.spyOn(Date, "now");
+    const start = 1_800_000_000_000;
+    clock.mockReturnValue(start);
+    const calls = recordFetch((request) =>
+      request.method === "GET" ? reply(200, { status: "approved" }) : reply(201, { id: "apr-b" }),
+    );
+
+    for (const at of [0, 10_000, 29_999]) {
+      clock.mockReturnValue(start + at);
+      const held = await pi.toolCallAsync(APPROVAL_TOOL, { target: "x" }, { cwd });
+      expect(held?.block).toBe(true);
+      expect(held?.reason).toContain("apr-b");
+    }
+    // One POST, zero status GETs: the dedup fast path never fetches.
     expect(calls).toHaveLength(1);
   });
 });

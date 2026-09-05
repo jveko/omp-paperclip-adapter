@@ -20,11 +20,14 @@ import path from "node:path";
  *   that blocks mutating tools past the cap. The whole lane is deliberately
  *   independent of the skills lane: a governance-only agent (skillsAsTools
  *   off) must still be enforced.
- * - **Human approval (v0.8 T5, advisory)** — a tool call that matches an
+ * - **Human approval (v0.8 T5)** — a tool call that matches an
  *   `approvalRequired` rule (and passed every guardrail) posts a
  *   `request_board_approval` to the Paperclip control plane and blocks the
- *   call. This is the one path where the handler awaits: it is self-bound to
- *   ~10s, far under omp's 30s `toolCallTimeoutMs`, and never polls.
+ *   call. This is the one path where the handler awaits: every control-plane
+ *   call is self-bound to ~10s, far under omp's 30s `toolCallTimeoutMs`, and
+ *   a pending entry older than the dedup window resolves its verdict with
+ *   ONE bounded status read — so a warm-handle session survives a granted
+ *   approval instead of holding it forever. Never a poll loop.
  *
  * omp's `#beforeToolCall` awaits this handler before the tool runs and before
  * any approval proxy, and fail-closes (blocks the call) if a handler throws or
@@ -519,7 +522,7 @@ function evaluateGuardrails(
 }
 
 /* ------------------------------------------------------------------ */
-/*  Human approval (advisory, no poll)                                 */
+/*  Human approval (board round-trip, verdict resolution)               */
 /* ------------------------------------------------------------------ */
 
 /**
@@ -543,14 +546,23 @@ type ApprovalAttempt =
 
 /**
  * Per-session approval dedup, keyed on `tool + args hash`: an identical call
- * re-asks the board only after the negative's short retry window, never after
- * a pending one. A pending entry holds for the whole session because the
- * bridge cannot see the board's verdict without polling — impossible inside
- * the handler cap — so the block reason tells the model to re-run instead.
+ * re-asks the board only after the negative's retry window, and a pending
+ * entry holds a burst inside that window with no network at all. Past the
+ * window the pending branch does NOT trust the entry — it resolves the
+ * board's verdict with ONE bounded `GET /api/approvals/:id` (a run JWT may
+ * read approvals; only deciding them is board-gated): approved runs, a
+ * refusal clears the entry so a later call may re-request, and still-pending
+ * or any failure refreshes the stamp and keeps holding, fail-closed.
  *
- * Same module-scope-per-session reasoning as `runningCost`: omp cache-busts
- * this extension on every `session/new`, so the NEW run an approval wakes
- * starts clean and can legitimately request the granted action again.
+ * Same module-scope-per-session reasoning as `runningCost` — but that holds
+ * only for a FRESH `session/new`, which cache-busts this extension. Under an
+ * operator-configured warm handle (`warmHandleIdleMs > 0`) a `session/load`
+ * of a live record neither re-imports this module nor re-fires
+ * `session_start`, so a pending entry SURVIVES into the run an approval
+ * wakes; assuming a clean slate there would re-hold the granted action
+ * forever, and clearing at the session boundary cannot fix it either — that
+ * handler never runs on a resumed warm session. The default
+ * `warmHandleIdleMs = 0` keeps cold-path behavior unchanged.
  */
 const approvalAttempts = new Map<string, ApprovalAttempt>();
 
@@ -611,16 +623,134 @@ function approvalIdFrom(body: unknown): string | null {
   return null;
 }
 
+/** What one status read can learn; "unknown" means the read could not decide. */
+type ApprovalVerdict =
+  | "approved"
+  | "rejected"
+  | "revision_requested"
+  | "cancelled"
+  | "pending"
+  | "unknown";
+
 /**
- * POST a `request_board_approval` for one gated call and block it.
+ * The verdict on an approval read. The installed control plane answers
+ * `GET /api/approvals/:id` with the redacted approval row itself — `status`
+ * at the top level, one of the five values of `@paperclipai/shared`'s
+ * APPROVAL_STATUSES — but accept an `approval`/`data` envelope too, exactly
+ * as `approvalIdFrom` does. Anything unrecognized (including a non-string)
+ * is "unknown", which the caller fails closed on.
+ */
+function approvalVerdictFrom(body: unknown): ApprovalVerdict {
+  if (!isRecord(body)) return "unknown";
+  for (const candidate of [
+    body.status,
+    isRecord(body.approval) ? body.approval.status : undefined,
+    isRecord(body.data) ? body.data.status : undefined,
+  ]) {
+    if (typeof candidate !== "string") continue;
+    const status = candidate.trim().toLowerCase();
+    if (
+      status === "approved" ||
+      status === "rejected" ||
+      status === "revision_requested" ||
+      status === "cancelled" ||
+      status === "pending"
+    ) {
+      return status;
+    }
+  }
+  return "unknown";
+}
+
+/**
+ * A control-plane fetch with its own deadline, shared by the approval POST
+ * and the verdict GET. omp caps a `tool_call` handler at
+ * `extensionHandlers.toolCallTimeoutMs` (default 30s) and does NOT cancel a
+ * handler promise that outlives it — it leaks. Race the fetch against our
+ * own timer rather than trusting `AbortSignal.timeout` alone: the signal
+ * cancels the socket, the timer guarantees this helper returns even if the
+ * fetch never settles, so a slow or black-holed control plane can never
+ * turn a governed run into a stall.
+ */
+async function boundedApprovalFetch(
+  url: string,
+  token: string,
+  jsonBody?: string,
+): Promise<Response> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`no response after ${APPROVAL_TIMEOUT_MS}ms`)),
+      APPROVAL_TIMEOUT_MS,
+    );
+    timer.unref();
+  });
+  try {
+    return await Promise.race([
+      fetch(url, {
+        method: jsonBody === undefined ? "GET" : "POST",
+        headers:
+          jsonBody === undefined
+            ? { authorization: `Bearer ${token}` }
+            : { "content-type": "application/json", authorization: `Bearer ${token}` },
+        ...(jsonBody === undefined ? {} : { body: jsonBody }),
+        signal: AbortSignal.timeout(APPROVAL_TIMEOUT_MS),
+      }),
+      deadline,
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Resolve one pending approval's verdict with a single bounded status read.
+ * NEVER throws: missing env, no fetch, a transport failure, a non-2xx or an
+ * unparseable reply all come back "unknown" — so an approved action runs
+ * only on a read that PROVES the board said approved.
+ */
+async function lookupApprovalVerdict(approvalId: string): Promise<ApprovalVerdict> {
+  try {
+    const api = (process.env.PAPERCLIP_API_URL ?? "").trim();
+    const token = (process.env.PAPERCLIP_API_KEY ?? "").trim();
+    if (!api || !token || typeof fetch !== "function") return "unknown";
+    const url = `${paperclipApiRoot(api)}/api/approvals/${encodeURIComponent(approvalId)}`;
+    const response = await boundedApprovalFetch(url, token);
+    if (!response.ok) return "unknown";
+    const raw = await response.text().catch(() => "");
+    if (raw === "") return "unknown";
+    try {
+      return approvalVerdictFrom(JSON.parse(raw));
+    } catch {
+      return "unknown";
+    }
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
+ * Govern one gated call against the board: hold it; POST a
+ * `request_board_approval` when no request is outstanding; and once a
+ * pending entry is older than the retry window, RESOLVE it with one bounded
+ * status read instead of trusting it. Approved → the entry is cleared and
+ * the pre-existing `guard` result is returned (undefined, or the operator's
+ * argument revision), so the granted action runs. Rejected /
+ * revision_requested / cancelled → the entry is cleared so a later call may
+ * request afresh, and this one holds with the outcome named. Anything else
+ * → the stamp is refreshed and the call keeps holding: fail-closed, never a
+ * throw, never an ungoverned allow.
  *
  * ADVISORY BY DESIGN (Phase B): Paperclip resolves an approval by firing
  * `heartbeat.wakeup(reason:"approval_approved")`, which starts a NEW run —
  * nothing resumes THIS one, and a poll/hold is impossible inside the 30s
- * handler cap. So the block reason is written to tell the model what actually
- * happens. `runId` is deliberately absent from the payload: the run child's
- * `PAPERCLIP_RUN_ID` is spawn-time and stale under a warm handle, so an id
- * there would be a lie on the board.
+ * handler cap. So the block reason is written to tell the model what
+ * actually happens. A FRESH `session/new` re-imports this module and starts
+ * clean; a warm-handle `session/load` does NOT, which is why an aged pending
+ * entry resolves its verdict via the status read rather than assuming a
+ * clean slate. `runId` is deliberately absent from the payload: the run
+ * child's `PAPERCLIP_RUN_ID` is spawn-time and stale under a warm handle, so
+ * an id there would be a lie on the board.
  *
  * Fail-closed: any error — transport, non-2xx (a status-only recovery run's
  * 403 is expected), unparseable reply — still blocks the call, because an
@@ -630,7 +760,8 @@ async function holdForApproval(
   toolName: string,
   args: Record<string, unknown>,
   rule: ApprovalRule,
-): Promise<BridgeToolCallResult> {
+  guard: BridgeToolCallResult | undefined,
+): Promise<BridgeToolCallResult | undefined> {
   const held = (detail: string): BridgeToolCallResult => ({
     block: true,
     reason: `paperclip governance: ${toolName} requires approval — ${detail}`,
@@ -648,12 +779,47 @@ async function holdForApproval(
     const hash = argumentsHash(args);
     key = `${toolName}\u0000${hash}`;
     const seen = approvalAttempts.get(key);
-    if (seen && (seen.state === "pending" || Date.now() - seen.at < APPROVAL_RETRY_MS)) {
-      return held(
-        seen.state === "pending"
-          ? `approval ${seen.approvalId} pending (requested earlier this session); re-run once it is approved to perform this action`
-          : `the previous request failed (${seen.detail}) and is not retried yet`,
-      );
+    if (seen) {
+      const fresh = Date.now() - seen.at < APPROVAL_RETRY_MS;
+      if (seen.state === "pending") {
+        if (fresh) {
+          // Dedup fast path, no network: a burst re-sending the identical
+          // call inside the window keeps holding immediately.
+          return held(
+            `approval ${seen.approvalId} pending (requested earlier this session); re-run once it is approved to perform this action`,
+          );
+        }
+        // Past the window the entry may be STALE: under a warm handle the
+        // board's verdict can land while this module still holds the key,
+        // and the run an approval wakes resumes right here. Resolve it with
+        // one bounded read — never allow on doubt, never throw.
+        const verdict = await lookupApprovalVerdict(seen.approvalId);
+        if (verdict === "approved") {
+          approvalAttempts.delete(key);
+          return guard;
+        }
+        if (
+          verdict === "rejected" ||
+          verdict === "revision_requested" ||
+          verdict === "cancelled"
+        ) {
+          // Cleared so a later call may request afresh; this one still holds.
+          approvalAttempts.delete(key);
+          const outcome = verdict === "revision_requested" ? "revision requested" : verdict;
+          return held(
+            `approval ${seen.approvalId} was ${outcome} by the board; re-run to request this action afresh`,
+          );
+        }
+        // Still pending, or the read failed: refresh the stamp (at most one
+        // bounded read per window, not one per model retry) and keep holding.
+        rememberAttempt(key, { state: "pending", approvalId: seen.approvalId, at: Date.now() });
+        return held(
+          `approval ${seen.approvalId} still pending (requested earlier this session); re-run once it is approved to perform this action`,
+        );
+      }
+      if (fresh) {
+        return held(`the previous request failed (${seen.detail}) and is not retried yet`);
+      }
     }
 
     const api = (process.env.PAPERCLIP_API_URL ?? "").trim();
@@ -683,35 +849,7 @@ async function holdForApproval(
       issueIds: taskId ? [taskId] : undefined,
     };
 
-    // Race the fetch against our own timer rather than trusting
-    // `AbortSignal.timeout` alone: the signal cancels the socket, the timer
-    // guarantees this handler returns even if the fetch never settles — an
-    // expired omp handler is not cancelled, it leaks.
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const deadline = new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(
-        () => reject(new Error(`no response after ${APPROVAL_TIMEOUT_MS}ms`)),
-        APPROVAL_TIMEOUT_MS,
-      );
-      timer.unref();
-    });
-    let response: Response;
-    try {
-      response = await Promise.race([
-        fetch(url, {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            authorization: `Bearer ${token}`,
-          },
-          body: JSON.stringify(body),
-          signal: AbortSignal.timeout(APPROVAL_TIMEOUT_MS),
-        }),
-        deadline,
-      ]);
-    } finally {
-      clearTimeout(timer);
-    }
+    const response = await boundedApprovalFetch(url, token, JSON.stringify(body));
 
     const raw = await response.text().catch(() => "");
     if (!response.ok) {
@@ -775,14 +913,16 @@ function installGovernanceLane(pi: BridgePi): void {
           ? null
           : (current.approvalRequired.find((candidate) => candidate.matches(toolName)) ?? null);
       if (!rule) return guard;
-      // The approval round-trip is the lane's only awaited path, and it is
-      // self-bound: hold the call, post the request, never poll.
+      // The approval round-trip is the lane's only awaited path, and every
+      // control-plane call inside it is self-bound. It normally holds; once a
+      // pending entry ages out, it resolves the board's verdict instead — so
+      // a warm handle cannot loop an already-approved action forever.
       const executed = isRecord(guard?.input)
         ? guard.input
         : isRecord(event?.input)
           ? event.input
           : {};
-      return holdForApproval(toolName, executed, rule);
+      return holdForApproval(toolName, executed, rule, guard);
     } catch {
       // Never throw: omp turns a throwing handler into a blanket block.
       return undefined;
