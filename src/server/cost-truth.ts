@@ -1,26 +1,15 @@
-import type { UsageSummary } from "@paperclipai/adapter-utils";
+import type { AdapterExecutionResult, UsageSummary } from "@paperclipai/adapter-utils";
 import type { OmpPricingStatus } from "./models.js";
 
 /**
- * The installed adapter-utils result type predates the accounting fields, so
- * the adapter declares the subset it emits here (see the skew note in
- * ./index.ts). Paperclip's run-completion whitelist-copies these names into the
- * run's usage receipt; an unknown name would be dropped, and `usageByModel`
- * whose sums do not match the run totals is discarded by the ledger.
+ * The accounting fields this module fills are the engine result's own fields
+ * (picked, never re-declared): Paperclip's run-completion whitelist-copies
+ * these names into the run's usage receipt, an unknown name would be dropped,
+ * and a `usageByModel` whose sums do not match the run totals is discarded by
+ * the ledger.
  */
-export interface RunCostFields {
-  /** Billed cost when omp's pricing status itself fixes the amount at zero. */
-  costUsd?: number;
-  costStatus?: "reported" | "estimated" | "unpriced";
-  pricingProvenance?: {
-    source: "rate_card" | "operator" | "unknown";
-    evidence?: string;
-  };
-  usageByModel?: Array<{ model: string; usage: UsageSummary; costUsd: number }>;
-}
-
 export interface RunCostAttribution {
-  fields: RunCostFields;
+  fields: Pick<AdapterExecutionResult, "costUsd" | "costStatus" | "pricingProvenance" | "usageByModel">;
   /** Operator-facing notes for the run's event stream; never carry tokens or ids. */
   warnings: string[];
 }
@@ -48,7 +37,7 @@ export function attributeRunCost(input: {
   model?: string | null;
   failoverConfigured: boolean;
 }): RunCostAttribution {
-  const fields: RunCostFields = {};
+  const fields: RunCostAttribution["fields"] = {};
   const warnings: string[] = [];
   const { pricingStatus } = input;
   let costUsd = input.costUsd ?? null;

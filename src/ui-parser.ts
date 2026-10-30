@@ -1,4 +1,4 @@
-import { parseAcpxStdoutLine } from "@paperclipai/adapter-utils/acpx-engine/ui";
+import { parseAcpxStdoutLine } from "./server/adapters/acp/ui.js";
 import type { TranscriptEntry } from "@paperclipai/adapter-utils";
 
 /**

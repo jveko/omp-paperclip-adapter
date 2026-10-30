@@ -1,11 +1,3 @@
-import type {
-  AdapterExecutionContext,
-  AdapterExecutionResult,
-} from "@paperclipai/adapter-utils";
-import type {
-  AcpxEngineBillingIdentity,
-  AcpxEngineExecutorOptions,
-} from "@paperclipai/adapter-utils/acpx-engine/execute";
 import { bridgePath, moduleDir, packageRootDir } from "./adapters/acp/launch.js";
 import { buildRunPlan } from "./run/run-plan.js";
 import { executePlan, type RunTransport } from "./run/execute.js";
@@ -28,8 +20,8 @@ import { resolveExecutionMode } from "./session-directives.js";
 export {
   DEFAULT_OMP_COMMAND, packageRootDir, bridgePath, shouldAppendBridgeExtension,
   resolveBridgeRunMode, isGovernanceArmed, bridgeArtifactError, resolveOmpAgentCommand,
-  resolveSessionCwd, deriveDefaultTimeoutSec, RUN_IDENTITY_ENABLED, buildOmpAcpConfig,
-  parseOmpVersion, TESTED_OMP_MINORS,
+  resolveSessionCwd, deriveDefaultTimeoutSec, configuredWarmHandleIdleMs, RUN_IDENTITY_ENABLED,
+  buildOmpAcpConfig, parseOmpVersion, TESTED_OMP_MINORS,
 } from "./adapters/acp/launch.js";
 export type { BridgeRunMode } from "./adapters/acp/launch.js";
 
@@ -43,6 +35,7 @@ export type {
 
 import { resolveOmpBillingIdentity } from "./run/billing.js";
 export { resolveOmpBillingIdentity };
+import { loadAcpxEngineExecutor, type AcpxEngineExecutorOptions, type OmpAcpExecutor } from "./adapters/acp/engine.js";
 
 type OmpAcpExecutorOptions = Omit<
   AcpxEngineExecutorOptions,
@@ -57,7 +50,6 @@ type OmpAcpExecutorOptions = Omit<
   /** `dist/omp-host.js`, resolved by the caller in tests; shipped path by default. */
   hostScript?: string;
 };
-type OmpAcpExecutor = (ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>;
 
 /**
  * Compose the ACP lane: build the run plan, refuse if it refused, then execute
@@ -72,22 +64,12 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
   const bridge = bridgeOverride ?? bridgePath;
   let executor: OmpAcpExecutor | null = null;
   // The managed lane is created lazily too, and its module graph deliberately
-  // excludes the engine: a managed run must not load acpx-engine at all.
+  // excludes the ACP engine: a managed run must not load it at all.
   let managed: ReturnType<typeof createHostTransport> | null = null;
   const ensureEngine = async (): Promise<OmpAcpExecutor> => {
     if (executor) return executor;
-    // Lazy by design: the acpx engine (and its transitive CLI deps) must not
-    // load until a run actually executes. This is the only dynamic import in
-    // the lane and it is deliberate — a static one would pay that cost on
-    // every import of the adapter, probes included.
-    const { createAcpxEngineExecutor } = await import(
-      "@paperclipai/adapter-utils/acpx-engine/execute"
-    );
-    executor = createAcpxEngineExecutor({
+    executor = await loadAcpxEngineExecutor({
       ...engineOptions,
-      adapterType: "omp_local",
-      moduleDir,
-      packageRootDir,
       resolveBillingIdentity: options.resolveBillingIdentity ?? resolveOmpBillingIdentity,
     });
     return executor;

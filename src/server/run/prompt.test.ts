@@ -49,7 +49,12 @@ describe("managed prompt", () => {
     expect(prompt.indexOf("Always be careful.")).toBeLessThan(prompt.indexOf("## Task"));
     expect(prompt).toContain("The above agent instructions were loaded from");
     expect(prompt).toContain("Fix the thing.");
-    expect(prompt).toContain("Continue your Paperclip work.");
+    // The heartbeat template is upstream's default (`DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE`),
+    // rendered with the run identity. Its copy moves between adapter-utils
+    // releases (2026.1023.0 replaced the execution contract with the
+    // connection-tools guidance), so pin the identity it renders rather than a
+    // sentence the dependency owns.
+    expect(prompt).toContain("You are agent agent-1 (A).");
     expect(prompt).toContain("PAPERCLIP_API_URL");
     expect(prompt).not.toContain("PAPERCLIP_API_KEY");
     expect(prompt).not.toContain("PI_CONFIG_FILES");
@@ -64,8 +69,8 @@ describe("managed prompt", () => {
       onLog: async () => {},
     });
     // A resumed session gets the wake delta instead of the full heartbeat
-    // template; the template's execution contract is not repeated.
-    expect(prompt).not.toContain("Continue your Paperclip work.");
+    // template; the template's rendered identity is not repeated.
+    expect(prompt).not.toContain("You are agent agent-1 (A).");
     expect(prompt).toContain("Fix the thing.");
   });
 
@@ -82,7 +87,7 @@ describe("managed prompt", () => {
     });
     expect(logs.join("")).toContain("could not read agent instructions file");
     expect(commandNotes[0]).toContain("could not be read");
-    expect(prompt).toContain("Continue your Paperclip work.");
+    expect(prompt).toContain("You are agent agent-1 (A).");
   });
 
   it("renders the configured prompt template with the run identity", async () => {

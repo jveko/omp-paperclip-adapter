@@ -32,7 +32,7 @@ ACP stdio transport.
 | \`sessionScope\` | \`shared\` | \`shared\` = the host's one omp agent dir; \`isolated\` = this agent's own (requires \`credentialMode: broker\`) |
 | \`sessionSnapshotDiagnostic\` | \`false\` | log counts from omp's host-wide \`_omp/*\` listing (never ids, cwds or titles) |
 | \`subagentObservability\` | \`summary\` | managed lane only: \`off\` / \`summary\` / \`events\`; engine mode ignores it |
-| \`warmHandleIdleMs\` | \`0\` | pinned to \`0\` on every run (see below). The engine sets \`PAPERCLIP_API_KEY\` only when it spawns the child, so a reused process would keep an earlier run's token |
+| \`warmHandleIdleMs\` | \`0\` | engine warm-handle window, passed through as configured. No reuse happens under run identity: the engine's settlement gate discards a handle that still carries this run's credential (see below) |
 
 ### One run per session
 - Every \`execute()\` holds a per-\`sessionKey\` lease under the agent state dir
@@ -203,21 +203,20 @@ ACP stdio transport.
 - A managed AGENTS.md bundle is supported through \`instructionsFilePath\`: the
   engine renders that file into the run prompt and the ephemeral skills file
   merges the same path, so the bundle and \`skillsAsTools\` compose.
-- Warm reuse is pinned off, deliberately. The engine injects
-  \`PAPERCLIP_API_KEY\` into the child environment only when it spawns that
-  child, and a warm-hit run reuses the process without re-spawning it. The
-  installed engine (\`@paperclipai/adapter-utils\` 2026.824.x) drops a warm
-  handle for neither a run token nor run-scoped MCP servers, so reuse would make
-  later heartbeats speak with the FIRST run's token: their work products and
-  approval requests would authenticate as that earlier run (wrong attribution,
-  not just a failure). Because that is an audit-integrity defect, the adapter
-  forces \`warmHandleIdleMs: 0\` on every run, whatever the config says, and logs
-  one \`warm-handle reuse pinned to 0\` warning when a configured value was
-  ignored. The only exception is the fork run's own single-run 50 ms pin, which
-  exists so the fork resume can save and immediately close its handle. Lift the
-  pin in \`buildOmpAcpConfig\` only when the dependency's engine discards
-  run-scoped credentials on reuse (contract HEAD already does; see ROADMAP items
-  1/8).
+- Warm reuse never happens under run identity, and the engine enforces it. The
+  engine injects \`PAPERCLIP_API_KEY\` into the child environment only when it
+  spawns that child, so a reused process would speak with the token of the run
+  that spawned it — later heartbeats' work products and approval requests would
+  authenticate as that earlier run (wrong attribution, not just a failure).
+  From \`@paperclipai/adapter-utils\` 2026.1023.0 the settlement gate makes the
+  decision: the host-lane save candidate carries
+  \`liveRunScopedCredentials: ["paperclip-run-scoped-api-key"]\`, so
+  \`decideReuse\` answers \`discard / "run-scoped credential still valid"\` and the
+  run closes and relaunches instead of transferring the handle. The adapter
+  therefore passes \`warmHandleIdleMs\` through instead of overwriting it, and
+  logs one \`warm-handle idle window ... is honoured\` note when an operator
+  sets it. The fork run's own single-run 50 ms pin stays: it is what makes that
+  run's handle savable at all before it is closed.
 - No provider quota windows are reported. \`getQuotaWindows\` receives no adapter
   config, so it could only report the Paperclip host's omp login rather than the
   employee's; the subscription-quota card stays empty for this adapter.

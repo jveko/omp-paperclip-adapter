@@ -36,8 +36,9 @@ vi.mock("./models.js", async (importOriginal) => {
   };
 });
 
-vi.mock("@paperclipai/adapter-utils/acpx-engine/execute", () => ({
-  createAcpxEngineExecutor: mocks.createAcpxEngineExecutor,
+// Mocked at this package's loader seam, not the dependency's module id.
+vi.mock("./adapters/acp/engine.js", () => ({
+  loadAcpxEngineExecutor: async () => mocks.createAcpxEngineExecutor(),
 }));
 
 function baseCtx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecutionContext {

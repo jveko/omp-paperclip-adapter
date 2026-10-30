@@ -45,8 +45,9 @@ vi.mock("./session-intel.js", () => ({
   queryOmpSessions: mocks.queryOmpSessions,
 }));
 
-vi.mock("@paperclipai/adapter-utils/acpx-engine/execute", () => ({
-  createAcpxEngineExecutor: mocks.createAcpxEngineExecutor,
+// Mocked at this package's loader seam, not the dependency's module id.
+vi.mock("./adapters/acp/engine.js", () => ({
+  loadAcpxEngineExecutor: async () => mocks.createAcpxEngineExecutor(),
 }));
 
 /** Paperclip issue ids are UUIDs; only those runs may post work products. */

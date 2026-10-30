@@ -81,8 +81,11 @@ vi.mock("./models.js", async (importOriginal) => {
   return { ...actual, listOmpModels: modelsMocks.listOmpModels };
 });
 
-vi.mock("@paperclipai/adapter-utils/acpx-engine/execute", () => ({
-  createAcpxEngineExecutor: engineMocks.createAcpxEngineExecutor,
+// The engine is replaced at this package's own loader seam rather than at the
+// dependency's module id: the lane's lazy `loadAcpxEngineExecutor` is the only
+// place the engine is constructed, so mocking it covers every engine call.
+vi.mock("./adapters/acp/engine.js", () => ({
+  loadAcpxEngineExecutor: async () => engineMocks.createAcpxEngineExecutor(),
 }));
 
 function fakeEngine(result: Record<string, unknown>) {
@@ -95,8 +98,8 @@ function fakeEngine(result: Record<string, unknown>) {
 const ISSUE_ID = "0b8f0d5e-9a10-4f6a-8f2b-1c2d3e4f5a6b";
 
 function baseCtx(
-  // `runtimeTools` is absent from the installed adapter-utils declaration (it
-  // ships at contract HEAD), so the fixture surface declares it explicitly.
+  // `runtimeTools` is declared loosely here so a fixture can hand a partial
+  // access object; the real context type carries the full access shape.
   overrides: Partial<AdapterExecutionContext> & { runtimeTools?: Record<string, unknown> } = {},
 ): AdapterExecutionContext {
   return {
@@ -251,7 +254,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     }
   }, 20_000);
 
-  it("pins warm-handle reuse to 0 under run identity and reports the dropped opt-in", async () => {
+  it("passes the operator's warm-handle window through and notes the settlement discard", async () => {
     const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     const events: Array<{ level?: string; message?: string }> = [];
     const run = createOmpAcpExecutor();
@@ -260,15 +263,16 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
       authToken: "run-jwt-SENTINEL",
       onEvent: async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); },
     }));
-    // A reused child keeps the spawning run's PAPERCLIP_API_KEY (the engine sets
-    // it only at spawn), so a warm hit would authenticate this run's work as an
-    // earlier run. The adapter pins the knob off regardless of operator input.
-    expect(executorFn.mock.calls[0][0].config.warmHandleIdleMs).toBe(0);
-    const warnings = events.filter((e) => e.level === "warn" && /warm-handle/i.test(e.message ?? ""));
-    expect(warnings).toHaveLength(1);
+    // The operator's value is no longer overwritten: the engine's settlement
+    // gate is what refuses to carry this run's credential into a reused child
+    // (proved against the real engine in adapters/acp/warm-handle-settlement.test.ts).
+    expect(executorFn.mock.calls[0][0].config.warmHandleIdleMs).toBe(300_000);
+    const notes = events.filter((e) => e.level === "info" && /warm-handle/i.test(e.message ?? ""));
+    expect(notes).toHaveLength(1);
     expect(JSON.stringify(events)).not.toContain("SENTINEL");
 
-    // Default config (never opted in) is already 0: no warning noise per heartbeat.
+    // Default config (never opted in) is the engine's own default: no note noise
+    // per heartbeat.
     const quiet: Array<{ level?: string; message?: string }> = [];
     const run2 = createOmpAcpExecutor();
     await run2(baseCtx({
@@ -278,6 +282,15 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     }));
     expect(quiet.some((e) => /warm-handle/i.test(e.message ?? ""))).toBe(false);
     expect(JSON.stringify(quiet)).not.toContain("SENTINEL");
+  });
+
+  it("honours the acpWarmHandleIdleMs alias and coerces a numeric string", async () => {
+    const executorFn = fakeEngine({ exitCode: 0 });
+    const run = createOmpAcpExecutor();
+    await run(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, acpWarmHandleIdleMs: "120000" },
+    }));
+    expect(executorFn.mock.calls[0][0].config.warmHandleIdleMs).toBe(120_000);
   });
 
   it("fork still applies with broker env threaded to the side channel", async () => {

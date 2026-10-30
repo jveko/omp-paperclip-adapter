@@ -1,5 +1,5 @@
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
-import type { AcpxEngineBillingIdentity } from "@paperclipai/adapter-utils/acpx-engine/execute";
+import type { AcpxEngineBillingIdentity } from "../adapters/acp/engine.js";
 
 /**
  * The billing identity both lanes report. Lives beside the run transports

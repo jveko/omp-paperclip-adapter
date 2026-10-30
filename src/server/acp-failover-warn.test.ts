@@ -7,8 +7,9 @@ import { materializeFailoverOverlay } from "./failover-config.js";
 // Force the overlay write-failure branch and assert the executor warns via onEvent
 // and still runs (regression guard for the spec §4 "warn, don't fail" contract).
 const engineMocks = vi.hoisted(() => ({ createAcpxEngineExecutor: vi.fn() }));
-vi.mock("@paperclipai/adapter-utils/acpx-engine/execute", () => ({
-  createAcpxEngineExecutor: engineMocks.createAcpxEngineExecutor,
+// Mocked at this package's loader seam, not the dependency's module id.
+vi.mock("./adapters/acp/engine.js", () => ({
+  loadAcpxEngineExecutor: async () => engineMocks.createAcpxEngineExecutor(),
 }));
 vi.mock("./failover-config.js", async (importOriginal) => {
   // Vitest types `importOriginal` as returning `unknown`; the module namespace

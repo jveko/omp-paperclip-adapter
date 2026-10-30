@@ -76,21 +76,23 @@ function configuredTimeoutMs(config: Record<string, unknown>): number | null {
 }
 
 /**
- * `ctx.signal` ships at Paperclip contract HEAD but is absent from the pinned
- * declaration; read it from the boundary value rather than widening the type.
+ * `ctx.signal` is declared optional; the runtime value can still be anything at
+ * a plugin boundary, so keep the instanceof gate.
  */
 function abortSignalOf(ctx: AdapterExecutionContext): AbortSignal | null {
-  if (!("signal" in ctx)) return null;
   const signal: unknown = ctx.signal;
   return signal instanceof AbortSignal ? signal : null;
 }
 
-/** A HEAD-only adapter hook, read defensively from the pinned context type. */
+/**
+ * The run's usage checkpoint sink. The receipt crosses a JSON boundary (the
+ * supervisor serialises it), so it is forwarded as the wire record it is and
+ * validated by the server, not re-typed here.
+ */
 function usageSink(ctx: AdapterExecutionContext): ((receipt: Record<string, unknown>) => Promise<void>) | null {
-  if (!("onUsage" in ctx)) return null;
   const candidate = ctx.onUsage;
   return typeof candidate === "function"
-    ? (candidate as (receipt: Record<string, unknown>) => Promise<void>)
+    ? (candidate as unknown as (receipt: Record<string, unknown>) => Promise<void>)
     : null;
 }
 
@@ -127,9 +129,8 @@ function manifestsOf(plan: RunPlan): Manifests {
 }
 
 /**
- * The run's connection-tools access, read from the HEAD-only `ctx.runtimeTools`
- * (absent from the pinned declaration). The bearer is forwarded to the
- * supervisor only — never to the worker, a log, an event or the ledger.
+ * The run's connection-tools access. The bearer is forwarded to the supervisor
+ * only — never to the worker, a log, an event or the ledger.
  */
 function connectionToolsOf(ctx: AdapterExecutionContext): {
   endpoint: string;
@@ -137,19 +138,17 @@ function connectionToolsOf(ctx: AdapterExecutionContext): {
   expiresAt: string | null;
   tools: string[];
 } | null {
-  if (!("runtimeTools" in ctx)) return null;
-  const value: unknown = ctx.runtimeTools;
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
-  const record = value as Record<string, unknown>;
-  const endpoint = typeof record.mcpEndpoint === "string" ? record.mcpEndpoint.trim() : "";
-  const bearerToken = typeof record.bearerToken === "string" ? record.bearerToken.trim() : "";
+  const access = ctx.runtimeTools;
+  if (typeof access !== "object" || access === null) return null;
+  const endpoint = typeof access.mcpEndpoint === "string" ? access.mcpEndpoint.trim() : "";
+  const bearerToken = typeof access.bearerToken === "string" ? access.bearerToken.trim() : "";
   if (endpoint === "" || bearerToken === "") return null;
   return {
     endpoint,
     bearerToken,
-    expiresAt: typeof record.expiresAt === "string" ? record.expiresAt : null,
-    tools: Array.isArray(record.tools)
-      ? record.tools.filter((name): name is string => typeof name === "string")
+    expiresAt: typeof access.expiresAt === "string" ? access.expiresAt : null,
+    tools: Array.isArray(access.tools)
+      ? (access.tools as unknown[]).filter((name): name is string => typeof name === "string")
       : [],
   };
 }

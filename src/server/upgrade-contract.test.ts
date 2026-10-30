@@ -33,7 +33,7 @@ describe("upgrade contract", () => {
   });
 
   it("pins adapter-utils exactly so the execution-target contract cannot drift", () => {
-    expect(manifest.dependencies?.[ADAPTER_UTILS]).toBe("2026.824.1");
+    expect(manifest.dependencies?.[ADAPTER_UTILS]).toBe("2026.1023.0");
   });
 
   it("keeps the peer range's tested minors in sync with TESTED_OMP_MINORS", () => {

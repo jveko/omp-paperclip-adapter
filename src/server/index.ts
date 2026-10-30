@@ -1,5 +1,5 @@
 import type { ServerAdapterModule } from "@paperclipai/adapter-utils";
-import { sessionCodec } from "@paperclipai/adapter-utils/acpx-engine/session-codec";
+import { sessionCodec } from "./adapters/acp/session-codec.js";
 import { execute } from "./execute.js";
 import { detectOmpConfiguredModel, refreshOmpModelCatalog, type OmpModelCost } from "./models.js";
 import { listOmpSkillsSnapshot, syncOmpSkills } from "./skills.js";
@@ -17,12 +17,12 @@ interface DetectedOmpModel {
 }
 
 /**
- * The installed adapter-utils `AdapterModel` (and contract HEAD's) declares only
- * id/label. The registry hands the array to the route verbatim
- * (`registry.ts` refreshAdapterModels → `res.json`), so the extra fields reach
- * the board JSON without a type change on either side; a consumer that does not
- * know them ignores them. Re-declaring them here is the one place the skew is
- * recorded (same pattern as `runtimeToolDelivery` below).
+ * The installed `AdapterModel` declares only id/label; the adapter's catalog
+ * carries a context window and cost card as well. The registry hands the array
+ * to the route verbatim (`registry.ts` refreshAdapterModels → `res.json`), so
+ * the extra fields reach the board JSON without a type change on either side;
+ * a consumer that does not know them ignores them. This is the one place the
+ * skew is recorded.
  */
 interface OmpAdapterModel {
   id: string;
@@ -53,21 +53,7 @@ async function detectModel(): Promise<DetectedOmpModel | null> {
   return value;
 }
 
-/**
- * Delivery channel for Paperclip's run-scoped control tools.
- *
- * Paperclip contract HEAD declares `runtimeToolDelivery` on
- * `ServerAdapterModule` (adapter-utils types.ts:519) and the heartbeat path
- * reads it untyped (`adapter.runtimeToolDelivery ?? "invocation_context"`,
- * runtime-execution.ts:777-778), but the pinned 2026.824.1 declaration does not
- * carry the member. Re-declaring it here keeps the value checked without
- * bumping the dependency; this type is the one place the skew is recorded.
- */
-export type OmpRuntimeToolDelivery = "native_mcp" | "environment" | "invocation_context";
-export type OmpServerAdapterModule =
-  ServerAdapterModule & { runtimeToolDelivery?: OmpRuntimeToolDelivery };
-
-export function createServerAdapter(): OmpServerAdapterModule {
+export function createServerAdapter(): ServerAdapterModule {
   return {
     type,
     models: [],
@@ -79,13 +65,12 @@ export function createServerAdapter(): OmpServerAdapterModule {
     getConfigSchema: () => getSessionConfigSchema(),
     // Run identity: Paperclip mints the per-run JWT only for adapters that
     // declare this (runtime-execution.ts:249-260), and the engine turns the
-    // token into PAPERCLIP_API_KEY in the run child (pinned acpx-engine
-    // execute.js:1014-1015). That key is the single source for the session-snapshot
-    // and usage work products and for the bridge's approval round-trip; a
-    // missing token keeps failing closed with the existing explicit errors.
-    // Blast radius (company-scoped API access for the run) is stated in
-    // agentConfigurationDoc. The same constant pins engine warm-handle reuse
-    // off, because a reused child would keep an earlier run's token.
+    // token into PAPERCLIP_API_KEY in the run child (execute.js:1014-1015).
+    // That key is the single source for the session-snapshot and usage work
+    // products and for the bridge's approval round-trip; a missing token keeps
+    // failing closed with the existing explicit errors. Blast radius
+    // (company-scoped API access for the run) is stated in
+    // agentConfigurationDoc.
     supportsLocalAgentJwt: RUN_IDENTITY_ENABLED,
     // omp consumes ACP `mcpServers` on session/new|load|resume|fork, so the
     // Paperclip connections/project servers must be delivered there.

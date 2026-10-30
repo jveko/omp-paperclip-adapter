@@ -190,20 +190,43 @@ export function deriveDefaultTimeoutSec(cost: OmpModelCost | null | undefined): 
  * This adapter declares `supportsLocalAgentJwt: true` (../index.ts), so every
  * run carries a run-scoped Paperclip token, injected as `PAPERCLIP_API_KEY`.
  *
- * That makes engine warm-handle reuse unsafe. The engine writes the token into
- * the child environment only when it SPAWNS the child (pinned acpx-engine
- * `execute.js:1014-1015`), a warm hit reuses the running process without
- * re-spawning it (`execute.js:2608-2612, 2739`; `sessionOptions.env` is passed
- * only when a session has to be established, `2696,2726`), and the pinned
- * engine drops a warm handle for neither a run token nor run-scoped MCP servers
- * (contract HEAD does: `execute.ts:4448-4453`). A reused child would therefore
- * authenticate this run's work products and approval requests as an EARLIER
- * run — an audit-attribution error, not a slowdown. So `buildOmpAcpConfig`
- * pins `warmHandleIdleMs` to 0 for every run, and the executor reports a
- * dropped operator opt-in. The one exception is the fork run's own 50 ms pin,
- * which exists so the fork's resume can save and immediately close its handle.
+ * A reused child keeps the token of the run that spawned it (the engine writes
+ * it into the environment only at spawn), so reusing a handle under run
+ * identity would authenticate this run's work products and approval requests
+ * as an EARLIER run — an audit-attribution error, not a slowdown.
+ *
+ * The engine no longer needs this adapter to prevent that. From 2026.1023.0 the
+ * settlement sequence makes the reuse decision itself: the host-lane candidate
+ * carries `liveRunScopedCredentials: ["paperclip-run-scoped-api-key"]` and
+ * `decideReuse` answers `{ kind: "discard", reason: "run-scoped credential
+ * still valid" }` (`acpx-engine/settlement-sequence.js`), so a clean turn
+ * close-and-relaunches rather than transferring the warm handle. The sandbox
+ * lane saves only its staged files, which carry no credential.
+ *
+ * `buildOmpAcpConfig` therefore passes the operator's `warmHandleIdleMs`
+ * through instead of overwriting it: the setting is honoured by the engine, and
+ * the gate — not this adapter — is what keeps a credential-carrying handle from
+ * being reused. `adapters/acp/warm-handle-settlement.test.ts` asserts the
+ * discard against the real engine. The fork branch still re-pins 50 ms for its
+ * own single run, which is what makes that run's handle savable at all.
  */
 export const RUN_IDENTITY_ENABLED = true;
+
+/**
+ * The operator's warm-handle idle window. `warmHandleIdleMs` is the engine's
+ * own key; `acpWarmHandleIdleMs` is this adapter's alias. Anything that is not
+ * a positive finite number means "close each turn", which is also the engine's
+ * default.
+ */
+export function configuredWarmHandleIdleMs(config: Record<string, unknown>): number {
+  const raw = config.warmHandleIdleMs ?? config.acpWarmHandleIdleMs;
+  const value = typeof raw === "number"
+    ? raw
+    : typeof raw === "string" && raw.trim() !== ""
+      ? Number(raw)
+      : 0;
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
 
 /**
  * Build the ACP engine config for a run. `resolveModel` normalizes the raw
@@ -230,10 +253,11 @@ export function buildOmpAcpConfig(
     nonInteractivePermissions:
       firstNonEmptyString(config.nonInteractivePermissions, config.acpNonInteractivePermissions) ??
       DEFAULT_ACP_ENGINE_NON_INTERACTIVE_PERMISSIONS,
-    // Run identity pins warm reuse off for every run; the operator's value is
-    // dropped, never merged (see RUN_IDENTITY_ENABLED). The fork branch below
-    // re-pins 50 for its own single run, which is exempt by design.
-    warmHandleIdleMs: 0,
+    // Passed through, not pinned: the engine's settlement gate discards a
+    // handle that still carries this run's credential (see
+    // RUN_IDENTITY_ENABLED above). Normalized so the alias and string forms
+    // reach the engine as one number.
+    warmHandleIdleMs: configuredWarmHandleIdleMs(config),
   };
   if (model) next.model = model;
   // timeoutSec is numeric — firstNonEmptyString would drop it. Coerce once:

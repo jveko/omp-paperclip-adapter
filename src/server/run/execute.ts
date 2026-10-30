@@ -1,5 +1,5 @@
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
-import { attributeRunCost, type RunCostFields } from "../cost-truth.js";
+import { attributeRunCost } from "../cost-truth.js";
 import { runWithFreshSessionRetry, withRetryChain, type RetryChainEntry } from "../retry.js";
 import {
   bumpRunCounter, consumeToken, rotateIfTripped, snapshotDigest,
@@ -277,9 +277,7 @@ async function composeResult(
   for (const warning of attribution.warnings) {
     await plan.ctx.onEvent?.({ eventType: "run.system", stream: "system", level: "info", message: warning });
   }
-  // `costUsd` is the one field the result already declares (nullable there),
-  // so only the added accounting fields ride the intersection.
-  const final: AdapterExecutionResult & Omit<RunCostFields, "costUsd"> = {
+  const final: AdapterExecutionResult = {
     ...withRetryChain(resultJson ? { ...result, resultJson } : result, chain),
     ...attribution.fields,
   };

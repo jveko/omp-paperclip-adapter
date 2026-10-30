@@ -30,8 +30,8 @@ import { materializeThinkingOverlay, requestedThinkingLevel } from "../thinking-
 import { mergePiConfigFiles, type OverlayEntry } from "./overlays.js";
 import { loadState, saveState, sessionIntelDir, type SessionIntelState } from "../session-state.js";
 import {
-  buildOmpAcpConfig, bridgeArtifactError, firstNonEmptyString, isGovernanceArmed,
-  resolveBridgeRunMode, resolveOmpAgentCommand, resolveSessionCwd,
+  buildOmpAcpConfig, bridgeArtifactError, configuredWarmHandleIdleMs, firstNonEmptyString,
+  isGovernanceArmed, resolveBridgeRunMode, resolveOmpAgentCommand, resolveSessionCwd,
 } from "../adapters/acp/launch.js";
 import {
   readSessionIntelConfig, resolveExecutionMode, resolveRunDirective, thinkingLevelChanged,
@@ -107,21 +107,12 @@ export type RunPlanResult =
 
 /**
  * Endpoint of the run-scoped connection-tools MCP server Paperclip offered this
- * run, or null when it offered none.
- *
- * `runtimeTools` ships at Paperclip contract HEAD (adapter-utils types.ts:273,
- * passed to `adapter.execute()` at runtime-execution.ts:832) but is absent from
- * the pinned 2026.824.1 declaration that `tsc` compiles against, so the member
- * is narrowed from the boundary value rather than asserted on the context. A
- * server that never sets it simply reads as null. Only the endpoint is read;
- * the bearer token in the same object must never enter a log, an event or a
- * work product.
+ * run, or null when it offered none. A server that never sets `runtimeTools`
+ * reads as null. Only the endpoint is read; the bearer token in the same object
+ * must never enter a log, an event or a work product.
  */
 function connectionToolsEndpoint(ctx: AdapterExecutionContext): string | null {
-  if (!("runtimeTools" in ctx)) return null;
-  const tools: unknown = ctx.runtimeTools;
-  if (typeof tools !== "object" || tools === null || !("mcpEndpoint" in tools)) return null;
-  const endpoint = tools.mcpEndpoint;
+  const endpoint = ctx.runtimeTools?.mcpEndpoint;
   return typeof endpoint === "string" && endpoint.trim() !== "" ? endpoint.trim() : null;
 }
 
@@ -679,17 +670,17 @@ async function applySessionDirective(
     }
   }
 
-  // The warm pin in buildOmpAcpConfig is silent in the engine, so report a
-  // dropped operator opt-in once per run — a dead knob must never look live.
-  // A fork run is exempt: its engineConfig carries the per-run 50 ms pin.
-  const requestedWarmIdleMs = Number(
-    ctx.config.warmHandleIdleMs ?? ctx.config.acpWarmHandleIdleMs ?? 0,
-  );
-  if (Number(engineConfig.warmHandleIdleMs ?? 0) === 0
-    && Number.isFinite(requestedWarmIdleMs) && requestedWarmIdleMs > 0) {
+  // The engine's settlement gate, not this adapter, is what keeps a warm
+  // handle from being reused under run identity (see RUN_IDENTITY_ENABLED):
+  // the operator's value is passed through, and a save that still carries this
+  // run's credential is discarded at settlement. Say so once, so an operator
+  // who expects a warm child knows why they still get a cold one. A fork run is
+  // exempt: its engineConfig carries the per-run 50 ms pin, not this value.
+  const requestedWarmIdleMs = configuredWarmHandleIdleMs(ctx.config);
+  if (requestedWarmIdleMs > 0 && directive.kind !== "fork") {
     await ctx.onEvent?.({
-      eventType: "run.system", stream: "system", level: "warn",
-      message: `omp warm-handle reuse pinned to 0 for this run: run identity is enabled and the engine keeps the spawning run's PAPERCLIP_API_KEY in a reused child, so a warm hit would authenticate this run's work as an earlier run; remove warmHandleIdleMs to stop this warning`,
+      eventType: "run.system", stream: "system", level: "info",
+      message: `omp warm-handle idle window ${requestedWarmIdleMs}ms is honoured, but this run carries a run-scoped credential, so the engine's settlement gate discards the handle instead of reusing it (close-and-relaunch); remove warmHandleIdleMs to stop this note`,
     });
   }
 

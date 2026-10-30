@@ -1,5 +1,11 @@
 import type { AdapterExecutionResult } from "@paperclipai/adapter-utils";
 
+/**
+ * The engine's error taxonomy. The package declares the union on the result
+ * but does not re-export the name, so derive it from the field it types.
+ */
+type AdapterExecutionErrorFamily = NonNullable<AdapterExecutionResult["errorFamily"]>;
+
 export interface RetryConfig {
   enabled: boolean;
   freshRetries: number;
@@ -70,8 +76,36 @@ export function isRestoreModelFailure(
     .some((text) => RESTORE_MODEL_PATTERN.test(text));
 }
 
+/**
+ * The engine's own error taxonomy, as its classification sets it on the
+ * result. A fresh session can only help when the failure was the context:
+ * a configuration error, a provider refusal and an auth family all survive a
+ * new session, and retrying them only burns tokens. `provider_quota` is
+ * retryable in principle — the window resets — so the timestamp decides.
+ */
+const FAMILY_RETRYABLE: Record<AdapterExecutionErrorFamily, boolean> = {
+  transient_upstream: true,
+  provider_quota: true,
+  configuration: false,
+  model_refusal: false,
+  refresh_token_reused: false,
+  refresh_token_expired: false,
+  refresh_token_invalidated: false,
+};
+
+/** The engine's "do not retry before" instruction, when it is still ahead. */
+function retryNotBeforeIsFuture(retryNotBefore: string | null | undefined, now: number): boolean {
+  if (typeof retryNotBefore !== "string" || retryNotBefore.trim() === "") return false;
+  const at = Date.parse(retryNotBefore);
+  return Number.isFinite(at) && at > now;
+}
+
 export function isTerminalRetryable(
-  result: Pick<AdapterExecutionResult, "errorCode" | "errorMessage" | "errorMeta">,
+  result: Pick<
+    AdapterExecutionResult,
+    "errorCode" | "errorMessage" | "errorMeta" | "errorFamily" | "retryNotBefore"
+  >,
+  now: number = Date.now(),
 ): boolean {
   const code = result.errorCode ?? null;
   if (!code) return false;
@@ -84,6 +118,12 @@ export function isTerminalRetryable(
   if (code === "acpx_session_init_failed") return isRestoreModelFailure(result);
   if (code === "acpx_backend_missing") return false;
   if (code === "acpx_backend_unavailable") return false;
+  // The engine's classification is the most specific read of the failure: it
+  // saw the provider text before redaction. Its timestamp outranks the family
+  // (a quota window is a time, not a verdict) and the code table below.
+  if (retryNotBeforeIsFuture(result.retryNotBefore, now)) return false;
+  const family = result.errorFamily ?? null;
+  if (family !== null && family in FAMILY_RETRYABLE) return FAMILY_RETRYABLE[family];
   // An explicit engine retryable flag overrides the code-based default.
   if (errorMeta.retryable === false) return false;
   if (errorMeta.retryable === true) return true;

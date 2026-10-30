@@ -78,6 +78,71 @@ describe("isTerminalRetryable", () => {
   });
 });
 
+describe("isTerminalRetryable — engine classification", () => {
+  const NOW = Date.parse("2026-10-30T12:00:00Z");
+
+  it("retries a transient upstream family the code table does not know", () => {
+    expect(isTerminalRetryable({
+      errorCode: "acpx_unknown_failure", errorFamily: "transient_upstream",
+    }, NOW)).toBe(true);
+  });
+
+  it("does not retry a configuration family", () => {
+    expect(isTerminalRetryable({
+      errorCode: "acpx_turn_failed", errorFamily: "configuration",
+    }, NOW)).toBe(false);
+  });
+
+  it("does not retry a provider quota before its retryNotBefore", () => {
+    expect(isTerminalRetryable({
+      errorCode: "acpx_turn_failed",
+      errorFamily: "provider_quota",
+      retryNotBefore: "2026-10-30T12:05:00Z",
+    }, NOW)).toBe(false);
+  });
+
+  it("retries a provider quota once retryNotBefore has passed", () => {
+    expect(isTerminalRetryable({
+      errorCode: "acpx_turn_failed",
+      errorFamily: "provider_quota",
+      retryNotBefore: "2026-10-30T11:59:00Z",
+    }, NOW)).toBe(true);
+  });
+
+  it("does not retry a model refusal", () => {
+    expect(isTerminalRetryable({
+      errorCode: "acpx_turn_failed", errorFamily: "model_refusal",
+    }, NOW)).toBe(false);
+  });
+
+  it("does not retry a refresh-token family", () => {
+    for (const errorFamily of ["refresh_token_reused", "refresh_token_expired", "refresh_token_invalidated"] as const) {
+      expect(isTerminalRetryable({ errorCode: "acpx_turn_failed", errorFamily }, NOW)).toBe(false);
+    }
+  });
+
+  it("vetoes a retryable code while the engine's retryNotBefore is still in the future", () => {
+    expect(isTerminalRetryable({
+      errorCode: "acpx_turn_failed", retryNotBefore: "2026-10-30T12:05:00Z",
+    }, NOW)).toBe(false);
+    expect(isTerminalRetryable({
+      errorCode: "acpx_turn_failed", retryNotBefore: "2026-10-30T11:00:00Z",
+    }, NOW)).toBe(true);
+  });
+
+  it("ignores an unparsable retryNotBefore rather than refusing every retry", () => {
+    expect(isTerminalRetryable({
+      errorCode: "acpx_turn_failed", retryNotBefore: "soon",
+    }, NOW)).toBe(true);
+  });
+
+  it("keeps the hard exclusions ahead of a retryable family", () => {
+    expect(isTerminalRetryable({
+      errorCode: "acpx_auth_required", errorFamily: "transient_upstream",
+    }, NOW)).toBe(false);
+  });
+});
+
 describe("forceFreshSession", () => {
   it("adds a retry-marker env var that busts the session fingerprint", () => {
     const fresh = forceFreshSession({}, 0);
