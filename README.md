@@ -56,6 +56,7 @@ Hot-registers — no service restart needed (`requiresRestart` only on reinstall
 | `timeoutSec` / `graceSec` | `0` / `15` | run timeout / SIGTERM grace (the engine default; the adapter forwards an explicit value) |
 | `stateDir`, `instructionsFilePath`, `cwd`, `env` | unset | passed through to the engine |
 | `sessionScope` | `"shared"` | `shared` = omp's host agent dir (every employee on the host shares sessions). `isolated` requires `credentialMode: broker`, fences the agent dir per employee, and fails fast otherwise |
+| `executionMode` | `"engine"` | `engine` = today's ACPX-engine path. `managed` = the per-instance `omp-host` supervisor runs an RPC worker (warm reuse, host tools, ledger). Opt-in; `engine` is the rollback |
 | `thinking` | *(omp default)* | `off`, `auto`, `minimal`…`max`; applied through a settings overlay. Changing it on an existing session costs one rotation (omp keeps a resumed transcript's stored level) |
 | `fallbackChain` | unset | per-agent model fallback chain (`retry.fallbackChains.default`) |
 | `fallbackOn` / `fallbackRevertPolicy` / `waitForUsageReset` / `maxDelayMs` | `any` / `cooldown-expiry` / `false` / unset | failover trigger, revert policy, authorize long usage-reset waits, backoff ceiling |

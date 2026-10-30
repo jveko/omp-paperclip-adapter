@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.12.0 — 2026-10-30
+
+The managed lane. A per-instance host supervisor now owns `omp` processes, sessions and evidence; the
+adapter can run heartbeats through it instead of spawning through Paperclip's ACPX engine. **Default is
+still `executionMode: "engine"`** — managed is opt-in per agent, and engine mode is the rollback.
+
+- **Supervisor (`omp-host`)** — one per Paperclip instance root, lazily spawned, lock-guarded, idle-exit
+  after 30 min. Unix socket (dir 0700, socket 0600, token in the name, stale takeover by pid + start
+  identity), JSONL protocol `v1` (`hello`, `run.begin|heartbeat|cancel|status`, `run.accepted|event|settled`,
+  `probe`, `shutdown`), `maxWorkers` 8 with capacity refusal, per-run session lease, run lease heartbeat
+  (TTL/3; first miss aborts, second kills the group), 30 s drain, reconciliation on start. CLI:
+  `omp-host serve|status|stop|gc|ledger tail`; ships as `dist/omp-host.js`.
+- **Run ledger** — append-only JSONL with fsync-before-ack, last-record-per-run compaction, truncated-tail
+  tolerance, and enforced invariants (one open `prompting` per session key; `settled` names a stop reason
+  and `agentInvoked`; credential/prompt/argument keys refused at any depth).
+- **RPC run worker** — `omp --mode rpc` in its own process group; chunked-frame reassembly; `open_session`
+  resume with a `new_session` fallback when the stored session cannot be opened (workspace move); settlement
+  only on `prompt_result.sessionSettled` / `session_settled`; worker exit classified `lost/worker_exit`
+  with `executionRecovery` only after a turn started.
+- **Warm reuse** — one worker per `(company, agent, cwd, sessionKey)`; a reused worker is retired when its
+  argv hash, bridge hash, agent dir, omp version or cwd changes. Acceptance (opt-in 60 s test): two
+  heartbeats a minute apart → one worker, one `open_session`, zero `new_session`; `kill -9` mid-run leaves
+  no orphan and exactly one `lost/host_exit`.
+- **Credentials** — the run JWT moves to `run-context/<workerId>/<runId>.json` (0600, atomically replaced
+  pointer) and is read per call by the bridge; it is stripped from the worker env twice. Connection tools
+  are answered by the supervisor as an MCP client behind omp host tools, so the bearer never enters the
+  worker. Provider credentials stay worker-env by design.
+- **Steering** — `steering: "off" | "on"` (default off) reaches a running turn over RPC.
+
+Honest limits: managed is opt-in and disabled by default; the ledger is not yet read by the session-panel
+plugin; `sessionScope: isolated` still requires broker credentials; the supervisor is not a systemd unit —
+it is spawned by the adapter and disappears when idle.
+
 ## 0.11.0 — 2026-10-30
 
 Internal seams. No user-visible change: same env names, event types, error codes, warning text and

@@ -28,8 +28,8 @@ v1.0 cut**.
 
 | Release | Lands | Gate |
 |---|---|---|
-| v0.11 | four behaviour-preserving cuts (ACP client extraction, side-channel port, one overlay writer, executor split) + `omp-host` skeleton behind `executionMode: "engine"` | identical behaviour, cycles 0, largest file ≤300 |
-| v0.12 | managed default for new agents: RPC worker with warm reuse, host-tool delivery, run ledger + run lease | two heartbeats → one worker, one `open_session`; `kill -9` leaves no orphan |
+| v0.11 | **shipped in 0.11.0**: four behaviour-preserving cuts (ACP client extraction, side-channel port, one overlay writer, executor split) | identical behaviour, cycles 0, largest file ≤300 |
+| v0.12 | **shipped in 0.12.0** (opt-in): supervisor, RPC worker with warm reuse, host-tool delivery, run ledger + run lease, steering flag; `engine` remains the default | two heartbeats → one worker, one `open_session`; `kill -9` leaves no orphan |
 | v0.13 | steering, subagent surface, engine lane demoted (deprecation event), compensations deleted | `acpx-engine` confined to one file |
 | v0.14 | adapter-utils reduced to `server-utils` + types, conformance harness in CI, capability probes replace the version pin | `grep acpx-engine src/` empty on the default path |
 
@@ -306,6 +306,13 @@ covered by tests.
 *Historical entries are preserved as written. Where an entry states a blocker that the
 2026-10-30 assessment resolved (for example the "resume fingerprint instability"), the
 assessment above supersedes it.*
+
+- **2026-10-30 — v0.12.0 (Managed lane).** Per-instance `omp-host` supervisor (Unix-socket JSONL v1,
+  ledger, run lease, capacity, reconciliation, CLI + `dist/omp-host.js`), RPC run worker with warm reuse
+  per `(company, agent, cwd, sessionKey)`, run JWT moved to a 0600 run-context file and stripped from the
+  worker env, connection tools answered by the supervisor as an MCP client, steering behind a flag.
+  `executionMode: "engine"` stays the default and the rollback. 745 tests + an opt-in 60 s warm test;
+  `kill -9` leaves no orphan and one `lost/host_exit`.
 
 - **2026-10-30 — v0.11.0 (Seams).** Four behaviour-preserving cuts: ACP client extracted
   (`adapters/acp/client.ts`, cycle gone), side-channel port, one overlay writer, executor split into
