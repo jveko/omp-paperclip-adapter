@@ -40,16 +40,32 @@ function legacyAgentDir(operatorAgentDir: string): string {
   return path.join(configRoot, "agent");
 }
 
-async function firstExistingConfigFile(agentDir: string): Promise<string | null> {
+/** `code` from a Node fs error, without asserting the error's shape. */
+function fsErrorCode(err: unknown): string | undefined {
+  return typeof err === "object" && err !== null && "code" in err && typeof err.code === "string"
+    ? err.code
+    : undefined;
+}
+
+/**
+ * The operator's omp config file in the shared agent dir, if there is one.
+ * Absent is normal (a fresh install); unreadable is NOT absent — the fenced run
+ * would silently lose providers and model roles, so the caller must warn.
+ */
+async function findConfigFile(
+  agentDir: string,
+): Promise<{ path: string | null; error?: string }> {
   for (const name of CONFIG_FILE_NAMES) {
     const candidate = path.join(agentDir, name);
     try {
-      if ((await stat(candidate)).isFile()) return candidate;
-    } catch {
-      /* absent: try the next name */
+      if ((await stat(candidate)).isFile()) return { path: candidate };
+    } catch (err) {
+      const code = fsErrorCode(err);
+      if (code === "ENOENT" || code === "ENOTDIR") continue;
+      return { path: null, error: `${candidate} could not be inspected (${code ?? String(err)})` };
     }
   }
-  return null;
+  return { path: null };
 }
 
 /**
@@ -103,10 +119,15 @@ export async function prepareSessionScope(
   // drop providers, model roles and auth-broker routing. Lowest precedence, so
   // the operator's own PI_CONFIG_FILES, the failover chain and the governance
   // overlay all still win.
-  const legacyConfig = await firstExistingConfigFile(legacyAgentDir(configuredAgentDir));
-  if (legacyConfig) {
+  const legacyConfig = await findConfigFile(legacyAgentDir(configuredAgentDir));
+  if (legacyConfig.error) {
+    warnings.push(
+      `sessionScope is 'isolated': the shared agent dir's omp config could not be read (${legacyConfig.error}), so this run starts without it — providers and model roles defined there will not apply`,
+    );
+  }
+  if (legacyConfig.path) {
     const existing = str(env.PI_CONFIG_FILES);
-    env.PI_CONFIG_FILES = [legacyConfig, existing].filter(Boolean).join(path.delimiter);
+    env.PI_CONFIG_FILES = [legacyConfig.path, existing].filter(Boolean).join(path.delimiter);
   }
   env.PI_CODING_AGENT_DIR = agentDir;
   return { ok: true, prepared: { scope: "isolated", agentDir, config: { ...config, env }, warnings } };

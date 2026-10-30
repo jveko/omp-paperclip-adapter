@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { evaluateOtlpCheck, evaluateSessionScopeCheck } from "./test.js";
+import { evaluateOtlpCheck, evaluateSessionListCheck, evaluateSessionScopeCheck } from "./test.js";
 import { validateSessionScope } from "./session-directives.js";
 
 describe("evaluateOtlpCheck", () => {
@@ -53,5 +53,19 @@ describe("evaluateSessionScopeCheck", () => {
     expect(check.level).toBe("info");
     expect(check.code).toBe("omp_sessions_isolated");
     expect(check.message).toContain("omp-agent");
+  });
+});
+
+describe("evaluateSessionListCheck", () => {
+  it("reports the capability the snapshot read depends on", () => {
+    const check = evaluateSessionListCheck(true);
+    expect(check.level).toBe("info");
+    expect(check.code).toBe("omp_session_list_supported");
+  });
+  it("warns that the snapshot is skipped on an omp without session/list", () => {
+    const check = evaluateSessionListCheck(false);
+    expect(check.level).toBe("warn");
+    expect(check.code).toBe("omp_session_list_unsupported");
+    expect(check.message).toContain("skipped");
   });
 });

@@ -18,7 +18,7 @@ const mocks = vi.hoisted(() => ({
   forkOmpSession: vi.fn(async () => ({ ok: true, sessionId: "fork-1" })),
   queryOmpSessions: vi.fn(async () => ({
     ok: true,
-    snapshot: { projects: [], sessions: [], total: 0, byCwd: [] },
+    snapshot: { projects: [], sessions: [], total: 0, truncated: false },
   })),
   createAcpxEngineExecutor: vi.fn(),
 }));

@@ -58,6 +58,27 @@ export function evaluateSessionScopeCheck(
   };
 }
 
+/**
+ * Report whether this omp build can serve the session snapshot. The snapshot
+ * read uses ACP `session/list` with no host-wide fallback (by design — see
+ * queryOmpSessions), so a build without that surface produces no card at all
+ * and the environment test is the only place that can say why.
+ */
+export function evaluateSessionListCheck(supportsSessionList: boolean): AdapterEnvironmentCheck {
+  return supportsSessionList
+    ? {
+        level: "info",
+        code: "omp_session_list_supported",
+        message: "ACP session/list available: the session snapshot stays scoped to this agent's workspace",
+      }
+    : {
+        level: "warn",
+        code: "omp_session_list_unsupported",
+        message: "this omp build does not advertise ACP session/list; the session snapshot work product will be skipped rather than widened to a host-wide listing",
+        detail: "Upgrade omp, or accept no session browser for this agent.",
+      };
+}
+
 export function evaluateOtlpCheck(env: Record<string, unknown>): AdapterEnvironmentCheck {
   const signals = ["", "TRACES_", "LOGS_", "METRICS_"] as const;
   const endpoints = signals
@@ -167,6 +188,8 @@ export async function testEnvironment(
       message: "ACP initialize+session/new OK",
       detail: probe.currentModel ? `active model: ${probe.currentModel}` : undefined,
     });
+    // Only a completed handshake can report the advertised capabilities.
+    checks.push(evaluateSessionListCheck(probe.supportsSessionList === true));
   } else {
     checks.push({
       level: "error",

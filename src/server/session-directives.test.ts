@@ -193,7 +193,7 @@ describe("buildSessionSnapshotWorkProduct", () => {
           { sessionId: "sess-b", cwd: "/w", title: "Second", updatedAt: "2026-08-28T01:00:00Z", messageCount: 1, size: 40 },
           { sessionId: "sess-a", cwd: "/w", title: "First", updatedAt: "2026-08-28T00:00:00Z", messageCount: 3, size: 120 },
         ],
-        total: 2, byCwd: [],
+        total: 2, truncated: false,
       },
       { currentSessionId: "sess-b", runId: "run-1", capturedAt: "2026-08-28T02:00:00Z" },
     );
@@ -206,7 +206,7 @@ describe("buildSessionSnapshotWorkProduct", () => {
   });
   it("carries subagents into metadata only when the snapshot has them", () => {
     const base = {
-      projects: [], sessions: [], total: 0, byCwd: [],
+      projects: [], sessions: [], total: 0, truncated: false,
     };
     const context = { currentSessionId: null, runId: "run-1", capturedAt: "2026-08-28T02:00:00Z" };
     const withSubagents = buildSessionSnapshotWorkProduct(
@@ -228,18 +228,30 @@ describe("buildSessionSnapshotWorkProduct", () => {
       {
         projects: [],
         sessions: [{ sessionId: "sess-1", cwd: "/w", title: "Bad", updatedAt: "never", messageCount: 1, size: 1 }],
-        total: 1, byCwd: [],
+        total: 1, truncated: false,
       },
       { currentSessionId: null, runId: "run-1", capturedAt: "2026-08-28T02:00:00Z" },
     );
     expect(wp.summary).toContain("unknown time");
+  });
+  it("renders a paged listing as a lower bound, not a complete count", () => {
+    const wp = buildSessionSnapshotWorkProduct(
+      {
+        projects: [],
+        sessions: [{ sessionId: "sess-1", cwd: "/w", title: "T", updatedAt: "2026-08-28T01:00:00Z", messageCount: 1, size: 1 }],
+        total: null, truncated: true,
+      },
+      { currentSessionId: null, runId: "run-1", capturedAt: "2026-08-28T02:00:00Z" },
+    );
+    expect(wp.title).toContain("1+ sessions");
+    expect(wp.metadata).toMatchObject({ total: null, truncated: true });
   });
   it("truncates ids longer than 12 characters and leaves 12-character ids intact", () => {
     const wp = buildSessionSnapshotWorkProduct(
       {
         projects: [],
         sessions: [{ sessionId: "1234567890123", cwd: "/w", title: "T", updatedAt: "2026-08-28T01:00:00Z", messageCount: 1, size: 1 }],
-        total: 1, byCwd: [],
+        total: 1, truncated: false,
       },
       { currentSessionId: "123456789012", runId: "run-1", capturedAt: "2026-08-28T02:00:00Z" },
     );

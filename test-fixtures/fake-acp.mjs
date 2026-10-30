@@ -36,7 +36,7 @@ rl.on("line", (line) => {
       protocolVersion: mode === "badversion" ? 99 : 1,
       agentInfo: { name: "fake-acp", title: "Fake", version: "0.0.1" },
       authMethods: [{ id: "agent", name: "agent" }],
-      agentCapabilities: { sessionCapabilities: { list: {} } },
+      agentCapabilities: mode === "nolist" ? {} : { sessionCapabilities: { list: {} } },
     } });
   } else if (msg.method === "session/list") {
     // ACP session/list: cwd-scoped when the client passes one, paged at 50 by

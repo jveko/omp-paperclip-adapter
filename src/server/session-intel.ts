@@ -37,10 +37,12 @@ export interface OmpSessionsSnapshot {
   /** omp paged the listing (session/list page size 50): more sessions exist. */
   truncated: boolean;
   /**
-   * Subagents spawned by this run's session, present only under the operator
-   * diagnostic switch. omp's ACP mode has no subagent bridge today (see
-   * docs/upstream/omp-acp-subagent-bridge.md), so in practice this is absent;
-   * an empty array means the method answered and the tree is empty.
+   * Subagents spawned by this run's session, present when omp answers
+   * `_omp/subagents` — the probe rides every query, not the diagnostic switch,
+   * because it describes this run rather than the host. omp's ACP mode has no
+   * subagent bridge today (see docs/upstream/omp-acp-subagent-bridge.md), so in
+   * practice this is absent; an empty array means the method answered and the
+   * tree is empty.
    */
   subagents?: OmpSubagentInfo[];
 }

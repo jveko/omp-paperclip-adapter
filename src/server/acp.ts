@@ -289,6 +289,8 @@ export interface OmpAcpProbeResult {
   ok: boolean;
   protocolVersion?: number;
   currentModel?: string;
+  /** The build advertises ACP `session/list`, the read the snapshot depends on. */
+  supportsSessionList?: boolean;
   error?: string;
 }
 
@@ -422,6 +424,23 @@ export function driveAcpSession(
   });
 }
 
+/**
+ * Whether the agent's initialize result advertises ACP `session/list`. The
+ * snapshot read has no host-wide fallback by design (see `queryOmpSessions`),
+ * so an omp build without it silently produces no session-snapshot card — the
+ * environment test is the only place that can say so up front. Unknown shape
+ * counts as absent.
+ */
+function advertisesSessionList(initializeInfo: Record<string, unknown> | undefined): boolean {
+  if (!initializeInfo || !("agentCapabilities" in initializeInfo)) return false;
+  const capabilities = initializeInfo.agentCapabilities;
+  if (typeof capabilities !== "object" || capabilities === null) return false;
+  if (!("sessionCapabilities" in capabilities)) return false;
+  const sessionCapabilities = capabilities.sessionCapabilities;
+  if (typeof sessionCapabilities !== "object" || sessionCapabilities === null) return false;
+  return "list" in sessionCapabilities && sessionCapabilities.list !== null;
+}
+
 export function probeOmpAcpSession(
   omp: { command: string; args?: string[]; env?: Record<string, string> },
   timeoutMs = 10_000,
@@ -429,9 +448,14 @@ export function probeOmpAcpSession(
   return driveAcpSession(omp, [
     { method: "session/new", params: { cwd: process.cwd(), mcpServers: [] } },
   ], timeoutMs).then((drive): OmpAcpProbeResult => {
-    if (!drive.ok) return { ok: false, protocolVersion: drive.protocolVersion, error: drive.error };
+    const supportsSessionList = advertisesSessionList(drive.initializeInfo);
+    if (!drive.ok) {
+      return { ok: false, protocolVersion: drive.protocolVersion, supportsSessionList, error: drive.error };
+    }
     const response = drive.responses[0];
-    if (response?.error) return { ok: false, error: `ACP error on request id ${response.id}: ${response.error.message}` };
+    if (response?.error) {
+      return { ok: false, supportsSessionList, error: `ACP error on request id ${response.id}: ${response.error.message}` };
+    }
     const options = Array.isArray(response?.result?.configOptions)
       ? (response.result?.configOptions as Array<Record<string, unknown>>)
       : [];
@@ -440,6 +464,7 @@ export function probeOmpAcpSession(
       ok: true,
       protocolVersion: 1,
       currentModel: typeof model?.currentValue === "string" ? model.currentValue : undefined,
+      supportsSessionList,
     };
   });
 }
@@ -980,7 +1005,7 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
           // diagnostic cannot become a cross-tenant browser.
           message: host.error
             ? `omp host-wide listing diagnostic failed: ${host.error}`
-            : `omp host-wide listing (diagnostic): ${host.sessionCount ?? "?"} sessions across ${host.projectCount ?? "?"} projects on this host — ids, cwds and titles withheld; set sessionScope 'isolated' to stop sharing them`,
+            : `omp host-wide listing (diagnostic, sessionScope '${sessionScope}'): ${host.sessionCount ?? "?"} sessions across ${host.projectCount ?? "?"} projects visible to ${sessionScope === "isolated" ? "this agent's own omp agent dir" : "every omp agent on this host"} — ids, cwds and titles withheld`,
         });
       }
       if (query.ok) {

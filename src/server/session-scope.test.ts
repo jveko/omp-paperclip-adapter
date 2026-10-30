@@ -1,6 +1,6 @@
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp, mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
 import { ompAgentDir } from "./session-state.js";
@@ -120,5 +120,20 @@ describe("prepareSessionScope", () => {
     );
     expect(out.ok).toBe(false);
     if (!out.ok) expect(out.error).toContain("could not be resolved");
+  });
+
+  it("warns instead of silently dropping an unreadable operator config", async () => {
+    const legacyConfig = path.join(tmpRoot, "omp-config", "agent", "config.yml");
+    await mkdir(path.dirname(legacyConfig), { recursive: true });
+    // A self-referential symlink makes stat fail with ELOOP, not ENOENT.
+    await symlink(legacyConfig, legacyConfig);
+    const out = await prepareSessionScope(
+      { sessionScope: "isolated", credentialMode: "broker", env: {} },
+      { companyId: "co-1", agentId: "agent-1" },
+    );
+    if (!out.ok) throw new Error(out.error);
+    expect(out.prepared.config.env).not.toHaveProperty("PI_CONFIG_FILES");
+    expect(out.prepared.warnings).toHaveLength(1);
+    expect(out.prepared.warnings[0]).toContain("could not be read");
   });
 });

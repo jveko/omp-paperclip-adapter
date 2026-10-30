@@ -1758,4 +1758,38 @@ describe("session scope fence", () => {
     }));
     expect(events.some((e) => e.message?.includes("host-wide listing"))).toBe(false);
   });
+
+  it("warns once when the scope flips back to shared", async () => {
+    const events: Array<{ level?: string; message?: string }> = [];
+    const onEvent = async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); };
+    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    await createOmpAcpExecutor()(baseCtx({ config: { command: `${process.execPath} ${fakeAcp}` } }));
+    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "new", sessionKey: "sk-new" } });
+    await createOmpAcpExecutor()(scopedCtx({ onEvent }));
+    events.length = 0;
+    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "newer", sessionKey: "sk-newer" } });
+    await createOmpAcpExecutor()(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}` }, onEvent,
+    }));
+    const flips = events.filter((e) => e.message?.includes("sessionScope switched to 'shared'"));
+    expect(flips).toHaveLength(1);
+    expect(flips[0].message).toContain("the host-wide omp agent dir");
+  });
+});
+
+describe("probeOmpAcpSession session/list capability", () => {
+  it("reports the capability the snapshot read depends on", async () => {
+    const probe = await probeOmpAcpSession({ command: process.execPath, args: [fakeAcp] });
+    expect(probe.ok).toBe(true);
+    expect(probe.supportsSessionList).toBe(true);
+  }, 15_000);
+  it("reports absence on a build that does not advertise it", async () => {
+    const probe = await probeOmpAcpSession(
+      { command: process.execPath, args: [fakeAcp], env: { FAKE_ACP_MODE: "nolist" } },
+    );
+    expect(probe.ok).toBe(true);
+    expect(probe.supportsSessionList).toBe(false);
+  }, 15_000);
+
+
 });
