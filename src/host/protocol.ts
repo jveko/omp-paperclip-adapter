@@ -1,0 +1,372 @@
+import type { AdapterExecutionResult } from "@paperclipai/adapter-utils";
+
+/**
+ * The adapter ↔ supervisor wire format (reshape-architecture.md §3.3).
+ *
+ * One JSON object per line, `id`-correlated, `v: 1`. The adapter is the client;
+ * the supervisor is the server on a Unix socket. `run.settled` is the only
+ * terminal frame for a run — a refusal or a failure is a settled result with an
+ * `errorCode`, so a caller never has two terminal paths to await.
+ *
+ * Nothing in this module does I/O. The field names are the contract every other
+ * host module reads, and the ledger copies them by name.
+ */
+
+export const HOST_PROTOCOL_VERSION = 1;
+
+/** The run's state machine, as journaled. */
+export type LedgerState =
+  | "leased"
+  | "worker_ready"
+  | "session_open"
+  | "prompting"
+  | "settled"
+  | "closed"
+  | "refused"
+  | "lost";
+
+/** Why a run left the happy path; `settled` records carry the stop reason instead. */
+export type LedgerCause =
+  | "clean"
+  | "worker_exit"
+  | "host_exit"
+  | "adapter_gone"
+  | "cancel"
+  | "timeout"
+  | "lease_held"
+  | "config_error"
+  | "capacity";
+
+/** The exact process the host must run. Env never carries the run JWT. */
+export interface WorkerSpec {
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+}
+
+/**
+ * The worker's reuse identity. The host compares these values (plus cwd, the
+ * agent dir and the omp version it observes) before it reuses a warm worker;
+ * a mismatch retires the worker and spawns a new one.
+ */
+export interface Cell {
+  argvHash: string;
+  bridgeHash: string;
+  agentDir: string | null;
+  model: string | null;
+  thinking: string | null;
+  approval: string | null;
+}
+
+/**
+ * Per-run Paperclip credentials. This object is written to the run-context file
+ * (0600) and is NEVER placed in a worker env or a ledger record.
+ */
+export interface Credentials {
+  apiUrl: string;
+  apiKey: string;
+  companyId: string;
+  taskId: string | null;
+  issueId: string | null;
+}
+
+/** The run's connection-tools access, held by the host (never the worker). */
+export interface ConnectionTools {
+  endpoint: string;
+  bearerToken: string;
+  expiresAt: string | null;
+  tools: string[];
+}
+
+/** Manifest paths the bridge reads; stable across runs for one agent. */
+export interface Manifests {
+  skills: string | null;
+  governance: string | null;
+  budget: string | null;
+  failover: string | null;
+  thinking: string | null;
+}
+
+export interface Limits {
+  /** The adapter's wall clock bound, or null for none. */
+  timeoutMs: number | null;
+  /** The adapter promises a heartbeat at least this often; the host refuses silence. */
+  runLeaseTtlMs: number;
+}
+
+export interface WorkerIdentity {
+  pid: number;
+  pgid: number | null;
+  startedAt: string;
+}
+
+export interface HelloFrame {
+  id: string;
+  type: "hello";
+  v: typeof HOST_PROTOCOL_VERSION;
+  instanceId: string;
+  adapterVersion: string;
+}
+
+export interface RunBeginFrame {
+  id: string;
+  type: "run.begin";
+  runId: string;
+  agent: { id: string; companyId: string };
+  sessionKey: string;
+  cwd: string;
+  /** The omp session this run wants to resume, if any. */
+  session: { ompSessionId: string | null };
+  cell: Cell;
+  worker: WorkerSpec;
+  /** The rendered Paperclip prompt. Content: never journaled, never logged. */
+  prompt: string;
+  credentials: Credentials;
+  connectionTools?: ConnectionTools | null;
+  manifests: Manifests;
+  limits: Limits;
+}
+
+export interface RunHeartbeatFrame {
+  id: string;
+  type: "run.heartbeat";
+  runId: string;
+}
+
+export interface RunCancelFrame {
+  id: string;
+  type: "run.cancel";
+  runId: string;
+  reason: "operator" | "timeout" | "shutdown";
+}
+
+export interface RunStatusFrame {
+  id: string;
+  type: "run.status";
+  runId: string;
+}
+
+export interface ProbeFrame {
+  id: string;
+  type: "probe";
+  kind: "capabilities" | "models" | "sessions" | "fork";
+  payload?: Record<string, unknown>;
+}
+
+export interface ShutdownFrame {
+  id: string;
+  type: "shutdown";
+  reason?: string;
+}
+
+export type HostFrame =
+  | HelloFrame
+  | RunBeginFrame
+  | RunHeartbeatFrame
+  | RunCancelFrame
+  | RunStatusFrame
+  | ProbeFrame
+  | ShutdownFrame;
+
+export interface HelloOkFrame {
+  type: "hello_ok";
+  hostVersion: string;
+  hostPid: number;
+  epoch: string;
+  workers: number;
+}
+
+export interface RunAcceptedFrame {
+  type: "run.accepted";
+  /** Echo of the `run.begin` id. */
+  id: string;
+  runId: string;
+  worker: WorkerIdentity;
+  reusedWorker: boolean;
+  sessionOpening: "new" | "open";
+  ompSessionId: string;
+  runContextPath: string;
+}
+
+/** The event vocabulary the adapter maps onto its own sinks. */
+export type RunEventKind = "acpx.tool_call" | "run.system" | "omp.turn" | "omp.usage";
+
+export interface RunEventFrame {
+  type: "run.event";
+  runId: string;
+  /** Monotonic per run; the adapter drops a frame at or below the last seq it saw. */
+  seq: number;
+  at: string;
+  kind: RunEventKind;
+  payload: Record<string, unknown>;
+}
+
+export interface RunSettledFrame {
+  type: "run.settled";
+  runId: string;
+  /** A finished result; error classification stays the adapter's job. */
+  result: AdapterExecutionResult;
+}
+
+export interface RunStatusResultFrame {
+  type: "run.status.result";
+  id: string;
+  runId: string;
+  state: LedgerState;
+  settled?: AdapterExecutionResult;
+}
+
+export interface ProbeResultFrame {
+  type: "probe.result";
+  id: string;
+  kind: ProbeFrame["kind"];
+  payload: Record<string, unknown>;
+}
+
+export interface HostErrorFrame {
+  type: "error";
+  id?: string;
+  code: string;
+  message: string;
+}
+
+export type HostReply =
+  | HelloOkFrame
+  | RunAcceptedFrame
+  | RunEventFrame
+  | RunSettledFrame
+  | RunStatusResultFrame
+  | ProbeResultFrame
+  | HostErrorFrame;
+
+export function encodeFrame(frame: HostFrame | HostReply): string {
+  return `${JSON.stringify(frame)}\n`;
+}
+
+const COMMAND_TYPES: Record<HostFrame["type"], true> = {
+  hello: true,
+  "run.begin": true,
+  "run.heartbeat": true,
+  "run.cancel": true,
+  "run.status": true,
+  probe: true,
+  shutdown: true,
+};
+
+const REPLY_TYPES: Record<HostReply["type"], true> = {
+  hello_ok: true,
+  "run.accepted": true,
+  "run.event": true,
+  "run.settled": true,
+  "run.status.result": true,
+  "probe.result": true,
+  error: true,
+};
+
+/**
+ * The one object guard this boundary needs: IPC input is untrusted, so every
+ * nested frame is proven an object before a field is read. It narrows to
+ * `Record<string, unknown>`; fields are still checked one by one.
+ */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const isString = (value: unknown): value is string => typeof value === "string";
+
+/**
+ * Shape checks for the frames whose fields the host acts on. A malformed frame
+ * is dropped by the reader (null), never half-applied: the host spawns a
+ * process from `run.begin`, so every field it needs must be a string.
+ */
+function isWellFormed(frame: Record<string, unknown>): boolean {
+  switch (frame.type) {
+    case "hello":
+      return frame.v === HOST_PROTOCOL_VERSION
+        && isString(frame.id) && isString(frame.instanceId) && isString(frame.adapterVersion);
+    case "run.begin": {
+      const worker = frame.worker;
+      return isString(frame.id)
+        && isString(frame.runId)
+        && isString(frame.sessionKey)
+        && isString(frame.cwd)
+        && isString(frame.prompt)
+        && isRecord(frame.agent)
+        && isString(frame.agent.id)
+        && isString(frame.agent.companyId)
+        && isRecord(worker)
+        && isString(worker.command)
+        && Array.isArray(worker.args)
+        && worker.args.every(isString)
+        && isRecord(worker.env)
+        && Object.values(worker.env).every(isString)
+        && isRecord(frame.cell)
+        && isRecord(frame.session)
+        && isRecord(frame.credentials)
+        && isString((frame.credentials as Record<string, unknown>).apiUrl)
+        && isString((frame.credentials as Record<string, unknown>).apiKey)
+        && isRecord(frame.manifests)
+        && isRecord(frame.limits)
+        && typeof (frame.limits as Record<string, unknown>).runLeaseTtlMs === "number";
+    }
+    case "run.heartbeat":
+    case "run.status":
+      return isString(frame.id) && isString(frame.runId);
+    case "run.cancel":
+      return isString(frame.id) && isString(frame.runId)
+        && (frame.reason === "operator" || frame.reason === "timeout" || frame.reason === "shutdown");
+    case "probe":
+      return isString(frame.id)
+        && (frame.kind === "capabilities" || frame.kind === "models"
+          || frame.kind === "sessions" || frame.kind === "fork");
+    case "shutdown":
+      return isString(frame.id);
+    case "hello_ok":
+      return isString(frame.hostVersion) && typeof frame.hostPid === "number"
+        && isString(frame.epoch) && typeof frame.workers === "number";
+    case "run.accepted":
+      return isString(frame.id) && isString(frame.runId) && isRecord(frame.worker)
+        && typeof (frame.worker as Record<string, unknown>).pid === "number"
+        && typeof frame.reusedWorker === "boolean"
+        && (frame.sessionOpening === "new" || frame.sessionOpening === "open")
+        && isString(frame.ompSessionId) && isString(frame.runContextPath);
+    case "run.event":
+      return isString(frame.runId) && typeof frame.seq === "number" && isString(frame.at)
+        && isString(frame.kind) && isRecord(frame.payload);
+    case "run.settled":
+      return isString(frame.runId) && isRecord(frame.result);
+    case "run.status.result":
+      return isString(frame.id) && isString(frame.runId) && isString(frame.state);
+    case "probe.result":
+      return isString(frame.id) && isString(frame.kind) && isRecord(frame.payload);
+    case "error":
+      return isString(frame.code) && isString(frame.message);
+    default:
+      return false;
+  }
+}
+
+/**
+ * Parse one JSONL line into a frame, or null when it is not a well-formed frame
+ * of this protocol. Unknown types and other versions are dropped rather than
+ * coerced: a host that cannot understand a frame must not act on it.
+ */
+export function parseFrame(line: string): HostFrame | HostReply | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (!isRecord(value) || !isString(value.type)) return null;
+  if (!COMMAND_TYPES[value.type as HostFrame["type"]] && !REPLY_TYPES[value.type as HostReply["type"]]) {
+    return null;
+  }
+  if (!isWellFormed(value)) return null;
+  return value as unknown as HostFrame | HostReply;
+}
+
+/** True when the frame is one the adapter sends (the host validates incoming frames). */
+export function isHostFrame(frame: HostFrame | HostReply): frame is HostFrame {
+  return COMMAND_TYPES[frame.type as HostFrame["type"]] === true;
+}
