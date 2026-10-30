@@ -9,6 +9,8 @@ import type {
 import { bridgePath, moduleDir, packageRootDir } from "./adapters/acp/launch.js";
 import { buildRunPlan } from "./run/run-plan.js";
 import { executePlan, type RunTransport } from "./run/execute.js";
+import { createHostTransport } from "./run/host-transport.js";
+import { resolveExecutionMode } from "./session-directives.js";
 
 /**
  * The ACP lane's public surface and composition root.
@@ -39,17 +41,8 @@ export type {
   AcpDriveResult, AcpFrameRequest, AcpFrameResponse, OmpAcpProbeResult,
 } from "./adapters/acp/client.js";
 
-export function resolveOmpBillingIdentity(ctx: Pick<AdapterExecutionContext, "config">): AcpxEngineBillingIdentity {
-  const env = (ctx.config.env ?? {}) as Record<string, unknown>;
-  const raw = String(env.OMP_PAPERCLIP_BILLING_TYPE ?? process.env.OMP_PAPERCLIP_BILLING_TYPE ?? "")
-    .trim()
-    .toLowerCase();
-  return {
-    provider: "oh-my-pi",
-    biller: null,
-    billingType: raw === "api" ? "api" : raw === "subscription" ? "subscription" : "api",
-  };
-}
+import { resolveOmpBillingIdentity } from "./run/billing.js";
+export { resolveOmpBillingIdentity };
 
 type OmpAcpExecutorOptions = Omit<
   AcpxEngineExecutorOptions,
@@ -61,6 +54,8 @@ type OmpAcpExecutorOptions = Omit<
    * availability check (and for an install that relocates `dist`).
    */
   bridgePath?: string;
+  /** `dist/omp-host.js`, resolved by the caller in tests; shipped path by default. */
+  hostScript?: string;
 };
 type OmpAcpExecutor = (ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>;
 
@@ -73,9 +68,12 @@ type OmpAcpExecutor = (ctx: AdapterExecutionContext) => Promise<AdapterExecution
  * run never constructs it and probe-only imports stay cheap.
  */
 export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAcpExecutor {
-  const { bridgePath: bridgeOverride, ...engineOptions } = options;
+  const { bridgePath: bridgeOverride, hostScript, ...engineOptions } = options;
   const bridge = bridgeOverride ?? bridgePath;
   let executor: OmpAcpExecutor | null = null;
+  // The managed lane is created lazily too, and its module graph deliberately
+  // excludes the engine: a managed run must not load acpx-engine at all.
+  let managed: ReturnType<typeof createHostTransport> | null = null;
   const ensureEngine = async (): Promise<OmpAcpExecutor> => {
     if (executor) return executor;
     // Lazy by design: the acpx engine (and its transitive CLI deps) must not
@@ -104,6 +102,13 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
         errorCode: planned.refusal.errorCode,
         errorMessage: planned.refusal.errorMessage,
       };
+    }
+    if (resolveExecutionMode(planned.plan.ctx.config) === "managed") {
+      managed ??= createHostTransport({ bridge, ...(hostScript !== undefined ? { hostScript } : {}) });
+      const hostTransport = managed;
+      const plan = planned.plan;
+      const transport: RunTransport = (merged) => hostTransport(merged, plan);
+      return executePlan(plan, transport);
     }
     const engine = await ensureEngine();
     const transport: RunTransport = (merged) => engine(merged);

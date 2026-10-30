@@ -1,5 +1,6 @@
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { createOmpAcpExecutor } from "./acp.js";
+import { resolveExecutionMode } from "./session-directives.js";
 import { sessionIntelDir } from "./session-state.js";
 import {
   acquireSessionLease, sessionLeaseKey, SESSION_LEASE_TIMEOUT_GRACE_MS,
@@ -23,6 +24,12 @@ function configuredTimeoutMs(config: Record<string, unknown>): number | null {
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+  // The managed lane's session lease belongs to the supervisor: it is the one
+  // process that stays alive across runs and the only reaper, and a second
+  // holder in the adapter would make every managed run refuse its own lease.
+  if (resolveExecutionMode(ctx.config) === "managed") {
+    return executor(ctx);
+  }
   // One writer per omp session file, for the whole call. See session-lease.ts:
   // a second process on the same session does not corrupt it, it silently
   // forks the transcript, so the run is refused instead. A configured timeout

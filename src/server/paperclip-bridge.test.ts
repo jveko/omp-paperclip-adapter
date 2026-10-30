@@ -219,6 +219,7 @@ afterEach(() => {
   delete process.env.PAPERCLIP_API_KEY;
   delete process.env.PAPERCLIP_COMPANY_ID;
   delete process.env.PAPERCLIP_TASK_ID;
+  delete process.env.PAPERCLIP_RUN_CONTEXT;
   vi.useRealTimers();
   vi.unstubAllGlobals();
 });
@@ -1044,6 +1045,45 @@ describe("human approval (advisory tool_call hold)", () => {
       expect(payload.runId).toBeUndefined();
       expect(calls[0].json.runId).toBeUndefined();
     }
+  });
+
+  it("reads the run's credentials from PAPERCLIP_RUN_CONTEXT instead of stale env", async () => {
+    const { pi, cwd } = await approvalFixture({ approvalRequired: [APPROVAL_TOOL] });
+    const dir = await fs.mkdtemp(path.join(tmpdir(), "omp-run-context-"));
+    try {
+      const file = path.join(dir, "current.json");
+      await fs.writeFile(file, JSON.stringify({
+        v: 1,
+        runId: "run-2",
+        credentials: {
+          apiUrl: "http://file.test:9", apiKey: "file-jwt",
+          companyId: "co-file", taskId: "issue-file", issueId: "issue-file",
+        },
+        manifests: {},
+      }), "utf8");
+      process.env.PAPERCLIP_RUN_CONTEXT = file;
+      // The env still names the spawning run's credentials: the file must win.
+      approvalEnv();
+      const calls = recordFetch(() => reply(201, { id: "apr-file" }));
+      const held = await pi.toolCallAsync(APPROVAL_TOOL, { target: "file" }, { cwd });
+      expect(held?.reason).toContain("approval apr-file requested");
+      expect(calls[0].url).toBe("http://file.test:9/api/companies/co-file/approvals");
+      expect(calls[0].headers.authorization).toBe("Bearer file-jwt");
+      expect(calls[0].json.issueIds).toEqual(["issue-file"]);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to env when the run-context file is unreadable", async () => {
+    const { pi, cwd } = await approvalFixture({ approvalRequired: [APPROVAL_TOOL] });
+    process.env.PAPERCLIP_RUN_CONTEXT = path.join(tmpdir(), `missing-${randomUUID()}.json`);
+    approvalEnv();
+    const calls = recordFetch(() => reply(201, { id: "apr-env" }));
+    const held = await pi.toolCallAsync(APPROVAL_TOOL, { target: "env" }, { cwd });
+    expect(held?.reason).toContain("approval apr-env requested");
+    expect(calls[0].url).toBe("http://pb.test:3100/api/companies/co-1/approvals");
+    expect(calls[0].headers.authorization).toBe("Bearer run-jwt");
   });
 
   it("carries the rule's reason and risk and omits issueIds with no task", async () => {

@@ -79,6 +79,31 @@ export function validateSessionScope(config: Record<string, unknown>): string | 
   return null;
 }
 
+/**
+ * Which lane a run executes on.
+ *
+ * `engine` is v0.11's path and the default, so an untouched agent behaves
+ * byte-identically and rollback is one config key. `managed` sends the run to
+ * the instance's omp-host supervisor (this build's opt-in lane). An unknown
+ * value is a config error rather than a silent fallback: the two lanes have
+ * different credential and settlement semantics, and a typo must not pick one.
+ */
+export type ExecutionMode = "engine" | "managed";
+
+export function resolveExecutionMode(config: Record<string, unknown>): ExecutionMode | null {
+  const raw = config.executionMode;
+  if (raw === undefined || raw === null || raw === "") return "engine";
+  if (raw === "engine" || raw === "managed") return raw;
+  return null;
+}
+
+/** Actionable message when `executionMode` is invalid, else null. */
+export function validateExecutionMode(config: Record<string, unknown>): string | null {
+  if (resolveExecutionMode(config) !== null) return null;
+  return `executionMode is '${String(config.executionMode)}' but expected 'engine' or 'managed'. `
+    + "'engine' keeps the v0.11 ACP lane; 'managed' hands the run to this instance's omp-host supervisor.";
+}
+
 export type RunDirective =
   | { kind: "fork"; forkSourceId: string; forkToken: string }
   | { kind: "forceFresh"; token: string }
@@ -257,6 +282,12 @@ export function getSessionConfigSchema(): AdapterConfigSchema {
         hint: `Emit an omp-usage work product with cost estimates. ${NEXT_RUN}` },
       { key: "skillsAsTools", label: "Expose skills as on-demand tools", type: "toggle", default: false,
         hint: `Register each enabled company skill as a native omp tool that returns its instructions on demand, instead of injecting all skill text into the prompt. Reduces context use. ${NEXT_RUN}` },
+      { key: "executionMode", label: "Execution lane", type: "select", default: "engine",
+        options: [
+          { label: "Engine (ACP, v0.11 behaviour)", value: "engine" },
+          { label: "Managed (omp-host supervisor)", value: "managed" },
+        ],
+        hint: `engine runs one 'omp acp' child per heartbeat through the ACP engine and is the rollback lane; managed hands the run to this instance's omp-host supervisor, which owns the omp --mode rpc worker and the run ledger. An unknown value is a config error, not a silent fallback. ${NEXT_RUN}` },
       { key: "governancePolicy", label: "Governance policy (YAML/JSON)", type: "textarea",
         hint: `Rules the run's omp child enforces through the paperclip bridge: guardrails (pathScopes, bashDeny, denyTools, argRevisions), budgetCapUsd, approvedEndpoints, approvalRequired. approvalRequired names tools a human must approve first (a bare tool name or {tool, reason?, risk?}; the name may end in *) — a match posts a board approval and BLOCKS the call: advisory, because approving wakes a NEW run while this one never resumes, and an identical retry in the same session is deduped instead of re-posting. budgetCapUsd is a soft PER-SESSION cap the bridge enforces: each omp session — subagents included — gets its own cap (with N in-process subagents the effective ceiling can be (1+N)×cap), and cost only accumulates across runs while a warm handle is reused (cold children make it per-run by default); past it, mutating tools block and read-only/control tools stay open. The same number is also forwarded to the omp child as its own session cost cap (session.maxCost), which refuses the next model request once the session tree reaches it; an early warning fires at 80% of the cap (the adapter's own heuristic). Adding or clearing the key changes PI_CONFIG_FILES and rotates the session once; changing only the number does not. Empty = off. While set, the run child's own config carries tools.approvalMode: yolo and the bridge is the single gate; a document that cannot be parsed is skipped with a warning rather than run ungoverned. approvedEndpoints is a provider allow-list: the run gets the complement as omp's disabledProviders, so unapproved endpoints are unreachable — while the configured model's provider and any fallbackChain provider are never disabled (a guard that warns rather than strands the run), and routing is skipped with a warning when no catalog is available to compute a safe complement. Adding or clearing the policy rotates the session (fingerprint change), so rule edits land on the next rotation; changing only which endpoints are approved keeps the path stable, so a cold child (the default) picks the new list up next run while a warm handle keeps the old one. restrictedFolders names folders where every call needs a human: the run child gets them as omp's tools.restrictedFolders (a prompt in every approval mode) and the bridge holds the same paths for a board approval, which is the ask a human actually sees under the single gate. yolo is written as a CONFIGURED approval mode, so omp does not ask its own permission proxy for bash/edit/delete/move — the bridge is their only gate; the proxy still answers whatever omp does ask (critical bash, restricted-folder prompts) and auto-allows it under the default approve-all. Because of that, approvalMode 'deny-all' together with pathScopes or argRevisions is rejected at config time. Plan mode is unavailable: plan/planMode/planEnabled/mode: plan/--plan are config errors, since omp auto-approves a plan when the client has no elicitation support. ${NEXT_RUN}` },
     ],

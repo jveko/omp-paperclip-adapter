@@ -34,8 +34,9 @@ import {
   resolveBridgeRunMode, resolveOmpAgentCommand, resolveSessionCwd,
 } from "../adapters/acp/launch.js";
 import {
-  readSessionIntelConfig, resolveRunDirective, thinkingLevelChanged, validateCredentialMode,
-  validatePlanMode, validateSessionScope, validateThinkingLevel,
+  readSessionIntelConfig, resolveExecutionMode, resolveRunDirective, thinkingLevelChanged,
+  validateCredentialMode, validateExecutionMode, validatePlanMode, validateSessionScope,
+  validateThinkingLevel,
   type RunDirective, type SessionIntelConfig, type SessionScope,
 } from "../session-directives.js";
 
@@ -124,6 +125,10 @@ function connectionToolsEndpoint(ctx: AdapterExecutionContext): string | null {
  * one diagnostic that does NOT abort (the append is fail-open).
  */
 async function gateRunConfig(ctx: AdapterExecutionContext): Promise<RunRefusal | null> {
+  // Lane selection comes first: the two lanes differ in credential placement and
+  // settlement semantics, so a typo must be a config error, never a fallback.
+  const modeErr = validateExecutionMode(ctx.config);
+  if (modeErr) return { errorCode: "omp_config_error", errorMessage: modeErr };
   // Fail closed: broker credentialMode demands a resolved broker url+token.
   // Return before any engine work so a misconfigured agent never runs a
   // half-configured session.
@@ -792,6 +797,7 @@ export async function buildRunPlan(
     scopeAgentDir: preparedScope.prepared.agentDir,
     intelDir,
   });
+  const executionMode = resolveExecutionMode(ctx.config) ?? "engine";
   const applied = await applySessionDirective(ctx, {
     directive: session.directive,
     thinkingRotateArmed: session.thinkingRotateArmed,
@@ -808,7 +814,11 @@ export async function buildRunPlan(
       ctx,
       engineConfig: applied.engineConfig,
       runtimeOverride: applied.runtimeOverride,
-      retry: applied.retry,
+      // The fresh-session retry replays a transport call; the managed lane's
+      // idempotent run.begin is per runId, so a second attempt would be answered
+      // from the first attempt's state. The host itself falls back to a fresh
+      // session when a resume cannot be opened.
+      retry: executionMode === "managed" ? { enabled: false, freshRetries: 0 } : applied.retry,
       overlays,
       directive: session.directive,
       intel: session.intel,

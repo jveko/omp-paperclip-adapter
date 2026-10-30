@@ -645,6 +645,44 @@ function canonicalJson(value: unknown): string {
   return "null";
 }
 
+/**
+ * The run's Paperclip credentials, read FRESH on every call.
+ *
+ * On the managed lane the host sets `PAPERCLIP_RUN_CONTEXT` to a stable path
+ * whose contents it rebinds before each prompt (`run-context/<runId>.json`
+ * behind `current.json`); the run JWT deliberately never enters this process's
+ * env, because a warm worker's env cannot change between runs. Engine mode has
+ * no such variable, so the env fallback stays exactly as it was.
+ *
+ * A missing or unparseable record falls back to env: a broken pointer must not
+ * silently turn every approval into "credentials unavailable" when the engine
+ * lane's env is right there.
+ */
+function runContextCredentials(): { apiUrl: string; companyId: string; taskId: string; token: string } {
+  const file = (process.env.PAPERCLIP_RUN_CONTEXT ?? "").trim();
+  if (file !== "") {
+    try {
+      const raw: unknown = JSON.parse(readFileSync(file, "utf8"));
+      if (isRecord(raw) && isRecord(raw.credentials)) {
+        const credentials = raw.credentials;
+        const apiUrl = typeof credentials.apiUrl === "string" ? credentials.apiUrl.trim() : "";
+        const token = typeof credentials.apiKey === "string" ? credentials.apiKey.trim() : "";
+        const companyId = typeof credentials.companyId === "string" ? credentials.companyId.trim() : "";
+        const taskId = typeof credentials.taskId === "string" ? credentials.taskId.trim() : "";
+        if (apiUrl !== "" && token !== "") return { apiUrl, companyId, taskId, token };
+      }
+    } catch {
+      // Unreadable record: fall through to the env the engine lane uses.
+    }
+  }
+  return {
+    apiUrl: (process.env.PAPERCLIP_API_URL ?? "").trim(),
+    companyId: (process.env.PAPERCLIP_COMPANY_ID ?? "").trim(),
+    taskId: (process.env.PAPERCLIP_TASK_ID ?? "").trim(),
+    token: (process.env.PAPERCLIP_API_KEY ?? "").trim(),
+  };
+}
+
 /** Short stable digest of the executed args, for the board card and dedup. */
 function argumentsHash(args: Record<string, unknown>): string {
   return createHash("sha256").update(canonicalJson(args)).digest("hex").slice(0, 16);
@@ -773,8 +811,7 @@ async function boundedApprovalFetch(
  */
 async function lookupApprovalVerdict(approvalId: string): Promise<ApprovalVerdict> {
   try {
-    const api = (process.env.PAPERCLIP_API_URL ?? "").trim();
-    const token = (process.env.PAPERCLIP_API_KEY ?? "").trim();
+    const { apiUrl: api, token } = runContextCredentials();
     if (!api || !token || typeof fetch !== "function") return "unknown";
     const url = `${paperclipApiRoot(api)}/api/approvals/${encodeURIComponent(approvalId)}`;
     const response = await boundedApprovalFetch(url, token);
@@ -888,10 +925,7 @@ async function holdForApproval(
       }
     }
 
-    const api = (process.env.PAPERCLIP_API_URL ?? "").trim();
-    const companyId = (process.env.PAPERCLIP_COMPANY_ID ?? "").trim();
-    const token = (process.env.PAPERCLIP_API_KEY ?? "").trim();
-    const taskId = (process.env.PAPERCLIP_TASK_ID ?? "").trim();
+    const { apiUrl: api, companyId, token, taskId } = runContextCredentials();
     if (!api || !companyId || !token) {
       // This path only exists once a governance manifest has armed the lane,
       // so a missing control-plane env is a governance failure, not an absent

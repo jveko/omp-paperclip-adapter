@@ -22,6 +22,8 @@ import {
   shouldAppendBridgeExtension, isGovernanceArmed,
 } from "./acp.js";
 import { runWithFreshSessionRetry, withRetryChain } from "./retry.js";
+import { startHost } from "../host/server.js";
+import { readLedgerRecords } from "../host/ledger.js";
 import * as sessionState from "./session-state.js";
 import { loadState, ompAgentDir, saveState, sessionIntelDir } from "./session-state.js";
 import { FAILOVER_CONFIG_FILE } from "./failover-config.js";
@@ -2249,4 +2251,98 @@ describe("probeOmpAcpSession session/list capability", () => {
   }, 15_000);
 
 
+});
+
+const fakeRpc = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)), "../../test-fixtures/fake-rpc.mjs",
+);
+
+describe("managed lane (executionMode)", () => {
+  let tmpRoot: string;
+  let host: Awaited<ReturnType<typeof startHost>> | null;
+
+  beforeAll(async () => {
+    tmpRoot = await mkdtemp(path.join(os.tmpdir(), "omp-managed-test-"));
+  });
+  afterAll(async () => {
+    await rm(tmpRoot, { recursive: true, force: true });
+  });
+  beforeEach(async () => {
+    await rm(path.join(tmpRoot, "instances"), { recursive: true, force: true });
+    vi.stubEnv("PAPERCLIP_HOME", tmpRoot);
+    vi.stubEnv("PAPERCLIP_INSTANCE_ID", "test-managed");
+    engineMocks.createAcpxEngineExecutor.mockReset();
+    modelsMocks.listOmpModels.mockImplementation(async () => modelsMocks.defaultModels);
+    serverUtilsMocks.readPaperclipSkillSyncPreference.mockReturnValue({
+      explicit: false, desiredSkills: [], desiredSkillEntries: [],
+    });
+    serverUtilsMocks.readPaperclipRuntimeSkillEntries.mockResolvedValue([]);
+    serverUtilsMocks.resolvePaperclipDesiredSkillNames.mockReturnValue([]);
+    serverUtilsMocks.readPaperclipSkillMarkdown.mockResolvedValue(null);
+    skillManifestMocks.materializeSkillManifest.mockReset();
+    host = await startHost({
+      rootDir: path.join(tmpRoot, "instances", "test-managed", "omp-host"),
+      hostIdleMs: 50,
+      workerIdleMs: 50,
+    });
+  });
+  afterEach(async () => {
+    if (host !== null) await host.close("test").catch(() => {});
+    host = null;
+    vi.unstubAllEnvs();
+  });
+
+  it("runs through the supervisor, maps events, reports the worker and never builds the engine", async () => {
+    const engineFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "never", sessionKey: "never" } });
+    const events: Array<{ eventType?: string; level?: string; message?: string }> = [];
+    const spawns: Array<{ pid: number; processGroupId: number | null; startedAt: string }> = [];
+    const usages: Array<Record<string, unknown>> = [];
+    const run = createOmpAcpExecutor();
+    const result = await run(baseCtx({
+      config: {
+        executionMode: "managed",
+        agentCommand: `${process.execPath} ${fakeRpc}`,
+      },
+      authToken: "run-jwt",
+      onEvent: async (event: unknown) => { events.push(event as { eventType?: string }); },
+      onSpawn: async (meta: { pid: number; processGroupId: number | null; startedAt: string }) => { spawns.push(meta); },
+      onUsage: async (receipt: Record<string, unknown>) => { usages.push(receipt); },
+      runtimeMcp: { getServers: () => [] },
+    }));
+    expect(engineFn).not.toHaveBeenCalled();
+    expect(result.exitCode).toBe(0);
+    expect(result.sessionParams?.acpSessionId).toBe("sess-1");
+    expect(result.usage).toEqual({ inputTokens: 100, outputTokens: 20, cachedInputTokens: 40 });
+    expect(result.usageBasis).toBe("per_run");
+    expect(result.model).toBe("prov/m");
+    expect(spawns).toHaveLength(1);
+    expect(spawns[0].pid).toBeGreaterThan(0);
+    expect(spawns[0].processGroupId).toBe(spawns[0].pid);
+    expect(events.some((event) => event.eventType === "omp.turn")).toBe(true);
+    expect(usages).toHaveLength(1);
+    expect(usages[0]).toMatchObject({ usageBasis: "per_run", complete: true });
+    expect(JSON.stringify(events)).not.toContain("run-jwt");
+    const ledger = await readLedgerRecords(path.join(tmpRoot, "instances", "test-managed", "omp-host"));
+    expect(ledger.map((record) => record.state)).toEqual([
+      "leased", "worker_ready", "session_open", "prompting", "settled", "closed",
+    ]);
+    expect(JSON.stringify(ledger)).not.toContain("run-jwt");
+  }, 30_000);
+
+  it("refuses an unknown executionMode before any lane is constructed", async () => {
+    const engineFn = fakeEngine({ exitCode: 0 });
+    const result = await createOmpAcpExecutor()(baseCtx({ config: { executionMode: "managd" } }));
+    expect(result.errorCode).toBe("omp_config_error");
+    expect(result.errorMessage).toContain("executionMode is 'managd'");
+    expect(engineFn).not.toHaveBeenCalled();
+  });
+
+  it("stays on the engine lane when executionMode is absent", async () => {
+    const engineFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "e-1", sessionKey: "sk" } });
+    const result = await createOmpAcpExecutor()(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}` },
+    }));
+    expect(engineFn).toHaveBeenCalledOnce();
+    expect(result.exitCode).toBe(0);
+  });
 });
