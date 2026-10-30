@@ -290,14 +290,23 @@ describe("supervisor", () => {
       const acceptedB = await first.waitFor(
         (frame) => frame.type === "run.accepted" && frame.runId === "run-2",
       );
-      await first.waitFor((frame) => frame.type === "run.settled" && frame.runId === "run-2");
-      if (acceptedB.type !== "run.accepted") throw new Error("unreachable");
+      const settledB = await first.waitFor(
+        (frame) => frame.type === "run.settled" && frame.runId === "run-2",
+      );
+      if (acceptedB.type !== "run.accepted" || settledB.type !== "run.settled") throw new Error("unreachable");
       expect(acceptedB.reusedWorker).toBe(true);
       expect(acceptedB.worker.pid).toBe(acceptedA.worker.pid);
+      // Cumulative session stats are delta'd: the second run reports its own
+      // turn and model, not the session total.
+      expect(settledB.result.resultJson).toMatchObject({ routedModels: { "prov/m": 1 } });
+      expect(settledB.result.model).toBe("prov/m");
       const commands = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { type: string });
       expect(commands.filter((command) => command.type === "open_session")).toHaveLength(1);
       expect(commands.filter((command) => command.type === "new_session")).toHaveLength(0);
       expect(running.workers).toBe(1);
+      // The session file survives the already-open skip on the ledger.
+      const closed = (await readLedgerRecords(root)).filter((record) => record.state === "closed").at(-1);
+      expect(closed?.sessionFile).toBeTruthy();
     } finally {
       first.close();
     }
@@ -344,6 +353,36 @@ describe("supervisor", () => {
       client.close();
     }
   }, 90_000);
+
+  it("spawns a fresh worker when the cached one died", async () => {
+    const running = await start();
+    const client = await connectClient(running.socketPath);
+    try {
+      client.send(beginFrame({ runId: "run-crash", sessionKey: "sk-crash", mode: "crash" }));
+      const settled = await client.waitFor(
+        (frame) => frame.type === "run.settled" && frame.runId === "run-crash",
+      );
+      if (settled.type !== "run.settled") throw new Error("unreachable");
+      expect(settled.result.errorCode).toBe("omp_host_worker_exit");
+      expect(running.workers).toBe(1);
+      // The dead entry is still in the registry; the next run must not reuse it.
+      client.send(beginFrame({
+        runId: "run-after-crash", sessionKey: "sk-crash", session: { ompSessionId: "sess-x" },
+      }));
+      const accepted = await client.waitFor(
+        (frame) => frame.type === "run.accepted" && frame.runId === "run-after-crash",
+      );
+      const settledAgain = await client.waitFor(
+        (frame) => frame.type === "run.settled" && frame.runId === "run-after-crash",
+      );
+      if (accepted.type !== "run.accepted" || settledAgain.type !== "run.settled") throw new Error("unreachable");
+      expect(accepted.reusedWorker).toBe(false);
+      expect(settledAgain.result.exitCode).toBe(0);
+      expect(running.workers).toBe(1);
+    } finally {
+      client.close();
+    }
+  }, 20_000);
 
   it("spawns a second worker for another cwd and leaves the first warm", async () => {
     const a = path.join(root, "work-a");

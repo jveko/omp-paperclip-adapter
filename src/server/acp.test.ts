@@ -2455,7 +2455,12 @@ describe("managed lane (executionMode)", () => {
         taskKey: "task",
       },
     }));
-    expect(second.exitCode).toBe(0);
+    // Managed fork finds the source cwd without the ACP list probe, but the
+    // forked transcript lives in omp's agent-dir storage while the worker
+    // resumes by directory: the run must refuse rather than silently continue
+    // the source session under the fork's id (v0.12 limitation, documented).
+    expect(second.errorCode).toBe("omp_host_run_failed");
+    expect(second.errorMessage).toContain("refusing to continue another session");
     const frames = await readAcpFrames(frameFile);
     const fork = frames.find((frame) => frame.method === "session/fork");
     expect(fork?.params.cwd).toBe(work);

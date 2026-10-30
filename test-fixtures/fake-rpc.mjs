@@ -26,7 +26,7 @@ let seq = 0;
 let pendingPrompt = null;
 let hostToolWaiter = null;
 
-let memoryStats = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+let memoryStats = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
 const stats = () => {
   if (!statsFile) return memoryStats;
   try {
@@ -42,6 +42,7 @@ const addUsage = () => {
   current.cacheRead += 40;
   current.cacheWrite += 10;
   current.cost += 0.5;
+  current.turns += 1;
   memoryStats = current;
   if (statsFile) writeFileSync(statsFile, JSON.stringify(current));
 };
@@ -116,7 +117,8 @@ rl.on("line", (line) => {
           total: current.input + current.output + current.cacheRead + current.cacheWrite,
         },
         cost: current.cost,
-        routedModels: { "prov/m": 1 },
+        // Cumulative, like omp's SessionStats.
+        routedModels: { "prov/m": current.turns },
         // The wire shape real omp sends (rpc-wire.generated.ts:413-417).
         contextUsage: { tokens: 4000, contextWindow: 200000, percent: 2 },
       });

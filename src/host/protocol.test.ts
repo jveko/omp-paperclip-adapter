@@ -83,6 +83,12 @@ describe("host protocol frames", () => {
     expect(parseFrame(JSON.stringify(begin({ agent: { id: "a", companyId: "../../c" } })))).toBeNull();
   });
 
+  it("rejects a malformed connection-tools block", () => {
+    expect(parseFrame(JSON.stringify(begin({
+      connectionTools: { endpoint: "http://x", bearerToken: 1 as never, tools: [] },
+    })))).toBeNull();
+  });
+
   it("requires the run.begin identity fields the host spawns from", () => {
     const { worker: _worker, ...noWorker } = begin();
     expect(parseFrame(JSON.stringify(noWorker))).toBeNull();

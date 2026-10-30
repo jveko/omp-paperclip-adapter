@@ -116,7 +116,7 @@ export interface RunBeginFrame {
   sessionKey: string;
   cwd: string;
   /** The omp session this run wants to resume, if any. */
-  session: { ompSessionId: string | null };
+  session: { ompSessionId: string | null; forked?: boolean };
   cell: Cell;
   worker: WorkerSpec;
   /** The rendered Paperclip prompt. Content: never journaled, never logged. */
@@ -333,13 +333,20 @@ function isWellFormed(frame: Record<string, unknown>): boolean {
         && Object.values(worker.env).every(isString)
         && isRecord(frame.cell)
         && isRecord(frame.session)
+        && (frame.session.forked === undefined || typeof frame.session.forked === "boolean")
         && isRecord(frame.credentials)
         && isString((frame.credentials as Record<string, unknown>).apiUrl)
         && isString((frame.credentials as Record<string, unknown>).apiKey)
         && isRecord(frame.manifests)
         && isRecord(frame.limits)
         && typeof (frame.limits as Record<string, unknown>).runLeaseTtlMs === "number"
-        && (frame.steering === undefined || typeof frame.steering === "boolean");
+        && (frame.steering === undefined || typeof frame.steering === "boolean")
+        && (frame.connectionTools === undefined || frame.connectionTools === null
+          || (isRecord(frame.connectionTools)
+            && isString(frame.connectionTools.endpoint)
+            && isString(frame.connectionTools.bearerToken)
+            && Array.isArray(frame.connectionTools.tools)
+            && frame.connectionTools.tools.every(isString)));
     }
     case "run.heartbeat":
     case "run.status":

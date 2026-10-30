@@ -119,6 +119,7 @@ interface WorkerEntry {
   startIdentity: string | null;
   /** The omp session this process currently has open, if any. */
   ompSessionId: string | null;
+  sessionFile: string | null;
   currentRun: string | null;
   lastUsedAt: number;
 }
@@ -225,13 +226,20 @@ function delta(before: StatsSnapshot | null, after: StatsSnapshot | null): Stats
     input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, routedModels: {}, contextUsage: null,
   };
   const top = after ?? base;
+  // Model turn counts are cumulative too: subtracting the baseline is what makes
+  // a warm session's second run report its own model rather than the sum.
+  const routedModels: Record<string, number> = {};
+  for (const [model, count] of Object.entries(top.routedModels)) {
+    const own = count - (base.routedModels[model] ?? 0);
+    if (own > 0) routedModels[model] = own;
+  }
   return {
     input: Math.max(0, top.input - base.input),
     output: Math.max(0, top.output - base.output),
     cacheRead: Math.max(0, top.cacheRead - base.cacheRead),
     cacheWrite: Math.max(0, top.cacheWrite - base.cacheWrite),
     cost: Math.max(0, top.cost - base.cost),
-    routedModels: top.routedModels,
+    routedModels,
     contextUsage: top.contextUsage,
   };
 }
@@ -482,9 +490,22 @@ class Supervisor {
           });
           return;
         }
+        // A message queued as the turn ends would be drained as an autonomous
+        // turn omp starts on its own: nothing here would track it, host tools are
+        // already cleared, and the next run would find a busy worker.
+        if (run.outcome !== null) {
+          this.send(connection, {
+            type: "run.steer.result", id: frame.id, runId: frame.runId,
+            ok: false, error: "the run's turn has already ended; nothing to steer",
+          });
+          return;
+        }
         try {
           if (frame.kind === "follow_up") await run.worker.worker.followUp(frame.message);
           else await run.worker.worker.steer(frame.message);
+          if (run.terminal || run.outcome !== null) {
+            void run.worker.worker.abort().catch(() => {});
+          }
           this.emitEvent(run, "run.system", {
             level: "info",
             message: `steering delivered to the running turn (${frame.kind})`,
@@ -726,6 +747,9 @@ class Supervisor {
       return;
     }
 
+    // Claim the worker before the setup awaits: the idle sweep must never
+    // retire a process a run is opening a session on.
+    worker.currentRun = begin.runId;
     const run: RunState = {
       runId: begin.runId,
       begin,
@@ -763,7 +787,9 @@ class Supervisor {
       await mkdir(sessionDir, { recursive: true, mode: 0o700 });
       let sessionId = run.ompSessionId;
       const alreadyOpen = sessionId !== "" && worker.ompSessionId === sessionId;
-      if (sessionId !== "" && !alreadyOpen) {
+      if (alreadyOpen) {
+        run.sessionFile = worker.sessionFile;
+      } else if (sessionId !== "") {
         const opened = await worker.worker.openSession(sessionDir);
         if (opened.cancelled) {
           const fresh = await worker.worker.newSession();
@@ -772,8 +798,20 @@ class Supervisor {
         } else {
           sessionId = opened.sessionId;
           run.sessionFile = opened.sessionFile ?? null;
+          // The worker resumes by session DIRECTORY (omp picks the newest
+          // session there), so a stored id and the opened id may legitimately
+          // differ (rotation, adoption) — the opened id is then the truth and is
+          // reported back. A FORK is the exception: its transcript lives in
+          // omp's agent-dir storage, so the directory never opens it, and
+          // continuing the source would consume the operator's fork silently.
+          const named = begin.session.ompSessionId;
+          if (begin.session.forked === true && named !== null && named !== "" && sessionId !== named) {
+            throw new Error(
+              `omp opened session ${sessionId} but the forked run named ${named}; refusing to continue another session under a fork directive`,
+            );
+          }
         }
-      } else if (sessionId === "") {
+      } else {
         const fresh = await worker.worker.newSession();
         if (fresh.cancelled) throw new Error("omp refused to create a session for this run");
       }
@@ -784,6 +822,7 @@ class Supervisor {
       }
       run.ompSessionId = sessionId;
       worker.ompSessionId = sessionId === "" ? null : sessionId;
+      worker.sessionFile = run.sessionFile;
       await this.journal(this.runRecord(run, "session_open", {
         worker: this.ledgerWorker(worker),
         ompSessionId: sessionId,
@@ -812,7 +851,6 @@ class Supervisor {
         worker: this.ledgerWorker(worker),
         lease: { owner: run.leaseOwner, expiresAt: new Date(run.leaseDeadline).toISOString() },
       }));
-      worker.currentRun = run.runId;
       this.runs.set(run.runId, run);
       connection.runId = run.runId;
       this.startLeaseWatch(run);
@@ -957,7 +995,9 @@ class Supervisor {
     run: RunState,
     access: { endpoint: string; bearerToken: string; expiresAt: string | null; tools: string[] },
   ): Promise<void> {
-    const client = new McpHttpClient({ endpoint: access.endpoint, bearer: access.bearerToken });
+    // A connection search can legitimately outlive a prompt token tick; 10 s
+    // (the client default) would turn a slow upstream into a tool error.
+    const client = new McpHttpClient({ endpoint: access.endpoint, bearer: access.bearerToken, timeoutMs: 30_000 });
     try {
       await client.initialize();
       const available = await client.listTools();
@@ -999,6 +1039,9 @@ class Supervisor {
       });
     } catch (err) {
       run.worker.worker.onHostToolCall(null);
+      // Clear any definition set that landed before the failure, so the warm
+      // worker cannot keep serving a later run from a dead handler.
+      void run.worker.worker.setHostTools([]).catch(() => {});
       this.emitEvent(run, "run.system", {
         level: "warn",
         message: `omp connection tools are unavailable this run: ${err instanceof Error ? err.message : String(err)}`,
@@ -1212,7 +1255,11 @@ class Supervisor {
       // The handler closes over this run's bearer: drop it before the worker is
       // reused by the next run (which installs its own).
       run.worker.worker.onHostToolCall(null);
-      void run.worker.worker.setHostTools([]).catch(() => {});
+      void run.worker.worker.setHostTools([]).catch(() => {
+        // A missed clear is recoverable (the handler is already gone; a call
+        // would answer "this host does not serve host tools"), and the next run
+        // rebinds the set anyway: never let it fail the settle.
+      });
     }
     await clearRunContext(this.root, run.worker.workerId, run.runId).catch(() => {});
     if ([...run.connections].some((connection) => !connection.closed)) {
@@ -1289,7 +1336,10 @@ class Supervisor {
     };
     const existing = this.workers.get(key);
     if (existing !== undefined && this.options.reuseWorkers && this.sameFingerprint(existing.fingerprint, fingerprint)) {
-      return { worker: existing, reused: true };
+      // A crashed worker stays in the registry until the idle sweep; reusing the
+      // dead entry would fail every later run of this key for up to 20 minutes.
+      if (existing.worker.alive) return { worker: existing, reused: true };
+      await this.retireWorker(existing);
     }
     if (existing !== undefined) {
       await this.retireWorker(existing);
@@ -1346,6 +1396,7 @@ class Supervisor {
       sessionKey: begin.sessionKey,
       startIdentity: await readProcessStartIdentity(worker.pid),
       ompSessionId: null,
+      sessionFile: null,
       currentRun: null,
       lastUsedAt: Date.now(),
     };

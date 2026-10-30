@@ -273,7 +273,9 @@ export async function steerManagedRun(input: {
     });
     const reply = await client.waitFor(
       (frame) => frame.type === "run.steer.result" && frame.runId === input.runId,
-      10_000,
+      // Above the supervisor's own 30 s RPC request timeout: timing out first
+      // would report a failure while the steer still lands.
+      35_000,
     );
     if (reply.type !== "run.steer.result") return { ok: false, error: "unexpected supervisor reply" };
     return reply.ok ? { ok: true } : { ok: false, error: reply.error ?? "steering refused" };
@@ -359,7 +361,10 @@ export function createHostTransport(options: HostTransportOptions): ManagedRun {
       agent: { id: ctx.agent.id, companyId: ctx.agent.companyId },
       sessionKey,
       cwd: plan.sessionCwd,
-      session: { ompSessionId: rotate ? null : (plan.forkedSessionId ?? storedSessionId) },
+      session: {
+        ompSessionId: rotate ? null : (plan.forkedSessionId ?? storedSessionId),
+        forked: plan.forkedSessionId !== null,
+      },
       cell: {
         argvHash: createHash("sha256").update([workerArgv.command, ...workerArgv.args].join("\u0000")).digest("hex").slice(0, 16),
         bridgeHash: await bridgeHash(options.bridge),
