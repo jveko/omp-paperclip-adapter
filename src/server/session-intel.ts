@@ -176,6 +176,56 @@ export async function queryOmpSessions(
   };
 }
 
+export type OmpSessionCwdResult =
+  | { ok: true; cwd: string }
+  | { ok: false; error: string };
+
+/** Bounded pages for the fork-source lookup (50 sessions/page in omp). */
+const MAX_SOURCE_LOOKUP_PAGES = 5;
+
+/**
+ * The cwd a session recorded, for the fork precondition.
+ *
+ * omp's `session/fork` opens the new session at the CLIENT's cwd and then
+ * switches to the source file without an `onCwdChange` callback; the switch
+ * rejects when the source's recorded cwd differs (`agent-session.ts:12689`,
+ * `SESSION_CWD_CHANGE_REJECTED`, surfaced as -32603). The source can live
+ * under any workspace, so the lookup is deliberately UNFILTERED — a cwd-scoped
+ * `session/list` would only find sessions of this run's workspace. Only the
+ * cwd of the id the operator already named is returned; nothing here is
+ * published, and the listing is bounded to a few pages.
+ */
+export async function findOmpSessionCwd(
+  omp: { command: string; args?: string[]; env?: Record<string, string> },
+  sessionId: string,
+  opts: { timeoutMs?: number; maxPages?: number } = {},
+): Promise<OmpSessionCwdResult> {
+  const maxPages = Math.max(1, Math.floor(opts.maxPages ?? MAX_SOURCE_LOOKUP_PAGES));
+  let cursor: string | undefined;
+  for (let page = 0; page < maxPages; page += 1) {
+    const drive = await driveAcpSession(omp, [
+      { method: "session/list", params: cursor ? { cursor } : {} },
+    ], opts.timeoutMs ?? 10_000);
+    if (!drive.ok) return { ok: false, error: drive.error ?? "ACP drive failed" };
+    const response = drive.responses[0];
+    if (response?.error) return { ok: false, error: response.error.message };
+    const match = parseSessions(response?.result?.sessions)
+      .find((session) => session.sessionId === sessionId);
+    if (match) {
+      return match.cwd.trim() !== ""
+        ? { ok: true, cwd: match.cwd }
+        : { ok: false, error: `session ${sessionId} has no recorded cwd` };
+    }
+    const next = response?.result?.nextCursor;
+    if (typeof next !== "string" || next.length === 0) break;
+    cursor = next;
+  }
+  return {
+    ok: false,
+    error: `session ${sessionId} is not in this omp agent dir's session listing`,
+  };
+}
+
 export type OmpForkResult =
   | { ok: true; sessionId: string }
   | { ok: false; error: string };

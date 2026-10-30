@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -1417,5 +1417,129 @@ describe("human approval (advisory tool_call hold)", () => {
     }
     // One POST, zero status GETs: the dedup fast path never fetches.
     expect(calls).toHaveLength(1);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Restricted folders (manifest root `restrictedFolders`)             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The manifest root key that makes THIS bridge ask the board. omp has its own
+ * `tools.restrictedFolders` prompt in the run child, but this lane's ACP proxy
+ * answers that prompt, so the fence only exists if the bridge holds the call.
+ * `approvalRequired` is empty and the run is on the single gate (`yolo`): the
+ * folder list alone must still produce the human ask.
+ */
+const RESTRICTED_FOLDERS_POLICY = {
+  approvalMode: "yolo",
+  approvalRequired: [],
+  restrictedFolders: ["/srv/secrets", "~/private-keys"],
+};
+
+describe("restricted folders (manifest root key)", () => {
+  it("holds a write touching a restricted folder and posts the ask with its reason", async () => {
+    const { pi } = await approvalFixture(RESTRICTED_FOLDERS_POLICY);
+    approvalEnv();
+    const calls = recordFetch(() => reply(201, { id: "apr-r1" }));
+
+    const held = await pi.toolCallAsync(
+      "write",
+      { path: "/srv/secrets/token.txt", content: "x" },
+      { cwd: "/work" },
+    );
+
+    expect(held?.block).toBe(true);
+    expect(held?.reason).toMatch(/restricted folder/i);
+    expect(held?.reason).toContain("/srv/secrets");
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toMatch(/\/approvals$/);
+    const payload = calls[0].json.payload as Record<string, unknown>;
+    expect(payload.source).toBe("omp_governance");
+    expect(payload.reason).toMatch(/restricted folder/i);
+  });
+
+  it("resolves a relative file_path against a cwd inside the restricted folder", async () => {
+    const { pi } = await approvalFixture(RESTRICTED_FOLDERS_POLICY);
+    approvalEnv();
+    const calls = recordFetch(() => reply(201, { id: "apr-r2" }));
+
+    const held = await pi.toolCallAsync(
+      "edit",
+      { file_path: "nested/id_rsa" },
+      { cwd: "/srv/secrets" },
+    );
+
+    expect(held?.block).toBe(true);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("judges a pathless tool by its cwd: bash inside a restricted folder is held", async () => {
+    const { pi } = await approvalFixture(RESTRICTED_FOLDERS_POLICY);
+    approvalEnv();
+    const calls = recordFetch(() => reply(201, { id: "apr-r3" }));
+
+    const held = await pi.toolCallAsync("bash", { command: "ls" }, { cwd: "/srv/secrets/jobs" });
+
+    expect(held?.block).toBe(true);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("leaves a path outside every restricted folder alone, with no board call", async () => {
+    const { pi } = await approvalFixture(RESTRICTED_FOLDERS_POLICY);
+    approvalEnv();
+    const calls = recordFetch(() => reply(200));
+
+    expect(
+      await pi.toolCallAsync("read", { path: "/work/src/a.ts" }, { cwd: "/work" }),
+    ).toBeUndefined();
+    expect(calls).toHaveLength(0);
+  });
+
+  it("expands ~ in a restricted folder the way omp expands tools.restrictedFolders", async () => {
+    const { pi } = await approvalFixture(RESTRICTED_FOLDERS_POLICY);
+    approvalEnv();
+    const calls = recordFetch(() => reply(201, { id: "apr-r5" }));
+
+    const held = await pi.toolCallAsync(
+      "write",
+      { path: path.join(homedir(), "private-keys", "k.pem"), content: "x" },
+      { cwd: "/work" },
+    );
+
+    expect(held?.block).toBe(true);
+    expect(calls).toHaveLength(1);
+    const payload = calls[0].json.payload as Record<string, unknown>;
+    expect(payload.reason).toContain("private-keys");
+  });
+
+  it("a denyTools deny outranks the approval hold and never reaches the board", async () => {
+    const { pi } = await approvalFixture({
+      ...RESTRICTED_FOLDERS_POLICY,
+      guardrails: { denyTools: ["write"] },
+    });
+    approvalEnv();
+    const calls = recordFetch(() => reply(201, { id: "never" }));
+
+    const denied = await pi.toolCallAsync(
+      "write",
+      { path: "/srv/secrets/token.txt", content: "x" },
+      { cwd: "/work" },
+    );
+
+    expect(denied?.block).toBe(true);
+    expect(denied?.reason).toMatch(/denyTools/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("never holds a control tool, even when its cwd sits in a restricted folder", async () => {
+    const { pi } = await approvalFixture(RESTRICTED_FOLDERS_POLICY);
+    approvalEnv();
+    const calls = recordFetch(() => reply(201, { id: "never" }));
+
+    expect(
+      await pi.toolCallAsync("yield", { path: "/srv/secrets/x", summary: "done" }, { cwd: "/srv/secrets" }),
+    ).toBeUndefined();
+    expect(calls).toHaveLength(0);
   });
 });

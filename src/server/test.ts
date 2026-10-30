@@ -10,7 +10,7 @@ import {
   ensureAdapterExecutionTargetCommandResolvable,
   resolveAdapterExecutionTargetCwd,
 } from "@paperclipai/adapter-utils/execution-target";
-import { parseOmpVersion, probeOmpAcpSession, resolveOmpAgentCommand } from "./acp.js";
+import { parseOmpVersion, probeOmpAcpSession, resolveOmpAgentCommand, TESTED_OMP_MINOR, type OmpAcpProbeResult } from "./acp.js";
 import { ompEnv } from "./omp-env.js";
 import { resolveSessionScope, validateSessionScope } from "./session-directives.js";
 
@@ -55,6 +55,78 @@ export function evaluateSessionScopeCheck(
     code: "omp_sessions_shared",
     message: "sessionScope=shared: this employee uses the host-wide omp agent dir, so sessions, titles, caches and config are shared with every other omp agent on this host",
     detail: "Set sessionScope=isolated (with credentialMode=broker) to give this agent its own omp sessions and caches.",
+  };
+}
+
+/**
+ * Enforce the tested omp MINOR, not just "a version parsed".
+ *
+ * The adapter compensates for engine behavior that moves between minors, so an
+ * untested minor is a heartbeat failure waiting to happen; the environment test
+ * is where it must surface, with a readable message, instead. Only a command
+ * literally named `omp` is enforced: the docs already note that wrapper
+ * commands report their own version, and failing a wrapper would be a false
+ * negative. A build that reports nothing parseable stays a warning, unchanged.
+ */
+export function evaluateOmpVersionCheck(
+  version: { major: number; minor: number; patch: number } | null,
+  output: string,
+  command: string,
+): AdapterEnvironmentCheck {
+  if (!version) {
+    return {
+      level: "warn",
+      code: "omp_version_unparsed",
+      message: "could not parse --version output",
+      detail: output.slice(0, 200),
+    };
+  }
+  const shown = `${version.major}.${version.minor}.${version.patch}`;
+  if (path.basename(command) !== "omp") {
+    return {
+      level: "warn",
+      code: "omp_version_unverified",
+      message: `probed '${command}' -> ${shown}; version enforcement is skipped because only a command named 'omp' reports omp's own version (wrapper commands report their own)`,
+      detail: `The adapter is tested against omp ${TESTED_OMP_MINOR.major}.${TESTED_OMP_MINOR.minor}.x.`,
+    };
+  }
+  if (version.major !== TESTED_OMP_MINOR.major || version.minor !== TESTED_OMP_MINOR.minor) {
+    return {
+      level: "error",
+      code: "omp_version_unsupported",
+      message: `omp ${shown} is outside the tested range ${TESTED_OMP_MINOR.major}.${TESTED_OMP_MINOR.minor}.x: this adapter compensates for that minor's engine behavior, so a different minor is untested (a renamed config key or surface fails a heartbeat instead of this check)`,
+      detail: `Install omp ${TESTED_OMP_MINOR.major}.${TESTED_OMP_MINOR.minor}.x, or upgrade this adapter and its peerDependencies range.`,
+    };
+  }
+  return {
+    level: "info",
+    code: "omp_version",
+    message: `probed '${command}' -> ${shown} (the tested minor)`,
+  };
+}
+
+/**
+ * Pin the ACP config-option id contract: omp's `session/set_config_option`
+ * accepts exactly `mode`, `model` and `thinking`, and this adapter reads the
+ * `model` option to report the active model. A build that renames those ids
+ * fails here with a readable message instead of leaving model selection inert.
+ */
+export function evaluateConfigOptionCheck(
+  probe: Pick<OmpAcpProbeResult, "configOptionIds">,
+): AdapterEnvironmentCheck {
+  const ids = probe.configOptionIds ?? [];
+  if (ids.includes("model")) {
+    return {
+      level: "info",
+      code: "omp_config_options",
+      message: `ACP config options: ${ids.join(", ") || "none"}`,
+    };
+  }
+  return {
+    level: "warn",
+    code: "omp_config_option_model_missing",
+    message: "the ACP handshake advertised no `model` config option, so the adapter cannot report the active model and model selection may be inert",
+    detail: `Advertised: ${ids.join(", ") || "none"}. omp accepts only mode|model|thinking; a renamed id is an upgrade cliff.`,
   };
 }
 
@@ -163,21 +235,7 @@ export async function testEnvironment(
 
   const spawnEnv = ompEnv({ config });
   const versionOut = await run(base[0], [...base.slice(1), "--version"], 10_000, spawnEnv);
-  const version = parseOmpVersion(versionOut);
-  if (version) {
-    checks.push({
-      level: "info",
-      code: "omp_version",
-      message: `probed '${bin}' -> ${version.major}.${version.minor}.${version.patch} (wrapper commands report their own version)`,
-    });
-  } else {
-    checks.push({
-      level: "warn",
-      code: "omp_version_unparsed",
-      message: "could not parse --version output",
-      detail: versionOut.slice(0, 200),
-    });
-  }
+  checks.push(evaluateOmpVersionCheck(parseOmpVersion(versionOut), versionOut, bin));
 
   // 4. ACP handshake + active model detection
   const probe = await probeOmpAcpSession({ command: bin, args: acpArgs, env: spawnEnv });
@@ -190,6 +248,7 @@ export async function testEnvironment(
     });
     // Only a completed handshake can report the advertised capabilities.
     checks.push(evaluateSessionListCheck(probe.supportsSessionList === true));
+    checks.push(evaluateConfigOptionCheck(probe));
   } else {
     checks.push({
       level: "error",

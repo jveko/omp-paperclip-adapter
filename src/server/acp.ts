@@ -34,9 +34,9 @@ import { readRetryConfig, runWithFreshSessionRetry, withRetryChain } from "./ret
 import { materializeFailoverOverlay, parseFallbackChain } from "./failover-config.js";
 import { ompEnv } from "./omp-env.js";
 import { prepareSessionScope } from "./session-scope.js";
-import { forkOmpSession, queryOmpSessions } from "./session-intel.js";
+import { forkOmpSession, findOmpSessionCwd, queryOmpSessions } from "./session-intel.js";
 import { materializeSkillManifest } from "./skill-manifest.js";
-import { governancePolicyActive, materializeGovernanceManifest, parseGovernancePolicy } from "./governance-manifest.js";
+import { governancePolicyActive, materializeGovernanceManifest, parseGovernancePolicy, validateGovernanceGate } from "./governance-manifest.js";
 import { materializeGovernanceOverlay } from "./governance-overlay.js";
 import { materializeBudgetOverlay } from "./budget-overlay.js";
 import {
@@ -49,7 +49,7 @@ import {
 import {
   buildSessionSnapshotWorkProduct, postWorkProduct, readSessionIntelConfig,
   resolveRunDirective, resolveWorkProductIssueId, sessionSnapshotDigestInput, validateCredentialMode,
-  validateSessionScope, validThinkingLevel, validateThinkingLevel,
+  validatePlanMode, validateSessionScope, validThinkingLevel, validateThinkingLevel,
 } from "./session-directives.js";
 
 export const DEFAULT_OMP_COMMAND = "omp";
@@ -126,7 +126,42 @@ export function isGovernanceArmed(manifestPath: string | null, bridgePath: strin
   return manifestPath !== null && resolveBridgeRunMode(bridgePath).kind === "ok";
 }
 
-export function resolveOmpAgentCommand(config: Record<string, unknown>): string {
+/**
+ * Why the governance bridge artifact cannot enforce this run, or null.
+ *
+ * This is the one part of "the extension loaded" the parent process can
+ * assert: the file the child will be told to load (`--extension <file>`) exists
+ * and can be opened. Whether omp's module loader then accepts it, and whether
+ * the extension's `session_start` handler arms, is inside the child and is not
+ * observable here — nothing in the ACP stream, the bridge, or the engine
+ * reports a load result (the bridge registers handlers and never speaks).
+ *
+ * A miss here is fail-closed by design: the governance manifest was written,
+ * so the run would otherwise take `tools.approvalMode: yolo` and hand the
+ * single gate to an extension that cannot be there — every guardrail, budget
+ * and approval rule silently absent.
+ */
+export async function bridgeArtifactError(file: string): Promise<string | null> {
+  let handle;
+  try {
+    handle = await fs.open(file, "r");
+    return null;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code ?? "unknown";
+    return `the governance bridge extension cannot be loaded: ${file} is missing or unreadable (${code}). `
+      + "The policy was materialized, so this run would take tools.approvalMode: yolo with no extension "
+      + "to replace omp's permission gate — no guardrail, budget or approval rule in force. Build the "
+      + "adapter (npm run build) or repair the install so dist/paperclip-bridge.js exists, or clear "
+      + "governancePolicy.";
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+export function resolveOmpAgentCommand(
+  config: Record<string, unknown>,
+  bridge: string = bridgePath,
+): string {
   const explicit = firstNonEmptyString(config.agentCommand, config.acpAgentCommand);
   const command = firstNonEmptyString(config.command) ?? DEFAULT_OMP_COMMAND;
   const base = explicit ?? `${command} acp`;
@@ -134,8 +169,8 @@ export function resolveOmpAgentCommand(config: Record<string, unknown>): string 
   // materialized a manifest env (pure function of config — the env presence IS
   // the bridge-active signal). Side channels that reuse the command but lack
   // the manifest env simply don't get the flag, so the bridge no-ops there.
-  const extension = shouldAppendBridgeExtension(config, bridgePath)
-    ? ` --extension ${bridgePath}`
+  const extension = shouldAppendBridgeExtension(config, bridge)
+    ? ` --extension ${bridge}`
     : "";
   // --thinking flag rides agentCommand because the engine's set_config_option
   // uses the wrong key (effort). Changing the level rotates the session via the
@@ -207,13 +242,14 @@ export function buildOmpAcpConfig(
   config: Record<string, unknown>,
   resolveModel: (model: string) => string | null = () => null,
   resolveCost: (model: string) => OmpModelCost | null = () => null,
+  bridge: string = bridgePath,
 ): Record<string, unknown> {
   const rawModel = firstNonEmptyString(config.model);
   const model = rawModel ? (resolveModel(rawModel) ?? rawModel) : undefined;
   const next: Record<string, unknown> = {
     ...config,
     agent: "custom",
-    agentCommand: resolveOmpAgentCommand(config),
+    agentCommand: resolveOmpAgentCommand(config, bridge),
     mode: firstNonEmptyString(config.mode, config.acpMode) ?? DEFAULT_ACP_ENGINE_MODE,
     permissionMode:
       firstNonEmptyString(config.permissionMode, config.acpPermissionMode) ??
@@ -275,6 +311,17 @@ export function parseOmpVersion(output: string): { major: number; minor: number;
   return m ? { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]) } : null;
 }
 
+/**
+ * The omp minor this adapter is tested against (18.13.x, verified against
+ * 18.13.1). The adapter compensates for that minor's engine behavior — the
+ * session-key fingerprint, the permission-proxy coercion, `usage_update`'s
+ * breakdown, `session/set_config_option`'s id set — so a different minor is
+ * untested rather than "probably fine". `testEnvironment` enforces this and
+ * `package.json`'s peerDependencies pins the same range; the upgrade-contract
+ * test keeps the two from drifting.
+ */
+export const TESTED_OMP_MINOR = { major: 18, minor: 13 } as const;
+
 export function resolveOmpBillingIdentity(ctx: Pick<AdapterExecutionContext, "config">): AcpxEngineBillingIdentity {
   const env = (ctx.config.env ?? {}) as Record<string, unknown>;
   const raw = String(env.OMP_PAPERCLIP_BILLING_TYPE ?? process.env.OMP_PAPERCLIP_BILLING_TYPE ?? "")
@@ -293,6 +340,8 @@ export interface OmpAcpProbeResult {
   currentModel?: string;
   /** The build advertises ACP `session/list`, the read the snapshot depends on. */
   supportsSessionList?: boolean;
+  /** Ids the handshake advertised; omp accepts only mode|model|thinking. */
+  configOptionIds?: string[];
   error?: string;
 }
 
@@ -467,6 +516,9 @@ export function probeOmpAcpSession(
       protocolVersion: 1,
       currentModel: typeof model?.currentValue === "string" ? model.currentValue : undefined,
       supportsSessionList,
+      configOptionIds: options
+        .map((option) => (typeof option.id === "string" ? option.id : ""))
+        .filter((id) => id.length > 0),
     };
   });
 }
@@ -518,7 +570,14 @@ async function materializeSkillsInstructions(config: Record<string, unknown>): P
 type OmpAcpExecutorOptions = Omit<
   AcpxEngineExecutorOptions,
   "adapterType" | "moduleDir" | "packageRootDir"
->;
+> & {
+  /**
+   * The extension artifact the run child is told to load. Defaults to the
+   * package's `dist/paperclip-bridge.js`; a test seam for the fail-closed
+   * availability check (and for an install that relocates `dist`).
+   */
+  bridgePath?: string;
+};
 type OmpAcpExecutor = (ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>;
 
 /**
@@ -542,7 +601,8 @@ function connectionToolsEndpoint(ctx: AdapterExecutionContext): string | null {
 }
 
 export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAcpExecutor {
-  const engineOptions = options;
+  const { bridgePath: bridgeOverride, ...engineOptions } = options;
+  const bridge = bridgeOverride ?? bridgePath;
   let executor: OmpAcpExecutor | null = null;
   return async (ctx) => {
     // Fail closed: broker credentialMode demands a resolved broker url+token.
@@ -568,6 +628,20 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     const scopeErr = validateSessionScope(ctx.config);
     if (scopeErr) {
       return { exitCode: 1, signal: null, timedOut: false, errorCode: "omp_config_error", errorMessage: scopeErr };
+    }
+    // Plan mode is a config error, not a warn: this adapter declares no
+    // elicitation/form capability, so omp would auto-approve the plan and the
+    // approval step plan mode exists for would be gone (see validatePlanMode).
+    const planErr = validatePlanMode(ctx.config);
+    if (planErr) {
+      return { exitCode: 1, signal: null, timedOut: false, errorCode: "omp_config_error", errorMessage: planErr };
+    }
+    // deny-all is answered by the engine's permission proxy, which the bridge
+    // cannot override; pairing it with scoped/rewritten tool rules describes a
+    // run that cannot happen. Fail at config time (see validateGovernanceGate).
+    const gateErr = validateGovernanceGate(ctx.config);
+    if (gateErr) {
+      return { exitCode: 1, signal: null, timedOut: false, errorCode: "omp_config_error", errorMessage: gateErr };
     }
     const preparedScope = await prepareSessionScope(ctx.config, {
       companyId: ctx.agent.companyId, agentId: ctx.agent.id,
@@ -599,20 +673,6 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
         message: `omp connection tools are unavailable this run: Paperclip delivered no MCP server for the declared native_mcp channel (${runtimeMcpServers.length} runtime MCP server(s)), so connections_search/connection_request never reach the agent`,
       });
     }
-    if (!executor) {
-      // Lazy by design: the acpx engine (and its transitive CLI deps) must not
-      // load until a run actually executes, so probe-only imports stay cheap.
-      const { createAcpxEngineExecutor } = await import(
-        "@paperclipai/adapter-utils/acpx-engine/execute"
-      );
-      executor = createAcpxEngineExecutor({
-        ...engineOptions,
-        adapterType: "omp_local",
-        moduleDir,
-        packageRootDir,
-        resolveBillingIdentity: options.resolveBillingIdentity ?? resolveOmpBillingIdentity,
-      });
-    }
     const intelDir = sessionIntelDir(ctx.agent.companyId, ctx.agent.id);
     // Resolvers backed by the cached `omp models ls` list (5-min TTL inside
     // models.ts, keyed by command+env so different agents' credentials never
@@ -630,7 +690,7 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
       });
     }
     const sideChannelEnv = ompEnv({ config: ctx.config, overlayPath: failoverOverlayPath });
-    const ompTokens = resolveOmpAgentCommand(ctx.config).split(/\s+/);
+    const ompTokens = resolveOmpAgentCommand(ctx.config, bridge).split(/\s+/);
     // The resolved agent command may carry trailing flags (e.g. `--thinking
     // medium`). Locate `acp` by index so trailing tokens are never confused
     // with the base command.
@@ -658,7 +718,7 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     const skillsAsToolsOn = ctx.config.skillsAsTools === true || ctx.config.skillsAsTools === "true";
     let bridgeActive = false;
     if (skillsAsToolsOn) {
-      const bridgeMode = resolveBridgeRunMode(bridgePath);
+      const bridgeMode = resolveBridgeRunMode(bridge);
       if (bridgeMode.kind === "whitespace") {
         await ctx.onEvent?.({
           eventType: "run.system", stream: "system", level: "warn",
@@ -693,6 +753,18 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
         ...(ctx.config.env ?? {}),
         PAPERCLIP_GOVERNANCE_MANIFEST: governanceManifest,
       };
+      // The policy reached the child, so the run is about to drop omp's own
+      // gate in favor of the bridge. If the extension artifact is not even
+      // readable, that trade leaves NO gate: fail the run instead of running
+      // it ungoverned with `approvalMode: yolo`. This is the whole load
+      // verification the parent can perform (see bridgeArtifactError).
+      const artifactError = await bridgeArtifactError(bridge);
+      if (artifactError) {
+        return {
+          exitCode: 1, signal: null, timedOut: false,
+          errorCode: "omp_governance_unavailable", errorMessage: artifactError,
+        };
+      }
     }
     // Governance is ARMED only when the policy really reached a bridge that will
     // really load: a manifest path AND a whitespace-free extension path (the
@@ -700,7 +772,7 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     // Anything less and the single gate must NOT move: `approvalMode: yolo`
     // switches off omp's own permission gate, so emitting it unarmed leaves the
     // run with no gate at all and no guardrail, budget or approval rule in force.
-    const governanceArmed = isGovernanceArmed(governanceManifest, bridgePath);
+    const governanceArmed = isGovernanceArmed(governanceManifest, bridge);
     if (!governanceArmed && governancePolicyActive(ctx.config)) {
       // Governance has no prose-injection fallback: without the extension loaded
       // the policy is decoration, so say which half failed and what it cost.
@@ -769,7 +841,7 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
         message: `omp budget overlay write failed: ${budgetOverlay.error}; the run continues without omp's hard cost cap (the bridge's soft cap still applies)`,
       });
     }
-    const config = buildOmpAcpConfig(ctx.config, resolveModel, resolveCost);
+    const config = buildOmpAcpConfig(ctx.config, resolveModel, resolveCost, bridge);
     // Fold every overlay this run owns into config BEFORE engineConfig is
     // derived: the fork branch rebuilds engineConfig as
     // { ...config, warmHandleIdleMs: 50 }, so an overlay added only to
@@ -842,12 +914,25 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     let engineConfig = config;
 
     if (directive.kind === "fork") {
-      const ompTokens = resolveOmpAgentCommand(ctx.config).split(/\s+/);
-      const fork = await forkOmpSession(
-        { command: ompTokens[0], args: ompTokens.slice(1), env: sideChannelEnv },
-        directive.forkSourceId,
-        sessionCwd,
-      );
+      const ompTokens = resolveOmpAgentCommand(ctx.config, bridge).split(/\s+/);
+      const sideChannel = { command: ompTokens[0], args: ompTokens.slice(1), env: sideChannelEnv };
+      // omp opens the fork at the CLIENT-SUPPLIED cwd and then switches to the
+      // source session, which refuses the switch when its recorded cwd differs
+      // (`agent-session.ts` SESSION_CWD_CHANGE_REJECTED → -32603). So the frame
+      // must carry the SOURCE's cwd, not this run's. The lookup is a bounded,
+      // unfiltered `session/list` (the source may live under another workspace)
+      // and never leaves this function: only the cwd of the id the operator
+      // already named is read.
+      const source = await findOmpSessionCwd(sideChannel, directive.forkSourceId);
+      const forkCwd = source.ok ? source.cwd : sessionCwd;
+      if (!source.ok) {
+        await ctx.onEvent?.({
+          eventType: "run.system", stream: "system", level: "warn",
+          message: `omp fork source session ${directive.forkSourceId} could not be located (${source.error}); `
+            + `forking with this run's cwd (${sessionCwd}) — omp rejects the fork if the source recorded a different one`,
+        });
+      }
+      const fork = await forkOmpSession(sideChannel, directive.forkSourceId, forkCwd);
       if (fork.ok) {
         forkTokenUsed = directive.forkToken;
         forkedSessionId = fork.sessionId;
@@ -905,6 +990,22 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
         ? { ...ctx.runtime, sessionParams: {} }
         : null;
 
+    // Lazy by design: the acpx engine (and its transitive CLI deps) must not
+    // load until a run actually executes, so probe-only imports stay cheap.
+    // Created only now, after every fail-closed gate (config, governance
+    // artifact, scope): a refused run must not even construct the engine.
+    if (!executor) {
+      const { createAcpxEngineExecutor } = await import(
+        "@paperclipai/adapter-utils/acpx-engine/execute"
+      );
+      executor = createAcpxEngineExecutor({
+        ...engineOptions,
+        adapterType: "omp_local",
+        moduleDir,
+        packageRootDir,
+        resolveBillingIdentity: options.resolveBillingIdentity ?? resolveOmpBillingIdentity,
+      });
+    }
     const { result, chain } = await runWithFreshSessionRetry(
       (runCtx) => {
         const merged = { ...ctx, ...runCtx } as typeof ctx;
@@ -1015,7 +1116,7 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
       }
     }
     if (intel.browser && issueId) {
-      const ompTokens = resolveOmpAgentCommand(ctx.config).split(/\s+/);
+      const ompTokens = resolveOmpAgentCommand(ctx.config, bridge).split(/\s+/);
       const query = await queryOmpSessions(
         { command: ompTokens[0], args: ompTokens.slice(1), env: sideChannelEnv },
         { cwd: sessionCwd, diagnostic: intel.diagnostic },

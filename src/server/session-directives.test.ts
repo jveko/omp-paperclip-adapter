@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import {
   getSessionConfigSchema, paperclipApiBase, readSessionIntelConfig, resolveRunDirective,
   resolveSessionScope, sessionSnapshotDigestInput, validateCredentialMode, validateSessionScope,
-  validThinkingLevel, validateThinkingLevel,
+  validThinkingLevel, validatePlanMode, validateThinkingLevel,
 } from "./session-directives.js";
 import { snapshotDigest } from "./session-state.js";
 
@@ -169,6 +169,28 @@ describe("validateCredentialMode", () => {
       credentialMode: "broker",
       env: {},
     })).toMatch(/OMP_AUTH_BROKER_URL/);
+  });
+});
+
+describe("validatePlanMode", () => {
+  it.each([
+    { name: "plan flag", config: { plan: true } },
+    { name: "planMode flag", config: { planMode: true } },
+    { name: "string planEnabled", config: { planEnabled: "true" } },
+    { name: "mode", config: { mode: "plan" } },
+    { name: "acpMode", config: { acpMode: "plan" } },
+    { name: "agentCommand --plan", config: { agentCommand: "omp acp --plan" } },
+    { name: "agentCommand --plan-yolo-into", config: { agentCommand: "omp acp --plan-yolo-into gpt-5" } },
+  ])("returns a plan warning for $name", ({ config }) => {
+    expect(validatePlanMode(config)).toMatch(/plan/i);
+  });
+
+  it.each([
+    { name: "an empty config", config: {} },
+    { name: "persistent mode", config: { mode: "persistent" } },
+    { name: "an agentCommand without --plan", config: { agentCommand: "omp acp --thinking high" } },
+  ])("returns null for $name", ({ config }) => {
+    expect(validatePlanMode(config)).toBeNull();
   });
 });
 

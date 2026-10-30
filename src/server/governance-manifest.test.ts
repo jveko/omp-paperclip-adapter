@@ -7,6 +7,7 @@ import {
   governancePolicyActive,
   materializeGovernanceManifest,
   parseGovernancePolicy,
+  validateGovernanceGate,
 } from "./governance-manifest.js";
 
 async function withDir(fn: (dir: string) => Promise<void>): Promise<void> {
@@ -108,6 +109,28 @@ describe("parseGovernancePolicy", () => {
     expect(res.policy.budgetCapUsd).toBeUndefined();
     expect(res.policy.approvedEndpoints).toEqual(["x"]);
     expect(res.policy.allowDebug).toBe(true);
+  });
+
+  // v0.9: `restrictedFolders` is a ROOT key the adapter folds into omp's own
+  // config (governance-overlay.ts) AND a bridge rule: on this lane omp's own
+  // restricted-folder prompt is answered by the ACP proxy, so the board ask has
+  // to come from the bridge. It is therefore bridge-enforceable (the manifest
+  // must exist for the handler to run).
+  it("reads root restrictedFolders as a bridge-enforced approval rail", () => {
+    const res = parseGovernancePolicy("restrictedFolders:\n  - /srv/secrets");
+    expect(res.kind).toBe("ok");
+    if (res.kind !== "ok") return;
+    expect(res.policy.restrictedFolders).toEqual(["/srv/secrets"]);
+    expect(res.enforceable).toBe(true);
+  });
+
+  it("is off when restrictedFolders holds no usable path", () => {
+    // Blank entries would otherwise emit `restrictedFolders: []`, which reads
+    // as "no restriction" while the operator believes one is configured.
+    const res = parseGovernancePolicy('restrictedFolders: ["", "  "]');
+    expect(res.kind).toBe("off");
+    if (res.kind !== "off") return;
+    expect(res.vacuous?.some((entry) => /restrictedFolders/.test(entry))).toBe(true);
   });
 
   it("keeps approvalRequired rules that can name a tool, in either writing", () => {
@@ -273,6 +296,68 @@ describe("materializeGovernanceManifest rule audit", () => {
       expect(await exists(path.join(dir, GOVERNANCE_MANIFEST_FILE))).toBe(false);
       expect(warn).not.toHaveBeenCalled();
     });
+  });
+
+  it("arms the bridge for a restrictedFolders-only policy", async () => {
+    // The bridge holds calls that touch those folders, so the manifest must
+    // exist and the run must keep the single gate — otherwise omp raises the
+    // prompt and this lane's auto-allowing proxy answers it.
+    await withDir(async (dir) => {
+      const file = await materializeGovernanceManifest(
+        { governancePolicy: "restrictedFolders:\n  - /srv/secrets" },
+        dir,
+        vi.fn(),
+      );
+      expect(file).toBe(path.join(dir, GOVERNANCE_MANIFEST_FILE));
+      const written = JSON.parse(await readFile(file as string, "utf8")) as Record<string, unknown>;
+      expect(written.restrictedFolders).toEqual(["/srv/secrets"]);
+    });
+  });
+});
+
+describe("validateGovernanceGate", () => {
+  const PATH_SCOPES = "guardrails:\n  pathScopes:\n    - /w";
+
+  it("flags a policy whose only rail deny-all would never reach", () => {
+    // deny-all refuses every tool call before the bridge can apply a scope, so
+    // the operator's rail(s) enforce nothing while looking configured.
+    expect(validateGovernanceGate({ permissionMode: "deny-all", governancePolicy: PATH_SCOPES }))
+      .toMatch(/deny-all/);
+  });
+
+  it("flags deny-all against a root-shorthand scope rule", () => {
+    // The bridge and this audit read a `guardrails` bag when there is one and
+    // the document ROOT otherwise; the validator must hear the shorthand too,
+    // or a dead scope rule escapes by being written one indent shallower.
+    expect(validateGovernanceGate({
+      permissionMode: "deny-all",
+      governancePolicy: "pathScopes:\n  - /w",
+    })).toMatch(/deny-all/);
+  });
+
+  it("flags argRevisions under deny-all (the rewrite never runs)", () => {
+    expect(validateGovernanceGate({
+      permissionMode: "deny-all",
+      governancePolicy: "guardrails:\n  argRevisions:\n    bash:\n      timeout: 5",
+    })).toMatch(/deny-all/);
+  });
+
+  it("accepts deny rules under deny-all (they agree with the gate)", () => {
+    expect(validateGovernanceGate({
+      permissionMode: "deny-all",
+      governancePolicy: "guardrails:\n  denyTools:\n    - web_search",
+    })).toBeNull();
+  });
+
+  it("ignores a permissive permissionMode (it cannot contradict a narrower rail)", () => {
+    expect(validateGovernanceGate({
+      permissionMode: "approve-all",
+      governancePolicy: PATH_SCOPES,
+    })).toBeNull();
+  });
+
+  it("says nothing when there is no policy to contradict", () => {
+    expect(validateGovernanceGate({ permissionMode: "deny-all" })).toBeNull();
   });
 });
 

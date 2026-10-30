@@ -58,6 +58,33 @@ describe("parseOmpModelsJson", () => {
     expect(parseOmpModelsJson("{}")).toEqual([]);
     expect(parseOmpModelsJson("null")).toEqual([]);
   });
+  it("parses a payload with no schemaVersion", () => {
+    const out = parseOmpModelsJson(JSON.stringify({
+      models: [
+        { provider: "openrouter", id: "glm-5.2", name: "GLM-5.2" },
+        { provider: "openrouter", id: "preview-free", name: "Preview Free" },
+      ],
+    }));
+    expect(out.map((m) => m.id)).toEqual(["openrouter/glm-5.2", "openrouter/preview-free"]);
+  });
+  it("tolerates an unknown schemaVersion and extra envelope keys", () => {
+    const out = parseOmpModelsJson(JSON.stringify({
+      schemaVersion: 99,
+      note: "x",
+      models: [{ provider: "openrouter", id: "glm-5.2", name: "GLM-5.2" }],
+    }));
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ id: "openrouter/glm-5.2", label: "GLM-5.2" });
+  });
+  it("skips an entry missing provider without dropping its valid sibling", () => {
+    const out = parseOmpModelsJson(JSON.stringify({
+      models: [
+        { id: "no-provider", name: "No Provider" },
+        { provider: "openrouter", id: "kept", name: "Kept" },
+      ],
+    }));
+    expect(out.map((m) => m.id)).toEqual(["openrouter/kept"]);
+  });
 });
 
 describe("parseOmpModelsJson pricingStatus", () => {

@@ -206,6 +206,91 @@ describe("materializeGovernanceOverlay", () => {
     }
   });
 
+  // v0.9: `restrictedFolders` is enforced by omp in the run child, so it lands
+  // regardless of arming — unlike `approvalMode`, which only moves when the
+  // bridge is armed and has a rule to run.
+  it("writes restrictedFolders even for an unarmed policy", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "gov-ov-"));
+    try {
+      const res = await materializeGovernanceOverlay(
+        { governancePolicy: "restrictedFolders:\n  - /srv/secrets\n  - ~/keys" },
+        dir,
+        { armed: false },
+        vi.fn(),
+      );
+      expect(res.status).toBe("ok");
+      const yaml = await readFile(path.join(dir, GOVERNANCE_CONFIG_FILE), "utf8");
+      expect(yaml).toContain("tools:");
+      expect(yaml).toMatch(/^ {2}restrictedFolders:$/m);
+      expect(yaml).toMatch(/^\s+- "\/srv\/secrets"$/m);
+      expect(yaml).toMatch(/^\s+- "~\/keys"$/m);
+      expect(yaml).not.toContain("approvalMode");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps restrictedFolders alongside the single-gate relaxation", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "gov-ov-"));
+    try {
+      const res = await materializeGovernanceOverlay(
+        {
+          governancePolicy:
+            "guardrails:\n  denyTools:\n    - web_search\nrestrictedFolders:\n  - /srv/secrets",
+        },
+        dir,
+        { armed: true },
+        vi.fn(),
+      );
+      expect(res.status).toBe("ok");
+      const yaml = await readFile(path.join(dir, GOVERNANCE_CONFIG_FILE), "utf8");
+      expect(yaml).toMatch(/^ {2}approvalMode: yolo$/m);
+      expect(yaml).toMatch(/^ {2}restrictedFolders:$/m);
+      expect(yaml).toMatch(/^\s+- "\/srv\/secrets"$/m);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("emits no restrictedFolders line when the policy does not set it", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "gov-ov-"));
+    try {
+      const res = await materializeGovernanceOverlay(
+        { governancePolicy: "guardrails:\n  denyTools:\n    - web_search" },
+        dir,
+        { armed: true },
+        vi.fn(),
+      );
+      expect(res.status).toBe("ok");
+      const yaml = await readFile(path.join(dir, GOVERNANCE_CONFIG_FILE), "utf8");
+      expect(yaml).toMatch(/^tools:\n {2}approvalMode: yolo$/m);
+      expect(yaml).not.toContain("restrictedFolders");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("relaxes the gate for a restrictedFolders-only policy when the bridge is armed", async () => {
+    // The bridge holds restricted-folder calls as approvals, so it is the gate
+    // this run relies on; keeping omp's own prompt would only add an ask the
+    // ACP proxy answers. Unarmed (previous test) it must not be emitted.
+    const dir = await mkdtemp(path.join(os.tmpdir(), "gov-ov-"));
+    try {
+      const res = await materializeGovernanceOverlay(
+        { governancePolicy: "restrictedFolders:\n  - /srv/secrets" },
+        dir,
+        { armed: true },
+        vi.fn(),
+      );
+      expect(res.status).toBe("ok");
+      const yaml = await readFile(path.join(dir, GOVERNANCE_CONFIG_FILE), "utf8");
+      expect(yaml).toMatch(/^ {2}approvalMode: yolo$/m);
+      expect(yaml).toMatch(/^ {2}restrictedFolders:$/m);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("emits disabledProviders for the approved-endpoint complement", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "gov-ov-"));
     try {

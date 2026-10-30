@@ -11,6 +11,10 @@ const mode = process.env.FAKE_ACP_MODE ?? "";
 // a code path must not send (a response cannot carry that list for request sets
 // whose trailing frames are optional).
 const seenFile = process.env.FAKE_ACP_SEEN_FILE;
+// Every incoming frame WITH its params, for tests that must assert what the
+// client actually asked (e.g. which cwd a fork targets). `seenFile` stays the
+// method-only log; this one is opt-in so neither seam disturbs the other.
+const frameLog = process.env.FAKE_ACP_FRAME_LOG;
 
 // Shape emitted by real omp for any `_omp/*` method it does not implement.
 const unknownExtMethod = (method) => ({
@@ -26,6 +30,11 @@ rl.on("line", (line) => {
   globalThis.__seen.push(msg.method);
   if (seenFile) {
     try { appendFileSync(seenFile, `${msg.method}\n`); } catch { /* test seam only */ }
+  }
+  if (frameLog) {
+    try {
+      appendFileSync(frameLog, `${msg.method}\t${JSON.stringify(msg.params ?? {})}\n`);
+    } catch { /* test seam only */ }
   }
   if (msg.method === "initialize") {
     if (mode === "error") {
@@ -46,12 +55,17 @@ rl.on("line", (line) => {
       send({ jsonrpc: "2.0", id: msg.id, error: { code: -32003, message: "session/list boom" } });
       return;
     }
-    const cwd = typeof msg.params?.cwd === "string" ? msg.params.cwd : "";
+    // An unscoped listing (no client cwd) must expose sessions from DIFFERENT
+    // workspaces: that is how a caller resolves a source session's own cwd
+    // before forking it. A client-sent cwd is still echoed unchanged.
+    const sentCwd = typeof msg.params?.cwd === "string" ? msg.params.cwd : null;
+    const cwdA = sentCwd ?? "/workspace";
+    const cwdB = sentCwd ?? "/other";
     send({ jsonrpc: "2.0", id: msg.id, result: {
       sessions: [
-        { sessionId: "sess-a", cwd, title: "First", updatedAt: "2026-08-28T00:00:00Z",
+        { sessionId: "sess-a", cwd: cwdA, title: "First", updatedAt: "2026-08-28T00:00:00Z",
           _meta: { messageCount: 3, size: 120 } },
-        { sessionId: "sess-b", cwd, title: "Second", updatedAt: "2026-08-28T01:00:00Z",
+        { sessionId: "sess-b", cwd: cwdB, title: "Second", updatedAt: "2026-08-28T01:00:00Z",
           _meta: { messageCount: 1, size: 40 } },
       ],
       ...(mode === "page2" ? { nextCursor: "2" } : {}),

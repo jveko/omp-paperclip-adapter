@@ -1,8 +1,11 @@
 import { execFile } from "node:child_process";
 import type * as NodeChildProcess from "node:child_process";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import os from "node:os";
+import path from "node:path";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AdapterEnvironmentTestContext } from "@paperclipai/adapter-utils";
-import { testEnvironment } from "./test.js";
+import { evaluateOmpVersionCheck, testEnvironment } from "./test.js";
 import type * as AcpModule from "./acp.js";
 
 // Regression guard for env threading into the environment-test version probe.
@@ -46,7 +49,7 @@ describe("testEnvironment version-probe env threading", () => {
   beforeEach(() => {
     execFileMock.mockReset();
     // Resolve the version probe so testEnvironment completes without a real omp.
-    execFileMock.mockImplementation((_c, _a, _o, cb) => cb(null, "omp/18.0.5"));
+    execFileMock.mockImplementation((_c, _a, _o, cb) => cb(null, "omp/18.13.1"));
   });
   afterEach(() => vi.restoreAllMocks());
 
@@ -77,7 +80,7 @@ describe("testEnvironment version-probe env threading", () => {
 describe("testEnvironment multi-token command probes", () => {
   beforeEach(() => {
     execFileMock.mockReset();
-    execFileMock.mockImplementation((_c, _a, _o, cb) => cb(null, "omp/18.0.5"));
+    execFileMock.mockImplementation((_c, _a, _o, cb) => cb(null, "omp/18.13.1"));
   });
   afterEach(() => vi.restoreAllMocks());
 
@@ -85,7 +88,7 @@ describe("testEnvironment multi-token command probes", () => {
     // A trailing `acp` is stripped so non-ACP subcommands are appended to the
     // wrapper invocation rather than argv[0]-only.
     execFileMock
-      .mockImplementationOnce((_c, _a, _o, cb) => cb(null, "omp/18.0.5"))
+      .mockImplementationOnce((_c, _a, _o, cb) => cb(null, "omp/18.13.1"))
       .mockImplementationOnce((_c, _a, _o, cb) => cb(null, '{"ok":true,"url":"http://b:8765","version":"18"}'));
     await testEnvironment(envTestCtx({
       credentialMode: "broker",
@@ -105,7 +108,7 @@ describe("testEnvironment multi-token command probes", () => {
     // not a mangled `omp acp --thinking medium --version` that starts an ACP
     // server and times out.
     execFileMock
-      .mockImplementationOnce((_c, _a, _o, cb) => cb(null, "omp/18.0.5"))
+      .mockImplementationOnce((_c, _a, _o, cb) => cb(null, "omp/18.13.1"))
       .mockImplementationOnce((_c, _a, _o, cb) => cb(null, '{"ok":true,"url":"http://b:8765","version":"18"}'));
     await testEnvironment(envTestCtx({
       credentialMode: "broker",
@@ -126,7 +129,7 @@ describe("testEnvironment broker-status parsing", () => {
 
   it("reports a reachable broker check (info) when status returns ok", async () => {
     execFileMock
-      .mockImplementationOnce((_c, _a, _o, cb) => cb(null, "omp/18.0.5"))
+      .mockImplementationOnce((_c, _a, _o, cb) => cb(null, "omp/18.13.1"))
       .mockImplementationOnce((_c, _a, _o, cb) => cb(null, '{"url":"http://b:8765","ok":true,"version":"18"}'));
     const res = await testEnvironment(envTestCtx({
       credentialMode: "broker",
@@ -140,7 +143,7 @@ describe("testEnvironment broker-status parsing", () => {
 
   it("reports an unreachable broker check (warn) when not configured", async () => {
     execFileMock
-      .mockImplementationOnce((_c, _a, _o, cb) => cb(null, "omp/18.0.5"))
+      .mockImplementationOnce((_c, _a, _o, cb) => cb(null, "omp/18.13.1"))
       .mockImplementationOnce((_c, _a, _o, cb) => cb(null, '{"ok":false,"reason":"not_configured"}'));
     const res = await testEnvironment(envTestCtx({
       credentialMode: "broker",
@@ -153,7 +156,7 @@ describe("testEnvironment broker-status parsing", () => {
 
   it("keeps the broker error in detail (not 'no output') when status reports connection refused", async () => {
     execFileMock
-      .mockImplementationOnce((_c, _a, _o, cb) => cb(null, "omp/18.0.5"))
+      .mockImplementationOnce((_c, _a, _o, cb) => cb(null, "omp/18.13.1"))
       .mockImplementationOnce((_c, _a, _o, cb) => cb(null, '{"ok":false,"url":"http://b:8765","error":"connection refused"}'));
     const res = await testEnvironment(envTestCtx({
       credentialMode: "broker",
@@ -171,8 +174,85 @@ describe("testEnvironment OTLP diagnostic", () => {
   afterEach(() => vi.restoreAllMocks());
 
   it("emits an OTLP export diagnostic check", async () => {
-    execFileMock.mockImplementationOnce((_c, _a, _o, cb) => cb(null, "omp/18.0.5"));
+    execFileMock.mockImplementationOnce((_c, _a, _o, cb) => cb(null, "omp/18.13.1"));
     const res = await testEnvironment(envTestCtx({}));
     expect(res.checks.some((c) => c.code === "omp_otlp_export_off" || c.code === "omp_otlp_export_armed")).toBe(true);
+  });
+});
+
+describe("evaluateOmpVersionCheck", () => {
+  it("accepts a build inside the tested 18.13 line", () => {
+    const check = evaluateOmpVersionCheck({ major: 18, minor: 13, patch: 1 }, "omp/18.13.1", "/usr/bin/omp");
+    expect(check.level).toBe("info");
+    expect(check.code).toBe("omp_version");
+  });
+
+  it("rejects a newer minor on a directly executed omp and names the supported range", () => {
+    const check = evaluateOmpVersionCheck({ major: 18, minor: 14, patch: 0 }, "omp/18.14.0", "/usr/bin/omp");
+    expect(check.level).toBe("error");
+    expect(check.code).toBe("omp_version_unsupported");
+    expect(check.message).toContain("18.14.0");
+    expect(check.message).toContain("18.13");
+  });
+
+  it.each([
+    {
+      name: "a major bump",
+      version: { major: 19, minor: 0, patch: 0 },
+      output: "omp/19.0.0",
+    },
+    {
+      name: "an older minor",
+      version: { major: 18, minor: 12, patch: 9 },
+      output: "omp/18.12.9",
+    },
+  ])("rejects $name on a directly executed omp", ({ version, output }) => {
+    const check = evaluateOmpVersionCheck(version, output, "omp");
+    expect(check.level).toBe("error");
+    expect(check.code).toBe("omp_version_unsupported");
+  });
+
+  it.each(["/usr/bin/node", "mise"])(
+    "does not fail a wrapper command (%s) whose reported version is outside the range",
+    (command) => {
+      const check = evaluateOmpVersionCheck({ major: 18, minor: 14, patch: 0 }, "omp/18.14.0", command);
+      expect(check.level).toBe("warn");
+      expect(check.code).toBe("omp_version_unverified");
+    },
+  );
+
+  it("warns when the version output cannot be parsed", () => {
+    const check = evaluateOmpVersionCheck(null, "not a version", "/usr/bin/omp");
+    expect(check.level).toBe("warn");
+    expect(check.code).toBe("omp_version_unparsed");
+    expect(check.detail).toContain("not a version");
+  });
+});
+
+describe("testEnvironment omp version gate", () => {
+  let tmpDir: string;
+  beforeAll(async () => {
+    tmpDir = await mkdtemp(path.join(os.tmpdir(), "omp-test-env-"));
+  });
+  afterAll(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+  beforeEach(() => execFileMock.mockReset());
+  afterEach(() => vi.restoreAllMocks());
+
+  it("fails the environment test when a directly executed omp is outside the tested range", async () => {
+    // ensureAdapterExecutionTargetCommandResolvable runs for real, so the
+    // command must be a real executable file; only --version is stubbed.
+    const ompPath = path.join(tmpDir, "omp");
+    await writeFile(ompPath, "#!/bin/sh\n", { mode: 0o755 });
+    execFileMock.mockImplementation((_c, _a, _o, cb) => cb(null, "omp/18.14.0"));
+
+    const res = await testEnvironment(envTestCtx({ command: ompPath }));
+
+    expect(res.checks.some((c) => c.code === "omp_command_resolvable")).toBe(true);
+    const check = res.checks.find((c) => c.code === "omp_version_unsupported");
+    expect(check).toBeTruthy();
+    expect(check!.level).toBe("error");
+    expect(res.status).toBe("fail");
   });
 });

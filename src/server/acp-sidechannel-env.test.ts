@@ -16,6 +16,7 @@ import { ompAgentDir, sessionIntelDir } from "./session-state.js";
 // spawning real subprocesses.
 const mocks = vi.hoisted(() => ({
   forkOmpSession: vi.fn(async () => ({ ok: true, sessionId: "fork-1" })),
+  findOmpSessionCwd: vi.fn(async () => ({ ok: true, cwd: "/workspace" })),
   queryOmpSessions: vi.fn(async () => ({
     ok: true,
     snapshot: { projects: [], sessions: [], total: 0, truncated: false },
@@ -25,6 +26,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("./session-intel.js", () => ({
   forkOmpSession: mocks.forkOmpSession,
+  findOmpSessionCwd: mocks.findOmpSessionCwd,
   queryOmpSessions: mocks.queryOmpSessions,
 }));
 

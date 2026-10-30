@@ -39,6 +39,24 @@ describe("isTerminalRetryable", () => {
   it("does not retry session-init failures (config/init-level, not turn-phase)", () => {
     expect(isTerminalRetryable({ errorCode: "acpx_session_init_failed" })).toBe(false);
   });
+  it("retries a session-init failure whose message says the model could not be restored", () => {
+    expect(isTerminalRetryable({
+      errorCode: "acpx_session_init_failed",
+      errorMessage: "Could not restore model omp/retired-model",
+    })).toBe(true);
+  });
+  it("retries a restore-model init failure when the text is only in errorMeta.causeMessage", () => {
+    expect(isTerminalRetryable({
+      errorCode: "acpx_session_init_failed",
+      errorMeta: { causeMessage: "Could not restore model omp/retired-model" },
+    })).toBe(true);
+  });
+  it("does not retry a plain session-init failure message", () => {
+    expect(isTerminalRetryable({
+      errorCode: "acpx_session_init_failed",
+      errorMessage: "ACP session init failed",
+    })).toBe(false);
+  });
   it("retries protocol / runtime errors (recoverable with a clean context)", () => {
     expect(isTerminalRetryable({ errorCode: "acpx_protocol_error" })).toBe(true);
     expect(isTerminalRetryable({ errorCode: "acpx_runtime_error" })).toBe(true);
@@ -110,7 +128,7 @@ describe("withRetryChain", () => {
 });
 
 describe("runWithFreshSessionRetry", () => {
-  type FakeResult = { errorCode?: string | null; errorMeta?: Record<string, unknown>; model?: string | null; resultJson?: Record<string, unknown> | null };
+  type FakeResult = { exitCode?: number | null; errorCode?: string | null; errorMessage?: string | null; errorMeta?: Record<string, unknown>; model?: string | null; resultJson?: Record<string, unknown> | null };
 
   it("returns the first result unchanged when it is not retryable", async () => {
     const executor = async () => ({ errorCode: null, model: "m1" } as FakeResult);
@@ -136,6 +154,33 @@ describe("runWithFreshSessionRetry", () => {
     // First call runs with the ORIGINAL config (no marker); the retry adds the marker.
     expect((configs[0].env as Record<string, string>).OMP_PAPERCLIP_RETRY).toBeUndefined();
     expect((configs[1].env as Record<string, string>).OMP_PAPERCLIP_RETRY).toBe("1");
+  });
+
+  it("retries a restore-model init failure on a fresh session and succeeds", async () => {
+    const configs: Array<Record<string, unknown>> = [];
+    let calls = 0;
+    const executor = async (ctx: { config: Record<string, unknown> }) => {
+      configs.push(ctx.config);
+      calls += 1;
+      if (calls === 1) {
+        return {
+          errorCode: "acpx_session_init_failed",
+          errorMessage: "Could not restore model omp/retired-model",
+        } as FakeResult;
+      }
+      return { exitCode: 0 } as FakeResult;
+    };
+    const { result, chain } = await runWithFreshSessionRetry(
+      executor,
+      { enabled: true, freshRetries: 1 },
+      { env: {} },
+    );
+    expect(calls).toBe(2);
+    expect(result.exitCode).toBe(0);
+    expect((configs[1].env as Record<string, string>).OMP_PAPERCLIP_RETRY).toBe("1");
+    expect(chain).toHaveLength(2);
+    expect(chain[0]).toMatchObject({ attempt: 0, errorCode: "acpx_session_init_failed", fresh: false });
+    expect(chain[1]).toMatchObject({ attempt: 1, fresh: true });
   });
 
   it("stops retrying once freshRetries is exhausted and returns the last failure", async () => {

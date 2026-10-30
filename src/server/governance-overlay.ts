@@ -214,12 +214,20 @@ export async function materializeGovernanceOverlay(
   // That trade is only sound while the bridge is armed AND has a rule to run:
   // endpoint routing is enforced by omp itself, so it never pays for itself.
   const relaxGate = context.armed === true && parsed.enforceable;
-  if (relaxGate) {
-    lines.push(
-      "tools:",
-      "  approvalMode: yolo",
-    );
+  const tools: string[] = [];
+  if (relaxGate) tools.push("  approvalMode: yolo");
+  // `tools.restrictedFolders` is omp's own fence: it raises an approval prompt
+  // in every approval mode, yolo included. It is written whenever configured —
+  // it is enforced by omp, not by the bridge, so it needs neither `armed` nor an
+  // enforceable rule. On this lane that prompt is answered by the ACP proxy
+  // (approve-all auto-allows), which is why the bridge holds the same folders
+  // as an approval rule; this key is the layer that still works for omp's own
+  // non-ACP paths and for a run that is not armed.
+  const restrictedFolders = parsed.policy.restrictedFolders ?? [];
+  if (restrictedFolders.length > 0) {
+    tools.push("  restrictedFolders:", ...restrictedFolders.map((p) => `    - ${JSON.stringify(p)}`));
   }
+  if (tools.length > 0) lines.push("tools:", ...tools);
   if (plan.disabled.length > 0) {
     lines.push("disabledProviders:", ...plan.disabled.map((p) => `  - ${JSON.stringify(p)}`));
   }

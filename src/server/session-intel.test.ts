@@ -4,7 +4,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  forkOmpSession, queryOmpSessions, type OmpQueryResult, type OmpSessionsSnapshot,
+  findOmpSessionCwd, forkOmpSession, queryOmpSessions,
+  type OmpQueryResult, type OmpSessionsSnapshot,
 } from "./session-intel.js";
 
 const fakeAcp = path.resolve(
@@ -45,6 +46,90 @@ async function queryWithSeen(
   } catch { /* child never started */ }
   return { out, seen };
 }
+
+interface RecordedFrame {
+  method: string;
+  params: Record<string, unknown>;
+}
+
+/** Parse the fixture's `${method}\t${params}` frame log. */
+function readFrames(file: string): RecordedFrame[] {
+  let raw = "";
+  try { raw = readFileSync(file, "utf8"); } catch { return []; }
+  return raw.split("\n").filter(Boolean).map((line) => {
+    const tab = line.indexOf("\t");
+    return {
+      method: tab < 0 ? line : line.slice(0, tab),
+      params: tab < 0 ? {} : JSON.parse(line.slice(tab + 1)) as Record<string, unknown>,
+    };
+  });
+}
+
+/**
+ * Run the source-cwd lookup against the scripted responder and capture both
+ * what the client asked (params included) and the method sequence. The fork
+ * cwd must come from the SOURCE session, so the request shape is the contract.
+ */
+async function findWithFrames(
+  sessionId: string,
+  opts?: { maxPages?: number },
+  mode = "",
+) {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "omp-session-intel-"));
+  tmpDirs.push(dir);
+  const seenFile = path.join(dir, "seen.txt");
+  const frameFile = path.join(dir, "frames.log");
+  const out = await findOmpSessionCwd(
+    {
+      command: process.execPath,
+      args: [fakeAcp],
+      env: {
+        FAKE_ACP_MODE: mode,
+        FAKE_ACP_SEEN_FILE: seenFile,
+        FAKE_ACP_FRAME_LOG: frameFile,
+      },
+    },
+    sessionId,
+    opts,
+  );
+  let seen: string[] = [];
+  try {
+    seen = readFileSync(seenFile, "utf8").split("\n").filter(Boolean);
+  } catch { /* child never started */ }
+  return { out, seen, frames: readFrames(frameFile) };
+}
+
+describe("findOmpSessionCwd", () => {
+  it("returns the source session's own cwd from an unfiltered listing", async () => {
+    const { out, seen, frames } = await findWithFrames("sess-a");
+    expect(out).toEqual({ ok: true, cwd: "/workspace" });
+    // The lookup is the whole read: one handshake and one listing.
+    expect(seen).toEqual(["initialize", "session/list"]);
+    const listings = frames.filter((frame) => frame.method === "session/list");
+    expect(listings).toHaveLength(1);
+    // A source session can live in ANY workspace; scoping the listing to the
+    // caller's cwd would make every cross-workspace id invisible.
+    expect(listings[0].params).not.toHaveProperty("cwd");
+  }, 15_000);
+
+  it("reports a not-found listing for an unknown id", async () => {
+    const { out } = await findWithFrames("sess-01020304");
+    expect(out.ok).toBe(false);
+    if (out.ok) throw new Error(`expected not-found, got cwd ${out.cwd}`);
+    expect(out.error).toMatch(/sess-01020304/);
+  }, 15_000);
+
+  it("follows nextCursor across pages and reports the id as not found", async () => {
+    const { out, frames } = await findWithFrames("sess-absent", { maxPages: 2 }, "page2");
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.error).toMatch(/sess-absent/);
+    // The fixture cannot script a match that appears only on page 2, so pin the
+    // paging contract itself: the cursor is followed exactly once.
+    const listings = frames.filter((frame) => frame.method === "session/list");
+    expect(listings).toHaveLength(2);
+    expect(listings[1].params.cursor).toBe("2");
+  }, 15_000);
+});
 
 describe("queryOmpSessions", () => {
   it("reads the run's own cwd over ACP session/list", async () => {

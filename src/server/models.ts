@@ -43,6 +43,13 @@ export function isFreeCost(cost: OmpModelCost | null | undefined): boolean {
     (cost.cacheWrite ?? 0) === 0;
 }
 
+/**
+ * `omp models ls --json` writes `{ models: [...] }` with no `schemaVersion`
+ * (models-cli.ts `ModelsJson`), so the envelope is unversioned by contract. Each
+ * entry is therefore read BY FIELD and never by position: a missing, extra or
+ * future envelope key changes nothing, and an entry that lacks `provider`/`id`
+ * is skipped instead of shifting the rest.
+ */
 export function parseOmpModelsJson(stdout: string): OmpModelInfo[] {
   let parsed: unknown;
   try {

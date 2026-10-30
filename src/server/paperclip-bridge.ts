@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { promises as fs, readFileSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 
 /**
@@ -258,6 +259,13 @@ interface GuardrailRules {
   budgetCapUsd: number;
   /** Tools held for a human; empty = approval lane off (hoisted from root). */
   approvalRequired: ApprovalRule[];
+  /**
+   * Folders whose calls are held for a human, from the policy root
+   * `restrictedFolders` (the same list the run child gets as omp's
+   * `tools.restrictedFolders`). Enforced here because omp's own prompt is
+   * answered by this lane's ACP proxy, which auto-allows under `approve-all`.
+   */
+  restrictedFolders: string[];
   /** Memoized realpath'd roots, valid only for `rootsCwd`. */
   rootsCwd: string | null;
   roots: string[] | null;
@@ -358,6 +366,12 @@ function normalizeGuardrails(document: Record<string, unknown>): GuardrailRules 
   // may also be written inside the `guardrails` bag by hand.
   const approvalRequired = normalizeApprovalRules(document.approvalRequired ?? bag.approvalRequired);
 
+  // Root-only, like `budgetCapUsd`: the overlay writes it as omp's
+  // `tools.restrictedFolders`, and the gate holds calls that touch it.
+  const restrictedFolders = stringList(document.restrictedFolders)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+
   return {
     pathScopes: normalizePathScopes(bag.pathScopes),
     bashDeny,
@@ -365,6 +379,7 @@ function normalizeGuardrails(document: Record<string, unknown>): GuardrailRules 
     argRevisions,
     budgetCapUsd,
     approvalRequired,
+    restrictedFolders,
     rootsCwd: null,
     roots: null,
   };
@@ -436,6 +451,53 @@ function isWithin(root: string, target: string): boolean {
   if (target === root) return true;
   const prefix = root.endsWith(path.sep) ? root : `${root}${path.sep}`;
   return target.startsWith(prefix);
+}
+
+/** omp expands `~` for `tools.restrictedFolders`; mirror it so both layers agree. */
+function expandHome(entry: string): string {
+  if (entry === "~") return homedir();
+  if (entry.startsWith("~/")) return path.join(homedir(), entry.slice(2));
+  return entry;
+}
+
+/**
+ * The approval rule a call gets for touching a restricted folder, or null.
+ *
+ * Mirrors omp's own `restrictedFolderReason`: the folder covers itself and
+ * everything below it; a tool that names no path is judged by the directory it
+ * runs in (or by its own `cwd` argument). omp raises a prompt for the same
+ * condition, but on this lane that prompt is answered by the ACP proxy, so the
+ * board ask has to come from here.
+ */
+function restrictedFolderRule(
+  event: BridgeToolCallEvent,
+  ctx: BridgeToolCallContext,
+  rules: GuardrailRules,
+): ApprovalRule | null {
+  if (rules.restrictedFolders.length === 0) return null;
+  const toolName = typeof event?.toolName === "string" ? event.toolName : "";
+  if (toolName === "" || CONTROL_TOOLS[toolName]) return null;
+  const input = isRecord(event?.input) ? event.input : {};
+  const base = typeof ctx?.cwd === "string" && ctx.cwd.length > 0 ? ctx.cwd : process.cwd();
+  const named = inputPaths(input);
+  const subjects = named.length > 0
+    ? named
+    : [typeof input.cwd === "string" && input.cwd.length > 0 ? input.cwd : base];
+  for (const entry of rules.restrictedFolders) {
+    const folder = path.resolve(base, expandHome(entry));
+    const folderKey = realpathAncestor(folder);
+    for (const subject of subjects) {
+      if (isWithin(folderKey, realpathAncestor(path.resolve(base, subject)))) {
+        return {
+          tool: toolName,
+          reason: `restricted folder: ${folder}`,
+          risk: "high",
+          matches: () => true,
+        };
+      }
+    }
+  }
+  return null;
 }
 
 /**
@@ -764,7 +826,11 @@ async function holdForApproval(
 ): Promise<BridgeToolCallResult | undefined> {
   const held = (detail: string): BridgeToolCallResult => ({
     block: true,
-    reason: `paperclip governance: ${toolName} requires approval — ${detail}`,
+    // The rule's own reason is the model's only clue to WHAT tripped the gate
+    // (a restricted folder path, an operator note). It belongs in the refusal,
+    // not only on the board card — a bare approval id teaches nothing.
+    reason: `paperclip governance: ${toolName} requires approval`
+      + `${rule.reason ? ` (${rule.reason})` : ""} — ${detail}`,
   });
 
   // One shape for every failure: cache it (so the retry window applies), tell
@@ -904,14 +970,14 @@ function installGovernanceLane(pi: BridgePi): void {
       const guard = evaluateGuardrails(event, ctx, current);
       // A deny outranks approval: never ask a human to approve what policy
       // already forbids, and never spend a board slot on it.
-      if (guard?.block || current.approvalRequired.length === 0) return guard;
+      if (guard?.block) return guard;
       const toolName = typeof event?.toolName === "string" ? event.toolName : "";
       // The control-tool allowlist outranks approval too — holding `yield`
       // for a human strands the run exactly like denying it would.
-      const rule =
-        toolName === "" || CONTROL_TOOLS[toolName]
-          ? null
-          : (current.approvalRequired.find((candidate) => candidate.matches(toolName)) ?? null);
+      const rule = toolName === "" || CONTROL_TOOLS[toolName]
+        ? null
+        : (current.approvalRequired.find((candidate) => candidate.matches(toolName))
+          ?? restrictedFolderRule(event, ctx, current));
       if (!rule) return guard;
       // The approval round-trip is the lane's only awaited path, and every
       // control-plane call inside it is self-bound. It normally holds; once a

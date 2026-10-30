@@ -1,7 +1,7 @@
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import {
   afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi,
@@ -106,6 +106,28 @@ function baseCtx(
   } as AdapterExecutionContext;
 }
 
+interface AcpFrame {
+  method: string;
+  params: Record<string, unknown>;
+}
+
+/**
+ * Parse the fake responder's `${method}\t${params}` frame log. Params are the
+ * contract for side-channel requests (which cwd a fork targets); the response
+ * body cannot show that.
+ */
+async function readAcpFrames(file: string): Promise<AcpFrame[]> {
+  let raw = "";
+  try { raw = await readFile(file, "utf8"); } catch { return []; }
+  return raw.split("\n").filter(Boolean).map((line) => {
+    const tab = line.indexOf("\t");
+    return {
+      method: tab < 0 ? line : line.slice(0, tab),
+      params: tab < 0 ? {} : JSON.parse(line.slice(tab + 1)) as Record<string, unknown>,
+    };
+  });
+}
+
 /** Run-scoped control-tool access as Paperclip hands it to an adapter. */
 function runtimeToolsAccess(mcpEndpoint: string, bearerToken: string): Record<string, unknown> {
   return {
@@ -167,6 +189,28 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     expect(merged.config.env?.OMP_PAPERCLIP_FRESH).toBeUndefined();
     expect(merged.config.env?.OMP_PAPERCLIP_RETRY).toBeUndefined();
   });
+
+  it("forks at the source session's own cwd, not this run's workspace", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "omp-fork-cwd-"));
+    try {
+      const frameFile = path.join(dir, "frames.log");
+      vi.stubEnv("FAKE_ACP_FRAME_LOG", frameFile);
+      const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
+      const run = createOmpAcpExecutor();
+      await run(baseCtx({
+        config: { command: `${process.execPath} ${fakeAcp}`, sessionForkSourceId: "sess-a", sessionForkToken: "t1" },
+        // The run executes in another workspace; the source session's fork must
+        // still target the workspace that session belongs to.
+        context: { taskId: ISSUE_ID, paperclipWorkspace: { cwd: "/run-cwd", source: "workspace" } },
+      }));
+      expect(executorFn).toHaveBeenCalledOnce();
+      const fork = (await readAcpFrames(frameFile)).find((frame) => frame.method === "session/fork");
+      expect(fork).toBeTruthy();
+      expect(fork!.params.cwd).toBe("/workspace");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
 
   it("pins warm-handle reuse to 0 under run identity and reports the dropped opt-in", async () => {
     const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
@@ -475,6 +519,43 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     const merged = executorFn.mock.calls[0][0];
     expect(merged.config.env?.PI_CONFIG_FILES).toBeUndefined();
   });
+
+  it("fails closed when an active governance policy has no bridge extension", async () => {
+    const badBridge = "/nonexistent/paperclip-bridge.js";
+    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const res = await createOmpAcpExecutor({ bridgePath: badBridge })(baseCtx({
+      config: {
+        command: `${process.execPath} ${fakeAcp}`,
+        governancePolicy: "guardrails:\n  denyTools:\n    - web_search",
+      },
+    }));
+    // A policy that cannot reach a bridge enforces nothing: running anyway
+    // would report a governed run with no guardrail, budget or approval rule.
+    expect(res).toMatchObject({ exitCode: 1, errorCode: "omp_governance_unavailable" });
+    expect(res.errorMessage).toContain(badBridge);
+    expect(engineMocks.createAcpxEngineExecutor).not.toHaveBeenCalled();
+  }, 15_000);
+
+  it("runs under governance when the configured bridge extension exists", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "omp-bridge-"));
+    try {
+      const bridge = path.join(dir, "paperclip-bridge.js");
+      await writeFile(bridge, "// test bridge\n");
+      const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+      const res = await createOmpAcpExecutor({ bridgePath: bridge })(baseCtx({
+        config: {
+          command: `${process.execPath} ${fakeAcp}`,
+          governancePolicy: "guardrails:\n  denyTools:\n    - web_search",
+        },
+      }));
+      expect(res.exitCode).toBe(0);
+      expect(executorFn).toHaveBeenCalledOnce();
+      const merged = executorFn.mock.calls[0][0];
+      expect(merged.config.agentCommand).toContain(bridge);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 15_000);
 
   it("a policy whose guardrails normalize to nothing never arms the bridge", async () => {
     const events: { level?: string; message?: string }[] = [];

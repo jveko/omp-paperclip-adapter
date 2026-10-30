@@ -35,8 +35,36 @@ const FRESH_RETRYABLE_CODES = new Set([
   "acpx_runtime_error",
 ]);
 
+/** omp >=18.6.3 refuses to open a session whose recorded model is gone. */
+const RESTORE_MODEL_PATTERN = /Could not restore model/i;
+
+/**
+ * `Could not restore model <provider/id>` is omp >= 18.6.3 refusing to open a
+ * session that recorded a model the catalog no longer has
+ * (`agent-session.ts` `switchSession`, `sdk.ts` `createAgentSession`). It is
+ * not a broken build and not a poisonable turn: the session file itself names
+ * a model that no longer resolves, and the ACP request cannot substitute one.
+ *
+ * A fresh session is the only recovery — it starts from the run's CURRENT
+ * model rather than the stored one — so this is exactly the case the
+ * fresh-session retry exists for, and the reason it must outrank the generic
+ * `acpx_session_init_failed` exclusion (a real init failure, e.g. a missing
+ * binary or an unreadable session, stays terminal).
+ */
+export function isRestoreModelFailure(
+  result: Pick<AdapterExecutionResult, "errorCode" | "errorMessage" | "errorMeta">,
+): boolean {
+  if (result.errorCode !== "acpx_session_init_failed") return false;
+  const errorMeta = (result.errorMeta ?? {}) as Record<string, unknown>;
+  // The engine surfaces omp's ACP error text in errorMessage and, when the
+  // error wrapped a cause, in errorMeta.causeMessage.
+  return [result.errorMessage, errorMeta.causeMessage]
+    .filter((value): value is string => typeof value === "string")
+    .some((text) => RESTORE_MODEL_PATTERN.test(text));
+}
+
 export function isTerminalRetryable(
-  result: Pick<AdapterExecutionResult, "errorCode" | "errorMeta">,
+  result: Pick<AdapterExecutionResult, "errorCode" | "errorMessage" | "errorMeta">,
 ): boolean {
   const code = result.errorCode ?? null;
   if (!code) return false;
@@ -45,7 +73,8 @@ export function isTerminalRetryable(
   // are not retried even if the engine flags retryable.
   if (code === "acpx_auth_required") return false;
   if (code === "acpx_session_config_failed") return false;
-  if (code === "acpx_session_init_failed") return false;
+  // A removed model is recoverable this way; every other init failure is not.
+  if (code === "acpx_session_init_failed") return isRestoreModelFailure(result);
   if (code === "acpx_backend_missing") return false;
   if (code === "acpx_backend_unavailable") return false;
   // An explicit engine retryable flag overrides the code-based default.

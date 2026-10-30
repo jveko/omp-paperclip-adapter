@@ -70,6 +70,19 @@ export interface GovernancePolicy {
    * that is ADVISORY — approving wakes a NEW run, this one never resumes.
    */
   approvalRequired?: GovernanceApprovalRuleInput[];
+  /**
+   * Folders where every tool call that touches them must be held for a human,
+   * in every approval mode. Enforced twice, on purpose:
+   * - omp's own `tools.restrictedFolders` (written by governance-overlay.ts)
+   *   raises a prompt, which this lane's ACP proxy would auto-answer under
+   *   `approve-all`;
+   * - the bridge (paperclip-bridge.ts) matches the call's paths against these
+   *   folders and posts a board approval, which is the ask a human actually
+   *   sees under the single-gate `yolo`.
+   * Paths are handed to omp as written: `~` and relative entries resolve
+   * against the run cwd there, and the bridge mirrors that.
+   */
+  restrictedFolders?: string[];
   [key: string]: unknown;
 }
 
@@ -491,18 +504,33 @@ function normalizePolicy(raw: Record<string, unknown>): {
     delete policy.approvalRequired;
   }
 
+  // A restricted-folder rail is enforced by the bridge as an approval rule, so
+  // it counts as bridge-enforceable: the manifest must exist (and the run must
+  // keep the single gate) or the fence has no handler. A key that names no
+  // usable path is dropped and reported rather than emitted as an empty list,
+  // which omp would read as "nothing restricted".
+  const vacuous = [...audit.vacuous];
+  const restrictedFolders = cleanStrings(raw.restrictedFolders);
+  if (restrictedFolders.length > 0) {
+    policy.restrictedFolders = restrictedFolders;
+  } else {
+    delete policy.restrictedFolders;
+    if (raw.restrictedFolders !== undefined) vacuous.push("restrictedFolders: no usable path");
+  }
+
   // The root budget and approval lanes are read off the document by the bridge
   // itself; an `approvalRequired` inside the bag is already counted by the audit
   // (the bridge reads `document.approvalRequired ?? bag.approvalRequired`).
   const enforceable = audit.enforceable
     || policy.budgetCapUsd !== undefined
-    || policy.approvalRequired !== undefined;
+    || policy.approvalRequired !== undefined
+    || policy.restrictedFolders !== undefined;
   const routing = policy.approvedEndpoints !== undefined;
   return {
     policy,
     live: enforceable || routing,
     enforceable,
-    vacuous: audit.vacuous,
+    vacuous,
   };
 }
 
@@ -559,6 +587,42 @@ function readDocument(text: string): unknown {
 export function governancePolicyActive(config: Record<string, unknown>): boolean {
   const parsed = parseGovernancePolicy(config.governancePolicy);
   return parsed.kind === "ok" && parsed.enforceable;
+}
+
+/**
+ * Reject `permissionMode: deny-all` on top of a policy that scopes or rewrites
+ * tool calls.
+ *
+ * `deny-all` lives in the ACP engine's permission proxy, not in omp: every
+ * request omp still raises — a critical bash command, a restricted folder, and
+ * every gated tool when omp's own approval mode is in force — is refused by the
+ * proxy before the bridge's handler can allow the call. A policy whose
+ * `pathScopes`/`argRevisions` presume those calls run therefore describes a run
+ * that cannot happen, and the operator sees a governed-looking config that
+ * vetoes its own tools. Fail at config time instead of at the first call.
+ *
+ * A deny-only policy is coherent with `deny-all` (both layers agree), and so is
+ * `deny-all` alone, so neither is rejected.
+ */
+export function validateGovernanceGate(config: Record<string, unknown>): string | null {
+  const rawMode = config.permissionMode ?? config.acpPermissionMode;
+  const mode = typeof rawMode === "string" && rawMode.trim() !== "" ? rawMode.trim() : "approve-all";
+  if (mode !== "deny-all") return null;
+  const parsed = parseGovernancePolicy(config.governancePolicy);
+  if (parsed.kind !== "ok") return null;
+  // Same bag choice the bridge and the audit make: a `guardrails` map when
+  // there is one, the document root otherwise (the hand-written shorthand).
+  const guardrails = (parsed.policy.guardrails ?? parsed.policy) as Record<string, unknown>;
+  const scoped = guardrails.pathScopes !== undefined;
+  const revised = typeof guardrails.argRevisions === "object"
+    && guardrails.argRevisions !== null
+    && Object.keys(guardrails.argRevisions).length > 0;
+  if (!scoped && !revised) return null;
+  return "permissionMode is 'deny-all' while the governance policy scopes or rewrites tool calls "
+    + `(${scoped ? "pathScopes" : "argRevisions"}): the ACP proxy refuses every permission request omp `
+    + "still raises, before the bridge can allow it, so those governed calls cannot run. Use "
+    + "'approve-all' (or 'approve-reads') with the governance policy as the single gate, or remove the "
+    + "scope/revision rules and keep deny-all as the only gate.";
 }
 
 /**

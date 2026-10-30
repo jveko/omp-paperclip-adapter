@@ -33,6 +33,55 @@ ACP stdio transport.
 | \`sessionSnapshotDiagnostic\` | \`false\` | log counts from omp's host-wide \`_omp/*\` listing (never ids, cwds or titles) |
 | \`warmHandleIdleMs\` | \`0\` | pinned to \`0\` on every run (see below). The engine sets \`PAPERCLIP_API_KEY\` only when it spawns the child, so a reused process would keep an earlier run's token |
 
+### One run per session
+- Every \`execute()\` holds a per-\`sessionKey\` lease under the agent state dir
+  (\`omp-session-intel/leases/<hash>.json\`) for the whole run. A second heartbeat
+  for the same session is refused with \`omp_session_lease_held\` instead of
+  being queued (a queued heartbeat reports late). Two processes on one session
+  file do not corrupt it — omp moves the non-owner's session to a fresh id on
+  its first write — but the employee's transcript forks invisibly and the next
+  run resumes only one branch.
+- The lease is reclaimed when its owner pid is gone, or after its TTL (4 h, or
+  \`timeoutSec\` + 5 min when that is longer). The file holds a pid, timestamps
+  and the session key — never a credential.
+- \`session/fork\` is sent the SOURCE session's recorded cwd (a bounded
+  \`session/list\` by id), not the current run's: omp rejects the fork when they
+  differ, and the source may live under another workspace. If the source is not
+  in this agent dir's listing, the run warns and forks with the run's cwd.
+- A resumed session whose recorded model no longer exists (\`Could not restore
+  model <provider/id>\`, omp >= 18.6.3) is retried once on a fresh session
+  instead of failing the employee; every other session-init failure stays
+  terminal.
+
+### Governance: the single gate, honestly
+- With \`governancePolicy\` set, the run child gets \`tools.approvalMode: yolo\`
+  through its own config overlay, so the bridge extension's \`tool_call\` handler
+  is the only deterministic gate. A CONFIGURED yolo makes omp skip the
+  permission request for edit/delete/move and allow bash directly, so the
+  engine's ACP permission proxy sees almost none of it. The requests it still
+  sees — a critical bash command, a restricted folder, any tool under omp's
+  default approval mode — are answered purely by \`permissionMode\`; this lane
+  has no human prompt, so \`approve-all\` (the default) auto-allows them and
+  \`deny-all\` refuses them. \`deny-all\` together with \`pathScopes\` or
+  \`argRevisions\` is therefore rejected at config time: the proxy would refuse
+  exactly the calls those rules describe.
+- \`governancePolicy.restrictedFolders\` is enforced twice. It is written to the
+  child as omp's \`tools.restrictedFolders\` (omp raises a prompt in every
+  approval mode, \`yolo\` included) and matched by the bridge, which posts a board
+  approval and blocks the call. Under \`yolo\` the bridge is the ask a human
+  actually sees; omp's prompt is the layer that still works outside ACP. Paths
+  are taken as written (\`~\` and relative entries resolve against the run cwd).
+- Before the run starts, the bridge artifact is checked: a materialized policy
+  plus a missing or unreadable \`dist/paperclip-bridge.js\` fails the run with
+  \`omp_governance_unavailable\` instead of taking \`yolo\` with no extension to
+  replace omp's gate. That is file presence and readability only — whether
+  omp's loader accepts the extension is not observable from the parent, and
+  nothing on the ACP stream reports it.
+- Plan mode is deliberately unavailable. \`plan\`, \`planMode\`, \`planEnabled\`,
+  \`mode: plan\` and a \`--plan\` flag are config errors (\`omp_config_error\`):
+  omp auto-approves a plan when the ACP client has no elicitation/form support,
+  which would delete the approval step plan mode exists for.
+
 ### Session scope and the data fence
 - \`sessionScope\` decides where omp keeps this employee's state. \`shared\`
   (default) is the historical behavior: every omp process on the host resolves
@@ -135,6 +184,12 @@ ACP stdio transport.
   \`detectModel\` reads the configured \`modelRoles.default\` instead of opening a
   throwaway ACP session, and returns the same \`provider/id\` shape the catalog
   uses. Both use the default omp on PATH, not any agent's \`command\` override.
+- Tested against omp **18.13.x** (verified 18.13.1). \`testEnvironment\` fails for
+  a command named \`omp\` outside that minor, and \`peerDependencies\` declares the
+  same range (\`@oh-my-pi/pi-coding-agent\`, optional so npm does not pull the
+  CLI for you). Wrapper commands report their own version, so they are reported
+  as unverified rather than failed. \`omp models ls --json\` is unversioned; the
+  catalog is parsed by field, so a missing or future \`schemaVersion\` is inert.
 - systemd may strip mise shims from PATH; prefer an absolute \`command\`.
 `.trim();
 

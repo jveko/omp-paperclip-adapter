@@ -111,6 +111,53 @@ export function resolveRunDirective(
   return { kind: "none" };
 }
 
+/** Config keys an operator could use to switch plan mode on. */
+const PLAN_MODE_KEYS = ["plan", "planMode", "planEnabled", "planYolo", "planYoloInto"] as const;
+
+/** `--plan`, `--plan opus`, `--plan-yolo`, `--plan-yolo-into <model>`; not `--planning`. */
+const PLAN_FLAG = /(^|\s)--plan(-[a-z-]+)?(\s|=|$)/;
+
+/**
+ * Plan mode is a deliberate "no" for this adapter, and this guard makes that
+ * enforceable instead of advisory.
+ *
+ * omp asks the ACP client to approve a plan before it leaves plan mode, but a
+ * client without `elicitation/form` support is answered `true` by omp itself
+ * (`acp-agent.ts`: `if (!supportsForm) return true`). This adapter declares no
+ * form support, so enabling plan mode would delete the approval step — the
+ * exact opposite of what plan mode is for. Enabling it is therefore a config
+ * error, not a warn: a run that starts in plan mode cannot be rescued later.
+ *
+ * Returns the actionable message, or null when nothing tries to enable it.
+ * Keys omp reads from `config.yml` outside this adapter's surface (`plan.enabled`
+ * inside a `PI_CONFIG_FILES` entry) are the operator's own escape hatch and are
+ * not inspected here.
+ */
+export function validatePlanMode(config: Record<string, unknown>): string | null {
+  const disabled = (source: string): string =>
+    `plan mode is disabled for this adapter (${source}): omp auto-approves the plan whenever the ACP `
+    + "client has no elicitation/form support (acp-agent.ts), so enabling it deletes the approval step "
+    + 'instead of adding one. This is a deliberate "no" until an elicitation client exists — remove it.';
+  for (const key of PLAN_MODE_KEYS) {
+    const value = config[key];
+    const on = value === true
+      || (typeof value === "number" && value !== 0)
+      || (typeof value === "string" && value.trim() !== "" && value.trim() !== "false");
+    if (on) return disabled(key);
+  }
+  for (const key of ["mode", "acpMode"] as const) {
+    const value = config[key];
+    if (typeof value === "string" && value.trim().toLowerCase() === "plan") {
+      return disabled(`${key}: plan`);
+    }
+  }
+  const command = [config.command, config.agentCommand, config.acpAgentCommand]
+    .filter((value): value is string => typeof value === "string")
+    .join(" ");
+  if (PLAN_FLAG.test(command)) return disabled("a command flag");
+  return null;
+}
+
 /** Actionable message when config.thinking holds an out-of-enum value, else null.
  * Mirrors validateCredentialMode: the append itself is fail-open (a bad value
  * just means "use the omp default"), so this only feeds a warn, never an abort. */
@@ -168,7 +215,7 @@ export function getSessionConfigSchema(): AdapterConfigSchema {
       { key: "skillsAsTools", label: "Expose skills as on-demand tools", type: "toggle", default: false,
         hint: `Register each enabled company skill as a native omp tool that returns its instructions on demand, instead of injecting all skill text into the prompt. Reduces context use. ${NEXT_RUN}` },
       { key: "governancePolicy", label: "Governance policy (YAML/JSON)", type: "textarea",
-        hint: `Rules the run's omp child enforces through the paperclip bridge: guardrails (pathScopes, bashDeny, denyTools, argRevisions), budgetCapUsd, approvedEndpoints, approvalRequired. approvalRequired names tools a human must approve first (a bare tool name or {tool, reason?, risk?}; the name may end in *) — a match posts a board approval and BLOCKS the call: advisory, because approving wakes a NEW run while this one never resumes, and an identical retry in the same session is deduped instead of re-posting. budgetCapUsd is a soft PER-SESSION cap the bridge enforces: each omp session — subagents included — gets its own cap (with N in-process subagents the effective ceiling can be (1+N)×cap), and cost only accumulates across runs while a warm handle is reused (cold children make it per-run by default); past it, mutating tools block and read-only/control tools stay open. The same number is also forwarded to the omp child as its own session cost cap (session.maxCost), which refuses the next model request once the session tree reaches it; an early warning fires at 80% of the cap (the adapter's own heuristic). Adding or clearing the key changes PI_CONFIG_FILES and rotates the session once; changing only the number does not. Empty = off. While set, the omp permission proxy auto-approves so the bridge is the single gate; a document that cannot be parsed is skipped with a warning rather than run ungoverned. approvedEndpoints is a provider allow-list: the run gets the complement as omp's disabledProviders, so unapproved endpoints are unreachable — while the configured model's provider and any fallbackChain provider are never disabled (a guard that warns rather than strands the run), and routing is skipped with a warning when no catalog is available to compute a safe complement. Adding or clearing the policy rotates the session (fingerprint change), so rule edits land on the next rotation; changing only which endpoints are approved keeps the path stable, so a cold child (the default) picks the new list up next run while a warm handle keeps the old one. ${NEXT_RUN}` },
+        hint: `Rules the run's omp child enforces through the paperclip bridge: guardrails (pathScopes, bashDeny, denyTools, argRevisions), budgetCapUsd, approvedEndpoints, approvalRequired. approvalRequired names tools a human must approve first (a bare tool name or {tool, reason?, risk?}; the name may end in *) — a match posts a board approval and BLOCKS the call: advisory, because approving wakes a NEW run while this one never resumes, and an identical retry in the same session is deduped instead of re-posting. budgetCapUsd is a soft PER-SESSION cap the bridge enforces: each omp session — subagents included — gets its own cap (with N in-process subagents the effective ceiling can be (1+N)×cap), and cost only accumulates across runs while a warm handle is reused (cold children make it per-run by default); past it, mutating tools block and read-only/control tools stay open. The same number is also forwarded to the omp child as its own session cost cap (session.maxCost), which refuses the next model request once the session tree reaches it; an early warning fires at 80% of the cap (the adapter's own heuristic). Adding or clearing the key changes PI_CONFIG_FILES and rotates the session once; changing only the number does not. Empty = off. While set, the run child's own config carries tools.approvalMode: yolo and the bridge is the single gate; a document that cannot be parsed is skipped with a warning rather than run ungoverned. approvedEndpoints is a provider allow-list: the run gets the complement as omp's disabledProviders, so unapproved endpoints are unreachable — while the configured model's provider and any fallbackChain provider are never disabled (a guard that warns rather than strands the run), and routing is skipped with a warning when no catalog is available to compute a safe complement. Adding or clearing the policy rotates the session (fingerprint change), so rule edits land on the next rotation; changing only which endpoints are approved keeps the path stable, so a cold child (the default) picks the new list up next run while a warm handle keeps the old one. restrictedFolders names folders where every call needs a human: the run child gets them as omp's tools.restrictedFolders (a prompt in every approval mode) and the bridge holds the same paths for a board approval, which is the ask a human actually sees under the single gate. yolo is written as a CONFIGURED approval mode, so omp does not ask its own permission proxy for bash/edit/delete/move — the bridge is their only gate; the proxy still answers whatever omp does ask (critical bash, restricted-folder prompts) and auto-allows it under the default approve-all. Because of that, approvalMode 'deny-all' together with pathScopes or argRevisions is rejected at config time. Plan mode is unavailable: plan/planMode/planEnabled/mode: plan/--plan are config errors, since omp auto-approves a plan when the client has no elicitation support. ${NEXT_RUN}` },
     ],
   };
 }
