@@ -849,6 +849,21 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     // Unknown, not asserted: the adapter never ran the source, so it cannot say
     // what level the fork inherited.
     expect((await loadState(dir)).lastThinking).toEqual({ sessionId: "fork-1", level: null });
+    // ...and the next run re-establishes it instead of leaving every later edit
+    // inert: one fresh session converts "unknown" into "certainly configured".
+    const next = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fresh-4", sessionKey: "sk" } });
+    const events: Array<{ level?: string; message?: string }> = [];
+    await createOmpAcpExecutor()(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, thinking: "high" },
+      runtime: {
+        sessionId: "fork-1", sessionDisplayId: "fork-1", taskKey: "t",
+        sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" },
+      } as AdapterExecutionContext["runtime"],
+      onEvent: async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); },
+    }));
+    expect(next.mock.calls[0][0].runtime.sessionParams).toEqual({});
+    expect(events.some((e) => /unknown/.test(e.message ?? ""))).toBe(true);
+    expect((await loadState(dir)).lastThinking).toEqual({ sessionId: "fresh-4", level: "high" });
   });
 
   it("lets an already-armed threshold rotation keep its own reason", async () => {

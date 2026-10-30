@@ -177,18 +177,22 @@ const NEXT_RUN = "Takes effect on the next run (the adapter has no live connecti
  * `thinking_level_change` entry, ahead of `defaultThinkingLevel`
  * (sdk.ts:2139-2146; agent-session.ts:12811-12835), so a level change on an
  * existing session needs a fresh session to take effect. The record is the
- * level the adapter asked for when the session started; with no record (a state
- * written before this field) or a null level (a fork whose source this adapter
- * never ran) the level is unknown and is adopted rather than rotated on — an
- * upgrade must never reset a running employee, and a fork must not be claimed to
- * run at a level nobody set.
+ * level the adapter asked for when the session started. No record (a state
+ * written before this field, or a session something else replaced) is adopted
+ * rather than rotated on: an upgrade must never reset a running employee. A
+ * record whose LEVEL is null is the running session's own unknown level (a fork
+ * from a session this adapter never ran) and counts as a change, so one fresh
+ * session converts "unknown" into "certainly configured" — leaving it unknown
+ * would make every later edit inert, and the fork must not be claimed to run at
+ * a level nobody set.
  */
 export function thinkingLevelChanged(
   record: { sessionId: string; level: string | null } | null,
   sessionId: string,
   requested: string,
 ): boolean {
-  if (record === null || record.sessionId !== sessionId || record.level === null) return false;
+  if (record === null || record.sessionId !== sessionId) return false;
+  if (record.level === null) return true;
   return record.level !== requested;
 }
 

@@ -913,9 +913,10 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     let thinkingRotateArmed = false;
     if (intelState.pendingRotate === null
       && thinkingLevelChanged(intelState.lastThinking, storedSessionId, requestedThinking)) {
-      const from = intelState.lastThinking?.level ?? "";
+      const recorded = intelState.lastThinking?.level ?? null;
+      const from = recorded === null ? "an unknown inherited level" : recorded === "" ? "omp default" : recorded;
       intelState.pendingRotate = {
-        reason: `thinking level changed from '${from === "" ? "omp default" : from}' to '${requestedThinking === "" ? "omp default" : requestedThinking}'`,
+        reason: `thinking level changed from '${from}' to '${requestedThinking === "" ? "omp default" : requestedThinking}'`,
         at: new Date().toISOString(),
       };
       thinkingRotateArmed = true;

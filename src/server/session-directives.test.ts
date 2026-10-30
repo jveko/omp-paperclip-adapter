@@ -185,6 +185,12 @@ describe("thinkingLevelChanged", () => {
     // Unsetting the level is a change too: the session keeps its stored level.
     expect(thinkingLevelChanged(record, "sess-a", "")).toBe(true);
   });
+  it("re-establishes a level the running session cannot name", () => {
+    // A fork from a session this adapter never ran leaves the level unknown.
+    // Keeping it unknown would make every later edit inert, so the next run
+    // spends one fresh session to make the level certain again.
+    expect(thinkingLevelChanged({ sessionId: "sess-a", level: null }, "sess-a", "high")).toBe(true);
+  });
   it("stays quiet when the level matches, or when the session's level is unknown", () => {
     expect(thinkingLevelChanged(record, "sess-a", "low")).toBe(false);
     // No record: a state written before the record existed, or a fork whose
@@ -192,9 +198,8 @@ describe("thinkingLevelChanged", () => {
     // never resets a running employee.
     expect(thinkingLevelChanged(null, "sess-a", "high")).toBe(false);
     expect(thinkingLevelChanged(record, "sess-b", "high")).toBe(false);
-    // A record whose level could not be known (a fork from a session the
-    // adapter never ran) stays unknown: adopt, never rotate.
-    expect(thinkingLevelChanged({ sessionId: "sess-a", level: null }, "sess-a", "high")).toBe(false);
+    // A record whose level could not be known for ANOTHER session is adopted.
+    expect(thinkingLevelChanged({ sessionId: "sess-b", level: null }, "sess-a", "high")).toBe(false);
   });
 });
 
