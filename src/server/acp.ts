@@ -32,6 +32,7 @@ import { buildSkillsInstructions, skillsDir, type SkillMarkdownSource } from "./
 import { readRetryConfig, runWithFreshSessionRetry, withRetryChain } from "./retry.js";
 import { materializeFailoverOverlay } from "./failover-config.js";
 import { ompEnv } from "./omp-env.js";
+import { prepareSessionScope } from "./session-scope.js";
 import { forkOmpSession, queryOmpSessions } from "./session-intel.js";
 import { materializeSkillManifest } from "./skill-manifest.js";
 import { governancePolicyActive, materializeGovernanceManifest } from "./governance-manifest.js";
@@ -46,7 +47,7 @@ import {
 import {
   buildSessionSnapshotWorkProduct, postWorkProduct, readSessionIntelConfig,
   resolveRunDirective, sessionSnapshotDigestInput, validateCredentialMode,
-  validThinkingLevel, validateThinkingLevel,
+  validateSessionScope, validThinkingLevel, validateThinkingLevel,
 } from "./session-directives.js";
 
 export const DEFAULT_OMP_COMMAND = "omp";
@@ -533,6 +534,28 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
         message: thinkMsg,
       });
     }
+    // Session scope (item 18) is a containment control, so it fails closed
+    // BEFORE any engine work: `isolated` points omp at this agent's own agent
+    // dir, which holds no credential store (agent.db) and no operator config,
+    // so only broker credentials can authenticate a fenced run.
+    const scopeErr = validateSessionScope(ctx.config);
+    if (scopeErr) {
+      return { exitCode: 1, signal: null, timedOut: false, errorCode: "omp_config_error", errorMessage: scopeErr };
+    }
+    const preparedScope = await prepareSessionScope(ctx.config, {
+      companyId: ctx.agent.companyId, agentId: ctx.agent.id,
+    });
+    if (!preparedScope.ok) {
+      return { exitCode: 1, signal: null, timedOut: false, errorCode: "omp_config_error", errorMessage: preparedScope.error };
+    }
+    const sessionScope = preparedScope.prepared.scope;
+    // The fenced config carries PI_CODING_AGENT_DIR (and the folded operator
+    // config.yml) into the run child AND every side channel below; ompEnv
+    // forwards the value it finds here.
+    if (preparedScope.prepared.config !== ctx.config) ctx.config = preparedScope.prepared.config;
+    for (const warning of preparedScope.prepared.warnings) {
+      await ctx.onEvent?.({ eventType: "run.system", stream: "system", level: "warn", message: warning });
+    }
     // Run-scoped control tools (v0.9). The adapter declares
     // `runtimeToolDelivery: "native_mcp"`, so Paperclip must hand the
     // connections server over as an ACP MCP server. Read the channel it
@@ -732,6 +755,28 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     const directive = resolveRunDirective(intel, intelState);
     const storedParams = (ctx.runtime.sessionParams ?? {}) as Record<string, unknown>;
     const sessionCwd = resolveSessionCwd(ctx, storedParams);
+    // A scope flip is the one moment a resumable session is left behind: the
+    // previous transcript sits in the other agent dir and this run's fingerprint
+    // differs, so the engine starts fresh. Say so ONCE (the state records the
+    // scope of every run) instead of cold-starting silently. A state written
+    // before this release reads as null and is treated as the historical
+    // default, so an upgrade alone never warns.
+    const previousScope = intelState.lastScope ?? "shared";
+    if (previousScope !== sessionScope) {
+      const previousSessionId = typeof storedParams.acpSessionId === "string"
+        ? storedParams.acpSessionId
+        : "";
+      if (previousSessionId) {
+        const where = sessionScope === "isolated"
+          ? `this agent's own omp agent dir (${preparedScope.prepared.agentDir})`
+          : "the host-wide omp agent dir";
+        await ctx.onEvent?.({
+          eventType: "run.system", stream: "system", level: "warn",
+          message: `omp sessionScope switched to '${sessionScope}': the previous session (${previousSessionId.slice(0, 12)}) stays where it was and will not be resumed, so this run starts a fresh session in ${where}`,
+        });
+      }
+    }
+    intelState.lastScope = sessionScope;
     // State writes must never fail a completed run: mirror the loadState
     // degrade + the other warn-and-continue degradation paths.
     const persistState = async (): Promise<void> => {
@@ -924,8 +969,20 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
       const ompTokens = resolveOmpAgentCommand(ctx.config).split(/\s+/);
       const query = await queryOmpSessions(
         { command: ompTokens[0], args: ompTokens.slice(1), env: sideChannelEnv },
-        { cwd: sessionCwd },
+        { cwd: sessionCwd, diagnostic: intel.diagnostic },
       );
+      if (query.ok && query.hostDiagnostic) {
+        const host = query.hostDiagnostic;
+        await ctx.onEvent?.({
+          eventType: "run.system", stream: "system",
+          level: host.error ? "warn" : "info",
+          // Counts only: ids, cwds and titles never leave the host, so the
+          // diagnostic cannot become a cross-tenant browser.
+          message: host.error
+            ? `omp host-wide listing diagnostic failed: ${host.error}`
+            : `omp host-wide listing (diagnostic): ${host.sessionCount ?? "?"} sessions across ${host.projectCount ?? "?"} projects on this host — ids, cwds and titles withheld; set sessionScope 'isolated' to stop sharing them`,
+        });
+      }
       if (query.ok) {
         const digest = snapshotDigest(
           sessionSnapshotDigestInput(query.snapshot, usedSessionId),

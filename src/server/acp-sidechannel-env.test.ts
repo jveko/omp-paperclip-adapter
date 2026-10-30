@@ -6,7 +6,7 @@ import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { createOmpAcpExecutor } from "./acp.js";
 import { FAILOVER_CONFIG_FILE } from "./failover-config.js";
 import { GOVERNANCE_CONFIG_FILE } from "./governance-overlay.js";
-import { sessionIntelDir } from "./session-state.js";
+import { ompAgentDir, sessionIntelDir } from "./session-state.js";
 
 // Regression guards for env threading into the fork and session-query side
 // channels. The fork and query call sites in createOmpAcpExecutor must forward
@@ -142,5 +142,28 @@ describe("side-channel env threading", () => {
       path.join(sessionIntelDir("co-1", "agent-1"), FAILOVER_CONFIG_FILE),
       path.join(sessionIntelDir("co-1", "agent-1"), GOVERNANCE_CONFIG_FILE),
     ].join(path.delimiter));
+  });
+
+  it("points both side channels at the fenced agent dir under sessionScope isolated", async () => {
+    const executor = vi.fn(async () => ({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } }));
+    mocks.createAcpxEngineExecutor.mockReturnValue(executor);
+    const ctx = baseCtx({
+      config: {
+        command: "omp", sessionForkSourceId: "sess-a", sessionForkToken: "t-fence",
+        sessionBrowser: true, sessionScope: "isolated",
+        credentialMode: "broker",
+        env: { OMP_AUTH_BROKER_URL: "http://b:8765", OMP_AUTH_BROKER_TOKEN: "tok" },
+      },
+    });
+    ctx.context.taskId = "issue-1";
+    await createOmpAcpExecutor()(ctx);
+    const expected = ompAgentDir("co-1", "agent-1");
+    const forkArg = mocks.forkOmpSession.mock.calls[0][0] as { env?: Record<string, string> };
+    const queryArg = mocks.queryOmpSessions.mock.calls[0][0] as { env?: Record<string, string> };
+    expect(forkArg.env?.PI_CODING_AGENT_DIR).toBe(expected);
+    expect(queryArg.env?.PI_CODING_AGENT_DIR).toBe(expected);
+    // The run child carries the same value, so all three resolve one dir.
+    const merged = executor.mock.calls[0][0] as { config?: { env?: Record<string, string> } };
+    expect(merged.config?.env?.PI_CODING_AGENT_DIR).toBe(expected);
   });
 });

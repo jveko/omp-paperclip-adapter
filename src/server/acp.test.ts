@@ -1631,3 +1631,131 @@ describe("omp-local executor retry composition", () => {
   });
 });
 
+describe("session scope fence", () => {
+  let tmpRoot: string;
+  beforeAll(async () => {
+    tmpRoot = await mkdtemp(path.join(os.tmpdir(), "omp-acp-scope-"));
+  });
+  afterAll(async () => {
+    await rm(tmpRoot, { recursive: true, force: true });
+  });
+  beforeEach(async () => {
+    engineMocks.createAcpxEngineExecutor.mockReset();
+    serverUtilsMocks.readPaperclipSkillSyncPreference.mockReturnValue({
+      explicit: false, desiredSkills: [], desiredSkillEntries: [],
+    });
+    serverUtilsMocks.readPaperclipRuntimeSkillEntries.mockResolvedValue([]);
+    serverUtilsMocks.resolvePaperclipDesiredSkillNames.mockReturnValue([]);
+    serverUtilsMocks.readPaperclipSkillMarkdown.mockResolvedValue(null);
+    modelsMocks.listOmpModels.mockImplementation(async () => modelsMocks.defaultModels);
+    await rm(path.join(tmpRoot, "instances"), { recursive: true, force: true });
+    await mkdir(path.join(tmpRoot, "instances"), { recursive: true });
+    vi.stubEnv("PAPERCLIP_HOME", tmpRoot);
+    vi.stubEnv("PAPERCLIP_INSTANCE_ID", "test-scope");
+    vi.stubEnv("PI_CONFIG_DIR", path.join(tmpRoot, "omp-config"));
+    vi.stubEnv("PI_CODING_AGENT_DIR", "");
+  });
+  afterEach(() => vi.unstubAllEnvs());
+
+  const brokerEnv = { OMP_AUTH_BROKER_URL: "http://b:8765", OMP_AUTH_BROKER_TOKEN: "tok" };
+
+  function scopedCtx(overrides: Partial<AdapterExecutionContext> = {}) {
+    return baseCtx({
+      config: {
+        command: `${process.execPath} ${fakeAcp}`,
+        sessionScope: "isolated",
+        credentialMode: "broker",
+        env: { ...brokerEnv },
+      },
+      ...overrides,
+    });
+  }
+
+  it("fails closed before any engine work when isolated runs without broker credentials", async () => {
+    const executorFn = fakeEngine({ exitCode: 0 });
+    const run = createOmpAcpExecutor();
+    const result = await run(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, sessionScope: "isolated" },
+    }));
+    expect(result.errorCode).toBe("omp_config_error");
+    expect(result.errorMessage).toContain("credentialMode");
+    expect(executorFn).not.toHaveBeenCalled();
+  });
+
+  it("points the run child at the per-agent dir", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    await createOmpAcpExecutor()(scopedCtx());
+    const merged = executorFn.mock.calls[0][0] as { config: { env?: Record<string, string> } };
+    expect(merged.config.env?.PI_CODING_AGENT_DIR).toBe(ompAgentDir("co-1", "agent-1"));
+    // Broker env still rides along: the fenced dir holds no credential store.
+    expect(merged.config.env?.OMP_AUTH_BROKER_URL).toBe("http://b:8765");
+  });
+
+  it("leaves a shared run on the host agent dir", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    await createOmpAcpExecutor()(baseCtx({ config: { command: `${process.execPath} ${fakeAcp}` } }));
+    const merged = executorFn.mock.calls[0][0] as { config: { env?: Record<string, string> } };
+    expect(merged.config.env?.PI_CODING_AGENT_DIR).toBeUndefined();
+  });
+
+  it("warns once when the scope flips away from the previous run's session", async () => {
+    const events: Array<{ level?: string; message?: string }> = [];
+    const onEvent = async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); };
+    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    await createOmpAcpExecutor()(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}` }, onEvent,
+    }));
+    expect(events.some((e) => e.message?.includes("sessionScope"))).toBe(false);
+
+    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "new", sessionKey: "sk-new" } });
+    await createOmpAcpExecutor()(scopedCtx({ onEvent }));
+    const flips = events.filter((e) => e.message?.includes("sessionScope switched"));
+    expect(flips).toHaveLength(1);
+    expect(flips[0].level).toBe("warn");
+    // The previous session is on record, but only its short id may be logged.
+    expect(flips[0].message).not.toContain("sessionKey");
+    const state = await loadState(sessionIntelDir("co-1", "agent-1"));
+    expect(state.lastScope).toBe("isolated");
+  });
+
+  it("does not warn again on the next isolated run", async () => {
+    const events: Array<{ level?: string; message?: string }> = [];
+    const onEvent = async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); };
+    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    await createOmpAcpExecutor()(baseCtx({ config: { command: `${process.execPath} ${fakeAcp}` } }));
+    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "new", sessionKey: "sk-new" } });
+    await createOmpAcpExecutor()(scopedCtx({ onEvent }));
+    const first = events.filter((e) => e.message?.includes("sessionScope switched")).length;
+    expect(first).toBe(1);
+    events.length = 0;
+    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "new", sessionKey: "sk-new" } });
+    await createOmpAcpExecutor()(scopedCtx({ onEvent }));
+    expect(events.filter((e) => e.message?.includes("sessionScope switched"))).toHaveLength(0);
+  });
+
+  it("reports the host-wide listing as counts only when the diagnostic is on", async () => {
+    const events: Array<{ level?: string; message?: string }> = [];
+    const onEvent = async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); };
+    const browserConfig = { sessionBrowser: "true" } as Record<string, unknown>;
+    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    await createOmpAcpExecutor()(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, sessionSnapshotDiagnostic: true, ...browserConfig },
+      onEvent,
+    }));
+    const diagnostic = events.filter((e) => e.message?.includes("host-wide listing"));
+    expect(diagnostic).toHaveLength(1);
+    expect(diagnostic[0].message).toContain("2 sessions");
+    expect(diagnostic[0].message).toContain("1 project");
+    expect(diagnostic[0].message).not.toContain("sess-a");
+  });
+
+  it("emits no host-wide diagnostic by default", async () => {
+    const events: Array<{ level?: string; message?: string }> = [];
+    const onEvent = async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); };
+    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    await createOmpAcpExecutor()(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}` }, onEvent,
+    }));
+    expect(events.some((e) => e.message?.includes("host-wide listing"))).toBe(false);
+  });
+});
