@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { evaluateOtlpCheck } from "./test.js";
+import { evaluateOtlpCheck, evaluateSessionScopeCheck } from "./test.js";
+import { validateSessionScope } from "./session-directives.js";
 
 describe("evaluateOtlpCheck", () => {
   it("off when no endpoint", () => {
@@ -27,5 +28,30 @@ describe("evaluateOtlpCheck", () => {
     const c = evaluateOtlpCheck({ OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: "http://c:4318/v1/metrics", OTEL_EXPORTER_OTLP_METRICS_PROTOCOL: "grpc" });
     expect(c?.level).toBe("warn");
     expect(c?.code).toBe("omp_otlp_protocol_unsupported");
+  });
+});
+describe("evaluateSessionScopeCheck", () => {
+  it("warns that the default scope shares sessions host-wide", () => {
+    const check = evaluateSessionScopeCheck({});
+    expect(check.level).toBe("warn");
+    expect(check.code).toBe("omp_sessions_shared");
+    expect(check.message).toContain("host-wide");
+  });
+  it("fails isolated without broker credentials, same message as the run path", () => {
+    const check = evaluateSessionScopeCheck({ sessionScope: "isolated" });
+    expect(check.level).toBe("error");
+    expect(check.code).toBe("omp_config_error");
+    expect(check.message).toBe(validateSessionScope({ sessionScope: "isolated" }));
+  });
+  it("fails an unknown scope rather than silently running shared", () => {
+    const check = evaluateSessionScopeCheck({ sessionScope: "Isolated" });
+    expect(check.level).toBe("error");
+    expect(check.code).toBe("omp_config_error");
+  });
+  it("reports an isolated, broker-backed scope as clean", () => {
+    const check = evaluateSessionScopeCheck({ sessionScope: "isolated", credentialMode: "broker" });
+    expect(check.level).toBe("info");
+    expect(check.code).toBe("omp_sessions_isolated");
+    expect(check.message).toContain("omp-agent");
   });
 });

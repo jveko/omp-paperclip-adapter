@@ -12,6 +12,7 @@ import {
 } from "@paperclipai/adapter-utils/execution-target";
 import { parseOmpVersion, probeOmpAcpSession, resolveOmpAgentCommand } from "./acp.js";
 import { ompEnv } from "./omp-env.js";
+import { resolveSessionScope, validateSessionScope } from "./session-directives.js";
 
 function run(command: string, args: string[], timeoutMs: number, env?: Record<string, string>): Promise<string> {
   return new Promise<string>((resolve) => {
@@ -28,6 +29,35 @@ function pickOtel(src: Record<string, unknown> | undefined): Record<string, unkn
   }
   return out;
 }
+/**
+ * Report the session scope this agent would run under. `shared` is not an
+ * error — it is the historical default — but it must be visible as a warning,
+ * because it means every omp employee on this host shares one agent dir
+ * (sessions, titles, caches, credentials). `isolated` reuses the run path's
+ * validator, so the test screen and the heartbeat fail on the same configs for
+ * the same reason.
+ */
+export function evaluateSessionScopeCheck(
+  config: Record<string, unknown>,
+): AdapterEnvironmentCheck {
+  const invalid = validateSessionScope(config);
+  if (invalid) return { level: "error", code: "omp_config_error", message: invalid };
+  if (resolveSessionScope(config) === "isolated") {
+    return {
+      level: "info",
+      code: "omp_sessions_isolated",
+      message: "sessionScope=isolated: sessions, titles and caches live in this agent's own omp agent dir (`companies/<company>/acp-engine/agents/<agent>/omp-agent`)",
+      detail: "The run creates that dir on first use and resolves PI_CODING_AGENT_DIR to it; credentials come from the auth broker only.",
+    };
+  }
+  return {
+    level: "warn",
+    code: "omp_sessions_shared",
+    message: "sessionScope=shared: this employee uses the host-wide omp agent dir, so sessions, titles, caches and config are shared with every other omp agent on this host",
+    detail: "Set sessionScope=isolated (with credentialMode=broker) to give this agent its own omp sessions and caches.",
+  };
+}
+
 export function evaluateOtlpCheck(env: Record<string, unknown>): AdapterEnvironmentCheck {
   const signals = ["", "TRACES_", "LOGS_", "METRICS_"] as const;
   const endpoints = signals
@@ -170,7 +200,9 @@ export async function testEnvironment(
       ? { level: "info", code: "omp_broker_reachable", message: "auth-broker reachable", detail: stdout.slice(0, 200) }
       : { level: "warn", code: "omp_broker_unreachable", message: "credentialMode=broker but `omp auth-broker status` did not report a reachable broker", detail: stdout.slice(0, 200) || "no output" });
   }
-  // 7. OTLP export diagnostic (agent env overrides host env)
+  // 7. session scope (item 18 containment control)
+  checks.push(evaluateSessionScopeCheck(config));
+  // 8. OTLP export diagnostic (agent env overrides host env)
   checks.push(evaluateOtlpCheck({ ...pickOtel(process.env), ...pickOtel(env) }));
 
   return {
