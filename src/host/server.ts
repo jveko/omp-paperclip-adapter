@@ -19,9 +19,9 @@ import {
 } from "./protocol.js";
 import { clearRunContext, reapRunContexts, runContextPointer, writeRunContext } from "./run-context.js";
 import {
-  acquireHostLock, clearDiscovery, ensureHostDirIn, hostRootDir, isDiscoveryStale,
-  newHostToken, readDiscovery, readProcessStartIdentity, socketPathIn, writeDiscovery,
-  type HostDiscovery,
+  acquireHostLock, clearDiscovery, clearDiscoveryOwned, ensureHostDirIn, hostRootDir,
+  isDiscoveryStale, newHostToken, readDiscovery, readProcessStartIdentity, socketPathIn,
+  writeDiscovery, type HostDiscovery,
 } from "./socket.js";
 import { RpcWorker, type RpcFrame } from "./worker.js";
 
@@ -69,6 +69,8 @@ const DEFAULT_MAX_WORKERS = 8;
 const DEFAULT_RUN_LEASE_TTL_MS = 90_000;
 const DEFAULT_DRAIN_MS = 30_000;
 const DEFAULT_CANCEL_GRACE_MS = 5_000;
+/** Bytes of unterminated frame one connection may buffer before it is dropped. */
+const MAX_IPC_LINE_CHARS = 16 * 1024 * 1024;
 
 function positiveEnv(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -102,8 +104,10 @@ interface Fingerprint {
 
 interface WorkerEntry {
   key: string;
+  /** Stable, filesystem-safe identity for this worker's run-context directory. */
+  workerId: string;
+  runContextPointer: string;
   worker: RpcWorker;
-  begin: RunBeginFrame;
   fingerprint: Fingerprint;
   sessionDir: string;
   sessionKey: string;
@@ -137,7 +141,8 @@ interface RunState {
   ompSessionId: string;
   sessionFile: string | null;
   seq: number;
-  connection: Connection;
+  /** Every connection waiting on this run (a retried begin attaches, never duplicates). */
+  connections: Set<Connection>;
   runContextPath: string;
   leaseOwner: string;
   leaseRelease: () => Promise<void>;
@@ -146,7 +151,6 @@ interface RunState {
   leaseTimer?: NodeJS.Timeout;
   timeoutTimer?: NodeJS.Timeout;
   outcome: PromptOutcome | null;
-  settledResult: AdapterExecutionResult | null;
   /** Set when the caller is gone: the settle is journaled as lost, not settled. */
   abandoned: "adapter_gone" | null;
   terminal: boolean;
@@ -340,6 +344,13 @@ class Supervisor {
     this.touch();
     socket.on("data", (chunk: Buffer) => {
       connection.buffer += connection.decoder.write(chunk);
+      // A frame that never ends must not grow the shared supervisor without
+      // bound: prompts are large but finite, and 16 MiB is far above one.
+      if (connection.buffer.length > MAX_IPC_LINE_CHARS) {
+        this.send(connection, { type: "error", code: "frame_too_large", message: "the frame exceeded the supervisor's line limit" });
+        socket.destroy();
+        return;
+      }
       let newline = connection.buffer.indexOf("\n");
       while (newline >= 0) {
         const line = connection.buffer.slice(0, newline);
@@ -356,7 +367,9 @@ class Supervisor {
       const runId = connection.runId;
       if (runId !== null) {
         const run = this.runs.get(runId);
-        if (run !== undefined && !run.terminal) void this.adapterGone(run);
+        if (run === undefined || run.terminal) return;
+        run.connections.delete(connection);
+        if (run.connections.size === 0) void this.adapterGone(run);
       }
     });
   }
@@ -424,19 +437,24 @@ class Supervisor {
 
   private emitEvent(run: RunState, kind: RunEventKind, payload: Record<string, unknown>): void {
     run.seq += 1;
-    this.send(run.connection, {
+    const frame: HostReply = {
       type: "run.event",
       runId: run.runId,
       seq: run.seq,
       at: new Date().toISOString(),
       kind,
       payload,
-    });
+    };
+    for (const connection of run.connections) this.send(connection, frame);
   }
 
   private sendSettled(connection: Connection, runId: string, result: AdapterExecutionResult): void {
     const frame: RunSettledFrame = { type: "run.settled", runId, result };
     this.send(connection, frame);
+  }
+
+  private broadcastSettled(run: RunState, result: AdapterExecutionResult): void {
+    for (const connection of run.connections) this.sendSettled(connection, run.runId, result);
   }
 
   private probe(frame: Extract<HostFrame, { type: "probe" }>): HostReply {
@@ -467,13 +485,7 @@ class Supervisor {
   private async statusOf(id: string, runId: string): Promise<HostReply> {
     const run = this.runs.get(runId);
     if (run !== undefined) {
-      return {
-        type: "run.status.result",
-        id,
-        runId,
-        state: run.terminal ? "settled" : "prompting",
-        ...(run.settledResult !== null ? { settled: run.settledResult } : {}),
-      };
+      return { type: "run.status.result", id, runId, state: "prompting" };
     }
     const ledger = this.ledger;
     if (ledger !== null) {
@@ -511,8 +523,11 @@ class Supervisor {
 
     const known = this.runs.get(begin.runId);
     if (known !== undefined) {
-      if (known.settledResult !== null) this.sendSettled(connection, begin.runId, known.settledResult);
-      else this.sendAccepted(connection, known);
+      // A retried begin after a transport hiccup joins the live run instead of
+      // starting a second prompt; it will receive the same terminal frame.
+      known.connections.add(connection);
+      connection.runId = known.runId;
+      this.sendAccepted(connection, known);
       return;
     }
     const prior = ledger.snapshot().get(begin.runId);
@@ -528,6 +543,11 @@ class Supervisor {
     }
     if (this.shuttingDown) {
       await refuse("config_error", "omp_host_shutting_down", "the omp supervisor is draining and does not accept new runs");
+      return;
+    }
+    const mismatch = this.sessionKeyMismatch(begin);
+    if (mismatch !== null) {
+      await refuse("config_error", "omp_config_error", mismatch);
       return;
     }
 
@@ -596,7 +616,7 @@ class Supervisor {
       ompSessionId: begin.session.ompSessionId ?? "",
       sessionFile: null,
       seq: 0,
-      connection,
+      connections: new Set([connection]),
       runContextPath: "",
       leaseOwner: lease.owner,
       leaseRelease: lease.release,
@@ -604,7 +624,6 @@ class Supervisor {
       leaseMisses: 0,
 
       outcome: null,
-      settledResult: null,
       abandoned: null,
       terminal: false,
       startedAtMs: Date.now(),
@@ -650,7 +669,7 @@ class Supervisor {
       run.statsBefore = readStats(await worker.worker.getStats().catch(() => ({})));
 
       run.runContextPath = await writeRunContext(
-        this.root, run.runId, begin.credentials, begin.manifests,
+        this.root, worker.workerId, run.runId, begin.credentials, begin.manifests,
       );
       this.attach(run);
       await this.journal(this.runRecord(run, "prompting", {
@@ -950,8 +969,6 @@ class Supervisor {
       summary: run.lastAssistantText ?? outcome.stopReason ?? status,
       ...(outcome.executionRecovery !== undefined ? { executionRecovery: outcome.executionRecovery } : {}),
     };
-    run.settledResult = result;
-
     const record = this.runRecord(run, outcome.kind, {
       ...(outcome.cause !== undefined ? { cause: outcome.cause } : {}),
       detail: {
@@ -972,8 +989,8 @@ class Supervisor {
         message: `the run ledger could not record the settle: ${err instanceof Error ? err.message : String(err)}`,
       });
     });
-    await clearRunContext(this.root, run.runId).catch(() => {});
-    if (!run.connection.closed) {
+    await clearRunContext(this.root, run.worker.workerId, run.runId).catch(() => {});
+    if ([...run.connections].some((connection) => !connection.closed)) {
       const receipt = {
         usage: { inputTokens: used.input, outputTokens: used.output, cachedInputTokens: used.cacheRead },
         usageBasis: "per_run" as const,
@@ -982,7 +999,7 @@ class Supervisor {
         complete: true,
       };
       this.emitEvent(run, "omp.usage", receipt);
-      this.sendSettled(run.connection, run.runId, result);
+      this.broadcastSettled(run, result);
     }
     await this.journal(this.runRecord(run, "closed", { cause: outcome.cause ?? "clean" })).catch(() => {});
     await run.leaseRelease().catch(() => {});
@@ -1004,7 +1021,18 @@ class Supervisor {
   }
 
   private sessionDirFor(begin: RunBeginFrame): string {
-    return `${this.root}/sessions/${hashText(begin.sessionKey)}`;
+    // Tenant identity is part of the directory: a sessionKey that names another
+    // agent must never resume that agent's transcript. The prefix check below
+    // rejects the mismatch up front; the hash keeps the path tenant-scoped anyway.
+    return `${this.root}/sessions/${hashText(begin.agent.companyId, begin.agent.id, begin.sessionKey)}`;
+  }
+
+  /** A sessionKey minted for another agent is a caller bug, not a resume. */
+  private sessionKeyMismatch(begin: RunBeginFrame): string | null {
+    const match = /^paperclip:([^:]+):([^:]+):/.exec(begin.sessionKey);
+    if (match === null) return null;
+    if (match[1] === begin.agent.companyId && match[2] === begin.agent.id) return null;
+    return `sessionKey '${begin.sessionKey}' belongs to another agent (company '${match[1]}', agent '${match[2]}')`;
   }
 
   private async ompVersionOf(command: string): Promise<string | null> {
@@ -1042,7 +1070,8 @@ class Supervisor {
       await this.retireWorker(idle);
     }
     const sessionDir = this.sessionDirFor(begin);
-    const runContext = runContextPointer(this.root);
+    const workerId = hashText(key);
+    const runContext = runContextPointer(this.root, workerId);
     const worker = await RpcWorker.spawn({
       command: begin.worker.command,
       args: begin.worker.args,
@@ -1051,8 +1080,9 @@ class Supervisor {
     });
     const entry: WorkerEntry = {
       key,
+      workerId,
+      runContextPointer: runContext,
       worker,
-      begin,
       fingerprint,
       sessionDir,
       sessionKey: begin.sessionKey,
@@ -1163,7 +1193,7 @@ class Supervisor {
       await done.promise;
     }
     await unlink(this.socketPath).catch(() => {});
-    await clearDiscovery(this.root);
+    await clearDiscoveryOwned(this.root, process.pid, this.epoch);
     if (this.ledger !== null) await this.ledger.close().catch(() => {});
     this.ledger = null;
     if (this.lock !== null) await this.lock.release().catch(() => {});
@@ -1223,7 +1253,9 @@ async function reconcileWith(rootDir: string, ledger: RunLedger): Promise<{
       const expected = record.worker?.startIdentity ?? null;
       if (!alive) {
         orphan = "gone";
-      } else if (expected !== null && identity !== null && expected !== identity) {
+      } else if (expected === null || identity === null || expected !== identity) {
+        // A live pid we cannot match to the recorded start identity may be a
+        // recycled pid owned by an unrelated process: never signal it.
         orphan = "unverified";
       } else {
         const pgid = record.worker?.pgid ?? pid;

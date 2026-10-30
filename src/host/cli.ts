@@ -3,7 +3,8 @@ import { HostClient } from "./client.js";
 import { readLedgerRecords } from "./ledger.js";
 import { reconcile, startHost } from "./server.js";
 import {
-  clearDiscovery, hostRootDir, isDiscoveryStale, readDiscovery, readProcessStartIdentity,
+  acquireHostLock, clearDiscovery, hostRootDir, isDiscoveryStale, readDiscovery,
+  readProcessStartIdentity,
 } from "./socket.js";
 
 /**
@@ -54,21 +55,35 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
     case "stop":
       return stopHost(rootDir, io);
     case "gc": {
-      const result = await reconcile(rootDir);
-      let socket = "kept";
-      const discovery = await readDiscovery(rootDir);
-      if (discovery !== null) {
-        const identity = await readProcessStartIdentity(discovery.pid);
-        if (isDiscoveryStale(discovery, identity)) {
-          await unlink(discovery.socket).catch(() => {});
-          await clearDiscovery(rootDir);
-          socket = "removed";
-        }
+      // Only a host that holds the lock may reconcile: compaction swaps the
+      // ledger inode under a live host, and the reconcile would kill its workers
+      // and delete its run-context tokens. Refuse while a supervisor is live.
+      let lock: { release: () => Promise<void> };
+      try {
+        lock = await acquireHostLock(rootDir);
+      } catch (err) {
+        io.err(`refusing to gc: ${err instanceof Error ? err.message : String(err)}\n`);
+        return 1;
       }
-      io.out(
-        `gc: killed=${result.killed.length} lost=${result.lost} run-context=${result.runContexts} socket=${socket}\n`,
-      );
-      return 0;
+      try {
+        const result = await reconcile(rootDir);
+        let socket = "kept";
+        const discovery = await readDiscovery(rootDir);
+        if (discovery !== null) {
+          const identity = await readProcessStartIdentity(discovery.pid);
+          if (isDiscoveryStale(discovery, identity)) {
+            await unlink(discovery.socket).catch(() => {});
+            await clearDiscovery(rootDir);
+            socket = "removed";
+          }
+        }
+        io.out(
+          `gc: killed=${result.killed.length} lost=${result.lost} run-context=${result.runContexts} socket=${socket}\n`,
+        );
+        return 0;
+      } finally {
+        await lock.release();
+      }
     }
     case "ledger": {
       if (args[0] !== "tail") {
@@ -130,6 +145,13 @@ async function stopHost(rootDir: string, io: CliIo): Promise<number> {
     await clearDiscovery(rootDir);
     io.out(`host not running (removed the stale record for pid ${discovery.pid})\n`);
     return 0;
+  }
+  // isDiscoveryStale is conservative about an unknown identity; a LIVE pid whose
+  // identity cannot be confirmed may be an unrelated process that recycled the
+  // pid, so signal only on positive evidence.
+  if (discovery.startIdentity === null || identity === null) {
+    io.err(`cannot verify that pid ${discovery.pid} is this instance's supervisor; refusing to signal it\n`);
+    return 1;
   }
   try {
     process.kill(discovery.pid, "SIGTERM");

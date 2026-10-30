@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import os from "node:os";
@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { encodeFrame, type HostFrame, type HostReply, type RunBeginFrame } from "./protocol.js";
 import { startHost, reconcile, type RunningHost } from "./server.js";
 import { RunLedger, readLedgerRecords } from "./ledger.js";
-import { runContextPointer } from "./run-context.js";
+import { RUN_CONTEXT_FILE } from "./run-context.js";
 import { readProcessStartIdentity } from "./socket.js";
 
 const fixture = path.resolve(
@@ -147,7 +147,8 @@ describe("supervisor", () => {
         ]);
       });
       await vi.waitFor(async () => {
-        await expect(stat(runContextPointer(root))).rejects.toThrow();
+        const dirs = await readdir(path.join(root, "run-context")).catch(() => []);
+        expect(dirs).toEqual([]);
       });
       expect(running.workers).toBe(0);
     } finally {
@@ -229,13 +230,39 @@ describe("supervisor", () => {
     }
   }, 20_000);
 
+  it("keeps concurrent runs' credential pointers separate", async () => {
+    const running = await start({ maxWorkers: 4 });
+    const first = await connectClient(running.socketPath);
+    const second = await connectClient(running.socketPath);
+    try {
+      first.send(beginFrame({ runId: "run-1", mode: "hang", sessionKey: "sk-1" }));
+      second.send(beginFrame({ runId: "run-2", mode: "hang", sessionKey: "sk-2" }));
+      const a = await first.waitFor((frame) => frame.type === "run.accepted");
+      const b = await second.waitFor((frame) => frame.type === "run.accepted");
+      if (a.type !== "run.accepted" || b.type !== "run.accepted") throw new Error("unreachable");
+      expect(a.runContextPath).not.toBe(b.runContextPath);
+      const recordA = JSON.parse(await readFile(a.runContextPath, "utf8")) as { runId: string };
+      const recordB = JSON.parse(await readFile(b.runContextPath, "utf8")) as { runId: string };
+      expect(recordA.runId).toBe("run-1");
+      expect(recordB.runId).toBe("run-2");
+      // Each worker's pointer resolves inside its own directory, so a second
+      // run can never rebind the file the first run's bridge reads.
+      expect(path.dirname(a.runContextPath)).not.toBe(path.dirname(b.runContextPath));
+    } finally {
+      first.close();
+      second.close();
+    }
+  }, 20_000);
+
   it("writes the run JWT to a 0600 run-context file and removes it after settle", async () => {
     const running = await start();
     const client = await connectClient(running.socketPath);
     try {
       client.send(beginFrame({ runId: "run-1", mode: "hang" }));
-      await client.waitFor((frame) => frame.type === "run.accepted");
-      const pointer = runContextPointer(root);
+      const accepted = await client.waitFor((frame) => frame.type === "run.accepted");
+      if (accepted.type !== "run.accepted") throw new Error("unreachable");
+      const pointer = accepted.runContextPath;
+      expect(pointer.endsWith(RUN_CONTEXT_FILE)).toBe(true);
       expect((await stat(pointer)).mode & 0o777).toBe(0o600);
       const record = JSON.parse(await readFile(pointer, "utf8")) as { runId: string; credentials: { apiKey: string } };
       expect(record.runId).toBe("run-1");
@@ -253,6 +280,31 @@ describe("supervisor", () => {
   it("refuses a second supervisor on the same root", async () => {
     await start();
     await expect(startHost({ rootDir: root })).rejects.toThrow(/another omp-host|lock/i);
+  });
+
+  it("refuses to signal an orphan whose start identity is unknown", async () => {
+    const child = spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
+    const pid = child.pid as number;
+    child.unref();
+    try {
+      const ledger = await RunLedger.open(root);
+      await ledger.append({
+        epoch: "old-host", runId: "run-old", companyId: "co-1", agentId: "agent-1",
+        sessionKey: "sk-old", cwd: root, state: "prompting",
+        worker: {
+          pid, pgid: pid, startedAt: new Date().toISOString(), startIdentity: null,
+          argvHash: "a", bridgeHash: "b", ompVersion: null,
+        },
+      });
+      await ledger.close();
+      const result = await reconcile(root);
+      expect(result.killed).toEqual([]);
+      expect((await readLedgerRecords(root)).find((record) => record.state === "lost")?.detail)
+        .toMatchObject({ orphan: "unverified" });
+      expect(() => process.kill(pid, 0)).not.toThrow();
+    } finally {
+      process.kill(pid, "SIGKILL");
+    }
   });
 
   it("reconciles a crashed host: kills the orphan and journals one lost/host_exit", async () => {

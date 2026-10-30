@@ -1,23 +1,36 @@
-import { chmod, mkdir, readFile, readdir, readlink, rename, symlink, unlink, writeFile } from "node:fs/promises";
+import {
+  chmod, mkdir, readFile, readdir, readlink, rename, rmdir, symlink, unlink, writeFile,
+} from "node:fs/promises";
 import path from "node:path";
 import type { Credentials, Manifests } from "./protocol.js";
 
 /**
  * The per-run credential context (reshape-architecture.md §3.3, C5).
  *
- * A warm worker's env cannot change, so the run JWT cannot live there. The
- * worker's env carries one stable path (`PAPERCLIP_RUN_CONTEXT`) and the host
- * rebinds the file behind it before each prompt:
+ * A warm worker's env cannot change, so the run JWT cannot live there. Each
+ * worker gets its own stable directory and its env carries one path into it:
  *
- *   run-context/<runId>.json   the 0600 credential + manifest record
- *   run-context/current.json   an atomically replaced symlink to it
+ *   run-context/<workerId>/<runId>.json   the 0600 credential record
+ *   run-context/<workerId>/current.json   an atomically replaced pointer to it
+ *
+ * The directory is per worker (not host-global) because concurrent runs share
+ * this host: a single `current.json` would let run B's begin rebind the file
+ * run A's bridge reads, writing A's approvals as B's company. One worker runs
+ * at most one run at a time, so a per-worker pointer cannot be rebound under a
+ * live run.
  *
  * The bridge re-reads `current.json` per call, so a run's token never outlives
- * its settle (the file and the pointer are unlinked together) and a crashed
- * host's leftovers are reaped on the next start.
+ * its settle, and a crashed host's leftovers are reaped on the next start.
  */
 
 export const RUN_CONTEXT_FILE = "current.json";
+const WORKER_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+function assertWorkerId(workerId: string): void {
+  if (!WORKER_ID.test(workerId) || workerId === "." || workerId === "..") {
+    throw new Error(`invalid run-context worker id '${workerId}'`);
+  }
+}
 
 export interface RunContextRecord {
   v: 1;
@@ -26,27 +39,33 @@ export interface RunContextRecord {
   manifests: Manifests;
 }
 
-export function runContextDir(hostRoot: string): string {
+export function runContextRoot(hostRoot: string): string {
   return path.join(hostRoot, "run-context");
 }
 
-export function runContextPointer(hostRoot: string): string {
-  return path.join(runContextDir(hostRoot), RUN_CONTEXT_FILE);
+export function runContextDir(hostRoot: string, workerId: string): string {
+  assertWorkerId(workerId);
+  return path.join(runContextRoot(hostRoot), workerId);
+}
+
+export function runContextPointer(hostRoot: string, workerId: string): string {
+  return path.join(runContextDir(hostRoot, workerId), RUN_CONTEXT_FILE);
 }
 
 /**
- * Write the run's record and point the stable path at it. The record is written
- * first (0600), then `current.json` is replaced atomically: a bridge call
+ * Write the run's record and point the worker's stable path at it. The record is
+ * written first (0600), then `current.json` is replaced atomically: a bridge call
  * either sees the previous run's complete record or this run's, never a partial
  * file. Returns the env-stable path.
  */
 export async function writeRunContext(
   hostRoot: string,
+  workerId: string,
   runId: string,
   credentials: Credentials,
   manifests: Manifests,
 ): Promise<string> {
-  const dir = runContextDir(hostRoot);
+  const dir = runContextDir(hostRoot, workerId);
   await mkdir(dir, { recursive: true, mode: 0o700 });
   await chmod(dir, 0o700);
   const record: RunContextRecord = { v: 1, runId, credentials, manifests };
@@ -63,7 +82,7 @@ export async function writeRunContext(
     await rename(pointerTmp, pointer);
   } catch {
     // Filesystems without symlinks: the pointer becomes a plain copy. The
-    // bridge reads either shape the same way.
+    // bridge reads either shape the same way, and clear/reap can tell them apart.
     await writeFile(pointerTmp, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
     await chmod(pointerTmp, 0o600);
     await rename(pointerTmp, pointer);
@@ -71,63 +90,73 @@ export async function writeRunContext(
   return pointer;
 }
 
-/**
- * Unlink this run's record and, only when it still points at this run, the
- * stable pointer. A newer run's context is never removed by an older settle.
- */
-export async function clearRunContext(hostRoot: string, runId: string): Promise<void> {
-  const dir = runContextDir(hostRoot);
-  const pointer = path.join(dir, RUN_CONTEXT_FILE);
+/** The run a pointer names, whether it is a symlink or a plain copy. */
+async function pointerRunId(pointer: string): Promise<string | null> {
   try {
-    const link = await readlink(pointer);
-    if (path.basename(link) === `${runId}.json`) await unlink(pointer);
+    return path.basename(await readlink(pointer)).replace(/\.json$/, "");
   } catch {
-    // A plain-copy pointer (or no pointer) cannot name a run; leave the pointer
-    // to reapRunContexts, which reads the record it contains.
+    try {
+      const record = JSON.parse(await readFile(pointer, "utf8")) as { runId?: unknown };
+      return typeof record.runId === "string" ? record.runId : null;
+    } catch {
+      return null;
+    }
   }
-  await unlink(path.join(dir, `${runId}.json`)).catch(() => {});
 }
 
 /**
- * Remove leftovers: every `<runId>.json` whose run is terminal, plus a pointer
- * that names a terminal or missing run. Returns how many files were removed.
+ * Unlink this run's record and pointer. The worker directory is exclusive to one
+ * run at a time, so the pointer can only name this run (or a stale predecessor);
+ * the check keeps a late settle from removing a newer run's context.
+ */
+export async function clearRunContext(hostRoot: string, workerId: string, runId: string): Promise<void> {
+  const dir = runContextDir(hostRoot, workerId);
+  const pointer = path.join(dir, RUN_CONTEXT_FILE);
+  const named = await pointerRunId(pointer);
+  if (named === null || named === runId) await unlink(pointer).catch(() => {});
+  await unlink(path.join(dir, `${runId}.json`)).catch(() => {});
+  await rmdir(dir).catch(() => {});
+}
+
+/**
+ * Remove leftovers: every worker directory whose pointer names a terminal run,
+ * plus individual `<runId>.json` records for terminal runs. Returns how many
+ * files were removed.
  */
 export async function reapRunContexts(
   hostRoot: string,
   isTerminal: (runId: string) => boolean,
 ): Promise<number> {
-  const dir = runContextDir(hostRoot);
   let entries: string[];
   try {
-    entries = await readdir(dir);
+    entries = await readdir(runContextRoot(hostRoot));
   } catch {
     return 0;
   }
   let removed = 0;
-  for (const entry of entries) {
-    if (entry === RUN_CONTEXT_FILE || !entry.endsWith(".json")) continue;
-    const runId = entry.slice(0, -".json".length);
-    if (!isTerminal(runId)) continue;
-    await unlink(path.join(dir, entry)).catch(() => {});
-    removed += 1;
-  }
-  // The pointer is safe to drop only when it names a terminal run. A symlink
-  // names its run; a plain copy carries it in the record.
-  const pointer = path.join(dir, RUN_CONTEXT_FILE);
-  let pointerRunId = "";
-  try {
-    pointerRunId = path.basename(await readlink(pointer)).replace(/\.json$/, "");
-  } catch {
+  for (const workerId of entries) {
+    if (!WORKER_ID.test(workerId) || workerId === "." || workerId === "..") continue;
+    const dir = path.join(runContextRoot(hostRoot), workerId);
+    let files: string[];
     try {
-      const record = JSON.parse(await readFile(pointer, "utf8")) as { runId?: unknown };
-      pointerRunId = typeof record.runId === "string" ? record.runId : "";
+      files = await readdir(dir);
     } catch {
-      pointerRunId = "";
+      continue;
     }
-  }
-  if (pointerRunId !== "" && isTerminal(pointerRunId)) {
-    await unlink(pointer).catch(() => {});
-    removed += 1;
+    for (const entry of files) {
+      if (entry === RUN_CONTEXT_FILE || !entry.endsWith(".json")) continue;
+      const runId = entry.slice(0, -".json".length);
+      if (!isTerminal(runId)) continue;
+      await unlink(path.join(dir, entry)).catch(() => {});
+      removed += 1;
+    }
+    const pointer = path.join(dir, RUN_CONTEXT_FILE);
+    const named = await pointerRunId(pointer);
+    if (named !== null && isTerminal(named)) {
+      await unlink(pointer).catch(() => {});
+      removed += 1;
+    }
+    await rmdir(dir).catch(() => {});
   }
   return removed;
 }

@@ -69,6 +69,15 @@ describe("omp-host cli", () => {
     expect(out.join("")).toMatch(/^host 0\.12\.0 pid=\d+ epoch=host-[0-9a-f]+ workers=0$/m);
   }, 20_000);
 
+  it("refuses to gc while a supervisor is live", async () => {
+    host = await startHost({ rootDir: root });
+    const { err, io } = capture();
+    expect(await runCli(["gc"], io)).toBe(1);
+    expect(err.join("")).toMatch(/refusing to gc|another omp-host/);
+    // The live host's ledger was not compacted or reaped.
+    expect(host.workers).toBe(0);
+  }, 20_000);
+
   it("gc removes a crashed host's stale discovery and socket", async () => {
     const socket = path.join(root, "host-deadbeef.sock");
     await writeFile(socket, "");

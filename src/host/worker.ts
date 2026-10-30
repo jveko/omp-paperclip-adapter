@@ -40,6 +40,13 @@ export interface WorkerSpawnOptions {
 const FORBIDDEN_WORKER_ENV: Record<string, true> = { PAPERCLIP_API_KEY: true };
 
 /**
+ * A worker that emits an unterminated line forever must not grow the supervisor
+ * without bound (omp caps a frame at 1 MiB and reassembles at 64 MiB, so this is
+ * well above anything legitimate).
+ */
+const MAX_WORKER_BUFFER_CHARS = 64 * 1024 * 1024;
+
+/**
  * The worker argv: the existing `resolveOmpAgentCommand` (which already carries
  * `--extension` and `--thinking`) with the `acp` subcommand removed and
  * `--mode rpc` appended.
@@ -119,6 +126,11 @@ export class RpcWorker {
     let buffer = "";
     child.stdout?.on("data", (chunk: Buffer) => {
       buffer += decoder.write(chunk);
+      if (buffer.length > MAX_WORKER_BUFFER_CHARS) {
+        buffer = "";
+        this.kill("SIGKILL");
+        return;
+      }
       let newline = buffer.indexOf("\n");
       while (newline >= 0) {
         const line = buffer.slice(0, newline);
@@ -361,6 +373,12 @@ export class RpcWorker {
     }
     pending.parts.push(Buffer.from(data, "base64"));
     pending.nextIndex += 1;
+    const bytes = pending.parts.reduce((sum, part) => sum + part.byteLength, 0);
+    if (bytes > MAX_WORKER_BUFFER_CHARS) {
+      this.chunks.delete(chunkId);
+      this.kill("SIGKILL");
+      return null;
+    }
     if (pending.nextIndex < pending.count) {
       this.chunks.set(chunkId, pending);
       return null;

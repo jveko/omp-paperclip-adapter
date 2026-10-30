@@ -118,9 +118,35 @@ describe("run ledger", () => {
     await ledger.close();
   });
 
+  it("assigns unique seqs to concurrent appends", async () => {
+    const ledger = await RunLedger.open(dir);
+    const records = await Promise.all([
+      ledger.append(input({ runId: "run-a", sessionKey: "sk-a", state: "leased" })),
+      ledger.append(input({ runId: "run-b", sessionKey: "sk-b", state: "leased" })),
+      ledger.append(input({ runId: "run-c", sessionKey: "sk-c", state: "leased" })),
+    ]);
+    expect(new Set(records.map((record) => record.seq)).size).toBe(3);
+    expect(records.map((record) => record.seq)).toEqual([1, 2, 3]);
+    await ledger.close();
+  });
+
+  it("refuses to append into a ledger another host replaced", async () => {
+    const ledger = await RunLedger.open(dir);
+    await ledger.append(input({ state: "leased" }));
+    await ledger.append(input({ state: "worker_ready" }));
+    // A second host compacts the two lines into one and renames a new inode
+    // over the path this handle holds.
+    const second = await RunLedger.open(dir);
+    await second.append(input({ runId: "run-9", sessionKey: "sk-9", state: "leased" }));
+    await second.close();
+    await expect(ledger.append(input({ state: "worker_ready" }))).rejects.toThrow(/replaced/);
+    await ledger.close();
+  });
+
   it("detects forbidden keys at any depth", () => {
     expect(findForbiddenLedgerKey({ detail: { nested: [{ bearerToken: "x" }] } })).toBe("bearerToken");
     expect(findForbiddenLedgerKey({ detail: { stopReason: "end_turn" } })).toBeNull();
+    expect(findForbiddenLedgerKey({ detail: { accessToken: "x" } })).toBe("accessToken");
     expect(findForbiddenLedgerKey({ usage: { routedModels: { "anthropic/claude": 2 } } })).toBeNull();
   });
 });

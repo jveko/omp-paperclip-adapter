@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,7 +7,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { createOmpAcpExecutor } from "../server/acp.js";
 import { readLedgerRecords } from "./ledger.js";
-import { runContextPointer } from "./run-context.js";
 import { startHost } from "./server.js";
 import { readDiscovery } from "./socket.js";
 
@@ -128,7 +127,8 @@ describe("phase 1 acceptance on dist/omp-host.js", () => {
     }, { timeout: 5_000, interval: 25 });
     const raw = await readFile(path.join(hostRoot, "ledger.jsonl"), "utf8");
     expect(raw).not.toContain("run-jwt-ACCEPTANCE");
-    await expect(stat(runContextPointer(hostRoot))).rejects.toThrow();
+    const contextDirs = await readdir(path.join(hostRoot, "run-context")).catch(() => []);
+    expect(contextDirs).toEqual([]);
   }, 45_000);
 
   it("survives kill -9 of the supervisor, then reaps the orphan on restart", async () => {

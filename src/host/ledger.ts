@@ -1,4 +1,4 @@
-import { mkdir, open as openFile, readFile, rename, unlink, type FileHandle } from "node:fs/promises";
+import { mkdir, open as openFile, readFile, rename, stat, unlink, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import type { LedgerCause, LedgerState } from "./protocol.js";
 
@@ -91,7 +91,13 @@ export class LedgerWriteError extends Error {
  * run. `token` is checked case-insensitively as a whole key only, so
  * `inputTokens`/`routedModels` stay legal.
  */
-const FORBIDDEN_KEY = /^(api[_-]?key|apikey|bearer|bearer[_-]?token|token|authorization|password|passwd|secret|credential|credentials|prompt|prompt[_-]?text|arguments|tool[_-]?args|tool[_-]?arguments|input)$/i;
+const FORBIDDEN_KEY = new RegExp(
+  "^(api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|bearer|bearer[_-]?token|"
+  + "token|jwt|authorization|x-api-key|api-token|cookie|password|passwd|"
+  + "client[_-]?secret|secret|credential|credentials|prompt|prompt[_-]?text|"
+  + "arguments|tool[_-]?args|tool[_-]?arguments|input)$",
+  "i",
+);
 
 /** The first forbidden key at any depth, or null. */
 export function findForbiddenLedgerKey(value: unknown): string | null {
@@ -163,6 +169,8 @@ export class RunLedger {
   private handle: FileHandle | null;
   private seq: number;
   private readonly records: Map<string, LedgerRecord>;
+  /** Serializes appends so two concurrent runs cannot write the same seq. */
+  private tail: Promise<unknown> = Promise.resolve();
 
   private constructor(file: string, handle: FileHandle, seq: number, records: Map<string, LedgerRecord>) {
     this.file = file;
@@ -215,7 +223,13 @@ export class RunLedger {
    * in-memory index. A failed write leaves nothing acked and throws
    * `LedgerWriteError` so the host can refuse the run (`omp_host_unwritable`).
    */
-  async append(input: LedgerInput): Promise<LedgerRecord> {
+  append(input: LedgerInput): Promise<LedgerRecord> {
+    const result = this.tail.then(() => this.write(input));
+    this.tail = result.catch(() => {});
+    return result;
+  }
+
+  private async write(input: LedgerInput): Promise<LedgerRecord> {
     const record: LedgerRecord = {
       ...input,
       v: LEDGER_VERSION,
@@ -232,6 +246,14 @@ export class RunLedger {
     const handle = this.handle;
     if (handle === null) throw new LedgerWriteError("the ledger is closed");
     try {
+      // A compacting second host renames a new inode over the path; appending
+      // through the old handle would write into an unlinked file and lose the
+      // record. Detect the swap and refuse instead of journaling into the void.
+      const mine = await handle.stat();
+      const onPath = await stat(this.file);
+      if (mine.ino !== onPath.ino) {
+        throw new LedgerWriteError(`the ledger file was replaced underneath this host (${this.file})`);
+      }
       await handle.writeFile(`${JSON.stringify(record)}\n`, "utf8");
       await handle.sync();
     } catch (err) {

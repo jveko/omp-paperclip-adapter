@@ -275,6 +275,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 const isString = (value: unknown): value is string => typeof value === "string";
 
 /**
+ * Identifiers the supervisor turns into filesystem names (run-context files,
+ * session directories) or trusts as tenant boundaries. `..`, path separators
+ * and empty strings are rejected at the protocol boundary.
+ */
+const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const isSafeId = (value: unknown): value is string =>
+  typeof value === "string" && value !== "." && value !== ".." && SAFE_ID.test(value);
+
+/**
  * Shape checks for the frames whose fields the host acts on. A malformed frame
  * is dropped by the reader (null), never half-applied: the host spawns a
  * process from `run.begin`, so every field it needs must be a string.
@@ -287,13 +296,13 @@ function isWellFormed(frame: Record<string, unknown>): boolean {
     case "run.begin": {
       const worker = frame.worker;
       return isString(frame.id)
-        && isString(frame.runId)
+        && isSafeId(frame.runId)
         && isString(frame.sessionKey)
         && isString(frame.cwd)
         && isString(frame.prompt)
         && isRecord(frame.agent)
-        && isString(frame.agent.id)
-        && isString(frame.agent.companyId)
+        && isSafeId(frame.agent.id)
+        && isSafeId(frame.agent.companyId)
         && isRecord(worker)
         && isString(worker.command)
         && Array.isArray(worker.args)

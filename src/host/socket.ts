@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { chmod, mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
 import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
@@ -21,6 +21,9 @@ import { pidAlive } from "../server/session-lease.js";
  */
 
 export const HOST_DISCOVERY_VERSION = 1;
+
+/** How long an unreadable lock record is trusted before it is reclaimed. */
+const LOCK_PUBLISH_GRACE_MS = 10_000;
 
 export interface HostDiscovery {
   v: typeof HOST_DISCOVERY_VERSION;
@@ -78,9 +81,15 @@ export async function ensureHostDir(): Promise<void> {
 }
 
 /**
- * One supervisor per instance root, enforced by an exclusive-create lock file
- * (the socket token is random, so two hosts would bind two sockets otherwise).
- * A lock naming a dead or reused pid is reclaimed; a live one refuses the start.
+ * One supervisor per instance root, enforced by a lock file that is published
+ * atomically.
+ *
+ * The record is written to a temp file and `link`ed into place, so the lock
+ * path never holds a partial record: a concurrent starter either sees a
+ * complete record (live → refuse) or EEXIST on a record it can judge. Treating
+ * an unreadable lock as stale is wrong in the open→write window of a
+ * non-atomic create — two hosts would both start, and the loser's reconcile
+ * would kill the winner's runs.
  */
 export async function acquireHostLock(rootDir: string = hostRootDir()): Promise<{ release: () => Promise<void> }> {
   await ensureHostDirIn(rootDir);
@@ -90,43 +99,50 @@ export async function acquireHostLock(rootDir: string = hostRootDir()): Promise<
     startedAt: new Date().toISOString(),
     startIdentity: await readProcessStartIdentity(process.pid),
   };
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      const handle = await open(target, "wx", 0o600);
+  const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tmp, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
+  try {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        await handle.writeFile(`${JSON.stringify(record)}\n`, "utf8");
-      } finally {
-        await handle.close();
+        await link(tmp, target);
+        return {
+          release: async () => {
+            try {
+              const current = JSON.parse(await readFile(target, "utf8")) as { pid?: unknown };
+              if (current.pid === process.pid) await unlink(target);
+            } catch {
+              // A missing/altered lock is not this host's failure to report.
+            }
+          },
+        };
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
       }
-      return {
-        release: async () => {
-          try {
-            const current = JSON.parse(await readFile(target, "utf8")) as { pid?: unknown };
-            if (current.pid === process.pid) await unlink(target);
-          } catch {
-            // A missing/altered lock is not this host's failure to report.
-          }
-        },
-      };
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
       let holder: { pid?: unknown; startIdentity?: unknown } = {};
       try {
         holder = JSON.parse(await readFile(target, "utf8")) as typeof holder;
       } catch {
-        // Unreadable is treated as stale below: nothing can be proven live.
+        // Unreadable is only stale once it is old enough that no writer can
+        // still be publishing it; the temp-file publish makes this window tiny.
+        const age = await stat(target).then((info) => Date.now() - info.mtimeMs).catch(() => Infinity);
+        if (age < LOCK_PUBLISH_GRACE_MS) {
+          throw new Error("another omp-host is starting for this instance (lock being published)");
+        }
       }
       const pid = typeof holder.pid === "number" ? holder.pid : 0;
       const identity = typeof holder.startIdentity === "string" ? holder.startIdentity : null;
       const current = pid > 0 ? await readProcessStartIdentity(pid) : null;
-      const stale = pid <= 0 || !pidAlive(pid) || (identity !== null && current !== null && identity !== current);
-      if (!stale) {
+      const live = pid > 0 && pidAlive(pid)
+        && (identity === null || current === null || identity === current);
+      if (live) {
         throw new Error(`another omp-host is running for this instance (pid ${pid})`);
       }
       await unlink(target).catch(() => {});
     }
+    throw new Error(`the omp-host lock at ${target} kept being reclaimed; refusing to start a second supervisor`);
+  } finally {
+    await unlink(tmp).catch(() => {});
   }
-  throw new Error(`the omp-host lock at ${target} kept being reclaimed; refusing to start a second supervisor`);
 }
 
 export async function writeDiscovery(
@@ -142,6 +158,17 @@ export async function writeDiscovery(
 }
 
 export async function clearDiscovery(rootDir: string = hostRootDir()): Promise<void> {
+  await unlink(hostDiscoveryIn(rootDir)).catch(() => {});
+}
+
+/**
+ * Remove the discovery record only when it still names this host. A losing or
+ * replaced supervisor must never erase the record of the one serving the
+ * instance.
+ */
+export async function clearDiscoveryOwned(rootDir: string, pid: number, epoch: string): Promise<void> {
+  const current = await readDiscovery(rootDir);
+  if (current === null || current.pid !== pid || current.epoch !== epoch) return;
   await unlink(hostDiscoveryIn(rootDir)).catch(() => {});
 }
 

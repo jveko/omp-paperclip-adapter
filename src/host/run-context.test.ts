@@ -6,6 +6,8 @@ import {
   RUN_CONTEXT_FILE, clearRunContext, reapRunContexts, runContextDir, runContextPointer, writeRunContext,
 } from "./run-context.js";
 
+const WORKER = "abc123";
+
 const credentials = {
   apiUrl: "http://127.0.0.1:3100",
   apiKey: "jwt-SENTINEL-1",
@@ -26,33 +28,46 @@ describe("run context", () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  it("writes a 0600 record behind an atomically replaced pointer", async () => {
-    const pointer = await writeRunContext(root, "run-1", credentials, manifests);
-    expect(pointer).toBe(runContextPointer(root));
-    expect((await stat(path.join(runContextDir(root), "run-1.json"))).mode & 0o777).toBe(0o600);
+  it("writes a 0600 record behind an atomically replaced per-worker pointer", async () => {
+    const pointer = await writeRunContext(root, WORKER, "run-1", credentials, manifests);
+    expect(pointer).toBe(runContextPointer(root, WORKER));
+    expect((await stat(path.join(runContextDir(root, WORKER), "run-1.json"))).mode & 0o777).toBe(0o600);
     expect(await readlink(pointer)).toBe("run-1.json");
     expect(JSON.parse(await readFile(pointer, "utf8"))).toMatchObject({ runId: "run-1", credentials });
-    expect((await stat(runContextDir(root))).mode & 0o777).toBe(0o700);
+    expect((await stat(runContextDir(root, WORKER))).mode & 0o777).toBe(0o700);
+  });
+
+  it("keeps two workers' pointers independent", async () => {
+    const a = await writeRunContext(root, "worker-a", "run-a", credentials, manifests);
+    const b = await writeRunContext(root, "worker-b", "run-b", { ...credentials, apiKey: "jwt-b" }, manifests);
+    expect(await readlink(a)).toBe("run-a.json");
+    expect(await readlink(b)).toBe("run-b.json");
+    await clearRunContext(root, "worker-a", "run-a");
+    await expect(stat(a)).rejects.toThrow();
+    expect(JSON.parse(await readFile(b, "utf8"))).toMatchObject({ runId: "run-b" });
   });
 
   it("does not let an older settle remove a newer run's pointer", async () => {
-    await writeRunContext(root, "run-1", credentials, manifests);
-    await writeRunContext(root, "run-2", { ...credentials, apiKey: "jwt-2" }, manifests);
-    await clearRunContext(root, "run-1");
-    expect(await readlink(runContextPointer(root))).toBe("run-2.json");
-    expect(JSON.parse(await readFile(runContextPointer(root), "utf8"))).toMatchObject({ runId: "run-2" });
-    await clearRunContext(root, "run-2");
-    await expect(stat(runContextPointer(root))).rejects.toThrow();
+    await writeRunContext(root, WORKER, "run-1", credentials, manifests);
+    await writeRunContext(root, WORKER, "run-2", { ...credentials, apiKey: "jwt-2" }, manifests);
+    await clearRunContext(root, WORKER, "run-1");
+    expect(await readlink(runContextPointer(root, WORKER))).toBe("run-2.json");
+    expect(JSON.parse(await readFile(runContextPointer(root, WORKER), "utf8"))).toMatchObject({ runId: "run-2" });
+    await clearRunContext(root, WORKER, "run-2");
+    await expect(stat(runContextPointer(root, WORKER))).rejects.toThrow();
   });
 
   it("reaps terminal leftovers and keeps a live run's context", async () => {
-    await writeRunContext(root, "run-live", credentials, manifests);
-    await writeRunContext(root, "run-dead", { ...credentials, apiKey: "jwt-DEAD" }, manifests);
-    // Point the stable path back at the live run, as a concurrent host would.
-    await writeRunContext(root, "run-live", credentials, manifests);
+    await writeRunContext(root, "worker-live", "run-live", credentials, manifests);
+    await writeRunContext(root, "worker-dead", "run-dead", { ...credentials, apiKey: "jwt-DEAD" }, manifests);
     const removed = await reapRunContexts(root, (runId) => runId === "run-dead");
-    expect(removed).toBe(1);
-    await expect(stat(path.join(runContextDir(root), "run-dead.json"))).rejects.toThrow();
-    expect(await readlink(path.join(runContextDir(root), RUN_CONTEXT_FILE))).toBe("run-live.json");
+    expect(removed).toBe(2);
+    await expect(stat(path.join(runContextDir(root, "worker-dead"), "run-dead.json"))).rejects.toThrow();
+    expect(await readlink(path.join(runContextDir(root, "worker-live"), RUN_CONTEXT_FILE))).toBe("run-live.json");
+  });
+
+  it("rejects a worker id that could escape the run-context root", async () => {
+    await expect(writeRunContext(root, "../escape", "run-1", credentials, manifests)).rejects.toThrow(/worker id/);
+    await expect(writeRunContext(root, "..", "run-1", credentials, manifests)).rejects.toThrow(/worker id/);
   });
 });

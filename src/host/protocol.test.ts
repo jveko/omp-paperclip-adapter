@@ -73,6 +73,14 @@ describe("host protocol frames", () => {
     expect(parseFrame(JSON.stringify({ id: "1", type: "hello", instanceId: "x", adapterVersion: "1" }))).toBeNull();
   });
 
+  it("rejects identifiers that would become filesystem names", () => {
+    for (const runId of ["../host", "a/b", "..", "", ".hidden"]) {
+      expect(parseFrame(JSON.stringify(begin({ runId }))), runId).toBeNull();
+    }
+    expect(parseFrame(JSON.stringify(begin({ agent: { id: "../x", companyId: "co-1" } })))).toBeNull();
+    expect(parseFrame(JSON.stringify(begin({ agent: { id: "a", companyId: "../../c" } })))).toBeNull();
+  });
+
   it("requires the run.begin identity fields the host spawns from", () => {
     const { worker: _worker, ...noWorker } = begin();
     expect(parseFrame(JSON.stringify(noWorker))).toBeNull();
