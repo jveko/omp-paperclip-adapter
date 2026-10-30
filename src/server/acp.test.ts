@@ -81,7 +81,11 @@ function fakeEngine(result: Record<string, unknown>) {
   return executor;
 }
 
-function baseCtx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecutionContext {
+function baseCtx(
+  // `runtimeTools` is absent from the installed adapter-utils declaration (it
+  // ships at contract HEAD), so the fixture surface declares it explicitly.
+  overrides: Partial<AdapterExecutionContext> & { runtimeTools?: Record<string, unknown> } = {},
+): AdapterExecutionContext {
   return {
     runId: "run-1",
     agent: { id: "agent-1", companyId: "co-1", name: "A", adapterType: "omp_local", adapterConfig: null },
@@ -96,6 +100,22 @@ function baseCtx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecu
     onEvent: async () => {},
     ...overrides,
   } as AdapterExecutionContext;
+}
+
+/** Run-scoped control-tool access as Paperclip hands it to an adapter. */
+function runtimeToolsAccess(mcpEndpoint: string, bearerToken: string): Record<string, unknown> {
+  return {
+    version: 1,
+    guidance: "Connection tools:",
+    mcpEndpoint,
+    rest: {
+      connectionsSearch: "http://paperclip.test/runtime-tools/connections/search",
+      connectionRequest: "http://paperclip.test/runtime-tools/connections/request",
+    },
+    bearerToken,
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    tools: ["connections_search", "connection_request"],
+  };
 }
 
 describe("createOmpAcpExecutor session runtime wiring", () => {
@@ -608,6 +628,57 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
         : undefined,
     ).toBeUndefined();
     expect(res.resultJson?.sessionRuntime).toBeUndefined();
+  });
+
+  it("warns when connection tools arrive outside the declared native_mcp channel", async () => {
+    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const events: Array<{ level?: string; message?: string }> = [];
+    const run = createOmpAcpExecutor();
+    const res = await run(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}` },
+      // invocation_context delivery: the tools exist as data, no MCP server
+      // carries them, and the adapter has no way to serve them itself.
+      runtimeTools: runtimeToolsAccess("http://paperclip.test/mcp/runtime-tools", "run-tools-bearer-SENTINEL"),
+      runtimeMcp: { getServers: () => [] },
+      onEvent: async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); },
+    }));
+    const warnings = events.filter(
+      (e) => e.level === "warn" && /connection tools/i.test(e.message ?? ""),
+    );
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.message).toContain("native_mcp");
+    // The run-scoped bearer is a credential: it must never reach events or
+    // the heartbeat evidence blob.
+    expect(JSON.stringify(events)).not.toContain("SENTINEL");
+    expect(JSON.stringify(res.resultJson ?? {})).not.toContain("SENTINEL");
+  });
+
+  it("stays quiet when the connections server is delivered over ACP", async () => {
+    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const events: Array<{ level?: string; message?: string }> = [];
+    const run = createOmpAcpExecutor();
+    const res = await run(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}` },
+      runtimeTools: runtimeToolsAccess("http://paperclip.test/mcp/runtime-tools", "run-tools-bearer-SENTINEL"),
+      runtimeMcp: {
+        getServers: () => [{
+          name: "Paperclip connections",
+          url: "http://paperclip.test/mcp/runtime-tools",
+          token: "mcp-token-SENTINEL",
+          connectionId: "paperclip-runtime-tools",
+        }],
+      },
+      onEvent: async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); },
+    }));
+    expect(events.some((e) => /connection tools/i.test(e.message ?? ""))).toBe(false);
+    const sessionRuntime = res.resultJson?.sessionRuntime;
+    expect(
+      sessionRuntime && typeof sessionRuntime === "object" && "mcpServerCount" in sessionRuntime
+        ? sessionRuntime.mcpServerCount
+        : undefined,
+    ).toBe(1);
+    expect(JSON.stringify(events)).not.toContain("SENTINEL");
+    expect(JSON.stringify(res.resultJson ?? {})).not.toContain("SENTINEL");
   });
 
   it("records lastRotation into sessionRuntime when compaction trips", async () => {

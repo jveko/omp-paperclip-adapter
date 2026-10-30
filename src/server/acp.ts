@@ -473,6 +473,25 @@ type OmpAcpExecutorOptions = Omit<
 >;
 type OmpAcpExecutor = (ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>;
 
+/**
+ * Endpoint of the run-scoped connection-tools MCP server Paperclip offered this
+ * run, or null when it offered none.
+ *
+ * `runtimeTools` ships at Paperclip contract HEAD (adapter-utils types.ts:272,
+ * populated by runtime-execution.ts:793) but is absent from the pinned
+ * 2026.824.1 declaration that `tsc` compiles against, so the member is narrowed
+ * from the boundary value rather than asserted on the context. A server that
+ * never sets it simply reads as null. Only the endpoint is read; the bearer
+ * token in the same object must never enter a log, an event or a work product.
+ */
+function connectionToolsEndpoint(ctx: AdapterExecutionContext): string | null {
+  if (!("runtimeTools" in ctx)) return null;
+  const tools: unknown = ctx.runtimeTools;
+  if (typeof tools !== "object" || tools === null || !("mcpEndpoint" in tools)) return null;
+  const endpoint = tools.mcpEndpoint;
+  return typeof endpoint === "string" && endpoint.trim() !== "" ? endpoint.trim() : null;
+}
+
 export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAcpExecutor {
   const engineOptions = options;
   let executor: OmpAcpExecutor | null = null;
@@ -491,6 +510,22 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
       await ctx.onEvent?.({
         eventType: "run.system", stream: "system", level: "warn",
         message: thinkMsg,
+      });
+    }
+    // Run-scoped control tools (v0.9). The adapter declares
+    // `runtimeToolDelivery: "native_mcp"`, so Paperclip must hand the
+    // connections server over as an ACP MCP server. Read the channel it
+    // actually used: when the tools arrive as invocation-context data instead
+    // (a Paperclip build that ignores the flag), nothing in this process can
+    // serve them and they would disappear silently — the pre-v0.9 failure.
+    // Resolved once per run so the count reported at the end is the same list
+    // the engine received.
+    const runtimeMcpServers = ctx.runtimeMcp?.getServers?.() ?? [];
+    const connectionEndpoint = connectionToolsEndpoint(ctx);
+    if (connectionEndpoint && !runtimeMcpServers.some((server) => server.url === connectionEndpoint)) {
+      await ctx.onEvent?.({
+        eventType: "run.system", stream: "system", level: "warn",
+        message: `omp connection tools are unavailable this run: Paperclip delivered no MCP server for the declared native_mcp channel (${runtimeMcpServers.length} runtime MCP server(s)), so connections_search/connection_request never reach the agent`,
       });
     }
     if (!executor) {
@@ -897,8 +932,9 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     if (intelState.lastRotation) sessionRuntime.lastRotation = intelState.lastRotation;
     // MCP servers forwarded to session/new are http-only (AdapterRuntimeMcpAccess has no
     // stdio/command discriminator), so a 0 count means "no http MCP servers", not "no MCP".
-    const mcpServerCount = ctx.runtimeMcp?.getServers?.().length ?? 0;
-    if (mcpServerCount > 0) sessionRuntime.mcpServerCount = mcpServerCount;
+    // Uses the list resolved at run start, so the evidence matches what the
+    // engine received rather than a second read of the accessor.
+    if (runtimeMcpServers.length > 0) sessionRuntime.mcpServerCount = runtimeMcpServers.length;
     const resultJson = Object.keys(sessionRuntime).length > 0
       ? { ...(result.resultJson ?? {}), sessionRuntime }
       : result.resultJson;
