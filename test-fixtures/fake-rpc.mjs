@@ -109,6 +109,13 @@ rl.on("line", (line) => {
           cancelled: false, resumed: false, sessionId, sessionFile,
         });
       }
+      if (mode === "openerror") {
+        // What omp answers when the stored session cannot be switched at all.
+        return send({
+          id, type: "response", command: "open_session", success: false,
+          error: "Session cannot be switched to a different cwd",
+        });
+      }
       if (mode === "openfail") {
         // What omp does when the stored session cannot be resumed in this cwd.
         return succeed(id, "open_session", { cancelled: true, resumed: false, sessionId });

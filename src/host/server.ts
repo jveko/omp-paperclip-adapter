@@ -790,22 +790,34 @@ class Supervisor {
       if (alreadyOpen) {
         run.sessionFile = worker.sessionFile;
       } else if (sessionId !== "") {
-        const opened = await worker.worker.openSession(sessionDir);
-        if (opened.cancelled) {
+        const named = sessionId;
+        let opened: Awaited<ReturnType<RpcWorker["openSession"]>> | null = null;
+        try {
+          opened = await worker.worker.openSession(sessionDir);
+        } catch (err) {
+          // An error response (not a `cancelled` one) is still a failed resume:
+          // omp answers `success:false` when the stored session cannot be
+          // switched (e.g. a cwd change). Fall back to a fresh session instead
+          // of failing a run the engine lane would have completed.
+          this.emitEvent(run, "run.system", {
+            level: "warn",
+            message: `omp could not open the stored session ${named} (${err instanceof Error ? err.message : String(err)}); starting a fresh session`,
+          });
+        }
+        if (opened === null || opened.cancelled) {
           const fresh = await worker.worker.newSession();
           if (fresh.cancelled) throw new Error("omp refused to open or create a session for this run");
           sessionId = "";
         } else {
-          const namedBeforeOpen = begin.session.ompSessionId;
           sessionId = opened.sessionId;
           run.sessionFile = opened.sessionFile ?? null;
           // A named session that could not be resumed (fresh directory, moved
           // workspace) is adopted as a new one, but never silently: the operator
           // is looking for that transcript, and the adapter records the new id.
-          if (opened.resumed === false && namedBeforeOpen !== null && namedBeforeOpen !== "") {
+          if (opened.resumed === false) {
             this.emitEvent(run, "run.system", {
               level: "warn",
-              message: `stored omp session ${namedBeforeOpen} could not be resumed in this session directory; this run started ${sessionId || "a new session"}`,
+              message: `stored omp session ${named} could not be resumed in this session directory; this run started ${sessionId || "a new session"}`,
             });
           }
           // The worker resumes by session DIRECTORY (omp picks the newest
@@ -814,8 +826,7 @@ class Supervisor {
           // reported back. A FORK is the exception: its transcript lives in
           // omp's agent-dir storage, so the directory never opens it, and
           // continuing the source would consume the operator's fork silently.
-          const named = begin.session.ompSessionId;
-          if (begin.session.forked === true && named !== null && named !== "" && sessionId !== named) {
+          if (begin.session.forked === true && sessionId !== named) {
             throw new Error(
               `omp opened session ${sessionId} but the forked run named ${named}; refusing to continue another session under a fork directive`,
             );

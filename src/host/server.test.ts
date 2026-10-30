@@ -10,6 +10,8 @@ import { startHost, reconcile, type RunningHost } from "./server.js";
 import { RunLedger, readLedgerRecords } from "./ledger.js";
 import { RUN_CONTEXT_FILE } from "./run-context.js";
 import { readProcessStartIdentity } from "./socket.js";
+import { acquireSessionLease } from "../server/session-lease.js";
+import { sessionIntelDir } from "../server/session-state.js";
 import { startFakeMcp } from "../../test/fake-mcp.js";
 
 const fixture = path.resolve(
@@ -103,11 +105,18 @@ describe("supervisor", () => {
   beforeEach(async () => {
     root = await mkdtemp(path.join(os.tmpdir(), "omp-host-server-"));
     host = null;
+    // The supervisor's session lease (and anything else instance-root-derived)
+    // must live under this test's temp root, never the operator's real
+    // ~/.paperclip: a lease left by another run there would block this run
+    // deterministically while a fresh full-suite process would reclaim it.
+    vi.stubEnv("PAPERCLIP_HOME", root);
+    vi.stubEnv("PAPERCLIP_INSTANCE_ID", "host-server-test");
   });
 
   afterEach(async () => {
     if (host !== null) await host.close("test").catch(() => {});
     host = null;
+    vi.unstubAllEnvs();
     await rm(root, { recursive: true, force: true });
   });
 
@@ -384,6 +393,30 @@ describe("supervisor", () => {
     }
   }, 20_000);
 
+  it("refuses a run whose session lease another process holds", async () => {
+    const held = await acquireSessionLease({
+      dir: sessionIntelDir("co-1", "agent-1"),
+      key: "sk-held",
+    });
+    expect(held.ok).toBe(true);
+    if (!held.ok) throw new Error("unreachable");
+    const running = await start();
+    const client = await connectClient(running.socketPath);
+    try {
+      client.send(beginFrame({ runId: "run-held", sessionKey: "sk-held" }));
+      const settled = await client.waitFor(
+        (frame) => frame.type === "run.settled" && frame.runId === "run-held",
+      );
+      if (settled.type !== "run.settled") throw new Error("unreachable");
+      expect(settled.result.errorCode).toBe("omp_session_lease_held");
+      const refused = (await readLedgerRecords(root)).find((record) => record.state === "refused");
+      expect(refused).toMatchObject({ cause: "lease_held" });
+    } finally {
+      client.close();
+      await held.release();
+    }
+  }, 20_000);
+
   it("starts a fresh session when the stored one cannot be resumed", async () => {
     const log = path.join(root, "openfail.log");
     const running = await start();
@@ -410,6 +443,39 @@ describe("supervisor", () => {
       expect(commands.some((command) => command.type === "new_session")).toBe(true);
       const opened = (await readLedgerRecords(root)).find((record) => record.state === "session_open");
       expect(opened?.ompSessionId).toBe("sess-new-1");
+    } finally {
+      client.close();
+    }
+  }, 20_000);
+
+  it("falls back to a fresh session when open_session returns an error", async () => {
+    const log = path.join(root, "openerror.log");
+    const running = await start();
+    const client = await connectClient(running.socketPath);
+    try {
+      client.send(beginFrame({
+        runId: "run-open-error", sessionKey: "sk-open-error",
+        worker: {
+          command: process.execPath,
+          args: [fixture],
+          env: { FAKE_RPC_MODE: "openerror", FAKE_RPC_LOG: log },
+        },
+        session: { ompSessionId: "sess-stored" },
+      }));
+      const settled = await client.waitFor(
+        (frame) => frame.type === "run.settled" && frame.runId === "run-open-error",
+      );
+      if (settled.type !== "run.settled") throw new Error("unreachable");
+      expect(settled.result.exitCode).toBe(0);
+      expect(settled.result.sessionParams?.acpSessionId).toBe("sess-new-1");
+      expect(client.frames.some(
+        (frame) => frame.type === "run.event" && frame.kind === "run.system"
+          && String(frame.payload.message).includes("could not open the stored session"),
+      )).toBe(true);
+      const commands = (await readFile(log, "utf8")).trim().split("\n")
+        .map((line) => JSON.parse(line) as { type: string });
+      expect(commands.some((command) => command.type === "open_session")).toBe(true);
+      expect(commands.some((command) => command.type === "new_session")).toBe(true);
     } finally {
       client.close();
     }
