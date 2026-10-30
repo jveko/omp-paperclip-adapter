@@ -121,6 +121,36 @@ ACP stdio transport.
   transcript before sharing it; the adapter itself never exports transcript
   content, only session titles and ids of the run's own workspace.
 
+### Thinking level and model failover, without a rotating fingerprint
+- \`thinking\` is forwarded as omp's own \`defaultThinkingLevel\` through a
+  run-scoped settings overlay (fixed filename, run child only), not as a
+  \`--thinking\` flag on the agent command. The engine hashes the command line
+  into the session key, so the flag made every level edit start a fresh
+  session; the overlay path is stable and only its content changes.
+- The setting is not the strongest source. omp resolves a run's level as:
+  CLI flag, then the level stored in the session's transcript
+  (\`thinking_level_change\`), then a model-selector suffix, then the model
+  catalog's own default effort, then \`defaultThinkingLevel\`. Every session
+  stores its level at creation, so a resumed session keeps the level it
+  started with. Editing \`thinking\` therefore rotates the session once — the
+  adapter records the level each session was started with and restarts only
+  when the operator asks for a different one — and the run says why. An agent
+  whose level is unchanged never rotates, and neither does a run that merely
+  re-lists or re-reads that session. \`off\` stays a CLI flag because omp's
+  setting has no \`off\` value (it discards one and reads \`high\`).
+- Live switching mid-session is not available on this lane: omp's ACP accepts
+  \`session/set_config_option {configId:"thinking"}\`, but the Paperclip engine
+  only sends \`model\`, \`effort\` and \`service_tier\` (and omp rejects \`effort\`);
+  that is an upstream ask, not a knob here.
+- The quota-aware retry knobs ride the same overlay as the fallback chain
+  (\`retry.fallbackOn\`, \`retry.fallbackRevertPolicy\`,
+  \`retry.waitForUsageReset\`, \`retry.maxDelayMs\`). \`fallbackChain\` is written
+  as \`retry.fallbackChains.default\`, the CHAT-session chain: omp never applies
+  \`default\` to a model-kind role, which keeps its own chain or built-in order.
+  A value outside an enum is a config error (\`omp_config_error\`) instead of a
+  file omp would silently discard — an unknown \`fallbackOn\` reads back as
+  \`any\`, so a warn would be a knob that does nothing.
+
 ### Run identity and control plane
 - Paperclip mints a per-run token for this adapter (\`supportsLocalAgentJwt\`)
   and the engine injects it into the omp child as \`PAPERCLIP_API_KEY\`. That is

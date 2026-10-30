@@ -78,8 +78,9 @@ describe("getSessionConfigSchema", () => {
       "sessionScope", "sessionBrowser", "sessionSnapshotDiagnostic",
       "sessionForceFreshToken", "sessionForkSourceId",
       "sessionForkToken", "sessionMaxRuns", "sessionMaxAgeHours",
-      "credentialMode", "thinking", "fallbackChain", "usageReport",
-      "skillsAsTools", "governancePolicy",
+      "credentialMode", "thinking", "fallbackChain",
+      "fallbackOn", "fallbackRevertPolicy", "waitForUsageReset", "maxDelayMs",
+      "usageReport", "skillsAsTools", "governancePolicy",
     ]);
     for (const field of schema.fields) expect(field.hint).toContain("next run");
   });
@@ -99,6 +100,33 @@ describe("getSessionConfigSchema", () => {
     expect(t.options.map((o: { value: string }) => o.value)).toEqual([
       "default", "off", "auto", "minimal", "low", "medium", "high", "xhigh", "max",
     ]);
+  });
+  it("exposes the quota-aware retry knobs omp validates by discarding", () => {
+    const byKey = Object.fromEntries(getSessionConfigSchema().fields.map((f) => [f.key, f]));
+    expect(byKey.fallbackOn.type).toBe("select");
+    expect(byKey.fallbackOn.default).toBe("any");
+    expect(byKey.fallbackOn.options.map((o: { value: string }) => o.value))
+      .toEqual(["any", "usage-limit", "except-usage-limit"]);
+    expect(byKey.fallbackRevertPolicy.type).toBe("select");
+    expect(byKey.fallbackRevertPolicy.default).toBe("cooldown-expiry");
+    expect(byKey.fallbackRevertPolicy.options.map((o: { value: string }) => o.value))
+      .toEqual(["cooldown-expiry", "never"]);
+    expect(byKey.waitForUsageReset.type).toBe("toggle");
+    expect(byKey.waitForUsageReset.default).toBe(false);
+    expect(byKey.maxDelayMs.type).toBe("number");
+    expect(byKey.maxDelayMs.default).toBeUndefined();
+  });
+  it("documents the thinking level as a settings overlay that rotates once when edited", () => {
+    const byKey = Object.fromEntries(getSessionConfigSchema().fields.map((f) => [f.key, f]));
+    const hint = byKey.thinking.hint;
+    // The mechanism is the omp setting, not the fingerprint-rotating flag.
+    expect(hint).toMatch(/defaultThinkingLevel/);
+    expect(hint).not.toMatch(/^Forwards omp --thinking/);
+    // A resumed session keeps its stored level, so an edit restarts it once.
+    expect(hint).toMatch(/resumed session keeps/i);
+    expect(hint).toMatch(/rotates/i);
+    // `off` is the one level the setting cannot express.
+    expect(hint).toMatch(/"off" runs the CLI flag/);
   });
   it("exposes the v0.8 governance policy as a textarea (empty = off)", () => {
     const byKey = Object.fromEntries(getSessionConfigSchema().fields.map((f) => [f.key, f]));
