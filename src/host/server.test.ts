@@ -121,7 +121,16 @@ describe("supervisor", () => {
   });
 
   async function start(options: Parameters<typeof startHost>[0] = {}): Promise<RunningHost> {
-    host = await startHost({ rootDir: root, ...options });
+    // Pin the knobs a polluted shell could otherwise change (the supervisor
+    // falls back to OMP_HOST_* env for unset options); a test that needs a
+    // different value passes it explicitly.
+    host = await startHost({
+      rootDir: root,
+      hostIdleMs: 30 * 60_000,
+      workerIdleMs: 20 * 60_000,
+      maxWorkers: 8,
+      ...options,
+    });
     return host;
   }
 
@@ -408,7 +417,7 @@ describe("supervisor", () => {
         (frame) => frame.type === "run.settled" && frame.runId === "run-held",
       );
       if (settled.type !== "run.settled") throw new Error("unreachable");
-      expect(settled.result.errorCode).toBe("omp_session_lease_held");
+      expect(settled.result.errorCode, JSON.stringify(settled.result)).toBe("omp_session_lease_held");
       const refused = (await readLedgerRecords(root)).find((record) => record.state === "refused");
       expect(refused).toMatchObject({ cause: "lease_held" });
     } finally {
@@ -435,7 +444,7 @@ describe("supervisor", () => {
         (frame) => frame.type === "run.settled" && frame.runId === "run-move",
       );
       if (settled.type !== "run.settled") throw new Error("unreachable");
-      expect(settled.result.exitCode).toBe(0);
+      expect(settled.result.exitCode, JSON.stringify(settled.result)).toBe(0);
       expect(settled.result.sessionParams?.acpSessionId).toBe("sess-new-1");
       const commands = (await readFile(log, "utf8")).trim().split("\n")
         .map((line) => JSON.parse(line) as { type: string });
@@ -466,7 +475,9 @@ describe("supervisor", () => {
         (frame) => frame.type === "run.settled" && frame.runId === "run-open-error",
       );
       if (settled.type !== "run.settled") throw new Error("unreachable");
-      expect(settled.result.exitCode).toBe(0);
+      // Carry the settled result in the failure message: a red run in another
+      // shell must name its errorCode instead of only `1 !== 0`.
+      expect(settled.result.exitCode, JSON.stringify(settled.result)).toBe(0);
       expect(settled.result.sessionParams?.acpSessionId).toBe("sess-new-1");
       expect(client.frames.some(
         (frame) => frame.type === "run.event" && frame.kind === "run.system"
