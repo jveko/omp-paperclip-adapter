@@ -6,15 +6,21 @@ interface HeartbeatRunRow {
   id: string;
   status: string | null;
   started_at: string | null;
-  ended_at: string | null;
+  /** `heartbeat_runs.finished_at` (there is no `ended_at` column). */
+  finished_at: string | null;
   result_json: unknown;
   usage_json: unknown;
 }
 
 interface CostEventRow {
-  run_id: string;
+  /** `cost_events.heartbeat_run_id` (there is no `run_id` column). */
+  heartbeat_run_id: string;
   model: string | null;
-  cost_cents: number;
+  /**
+   * `numeric(24,7)`: postgres.js leaves numerics as strings (no type parser),
+   * so this is a string at runtime even when it looks like a number.
+   */
+  cost_cents: number | string;
 }
 
 interface SessionRuntime {
@@ -119,7 +125,7 @@ const plugin = definePlugin({
       }
 
       const runs = await ctx.db.query<HeartbeatRunRow>(
-        `SELECT id, status, started_at, ended_at, result_json, usage_json
+        `SELECT id, status, started_at, finished_at, result_json, usage_json
          FROM heartbeat_runs
          WHERE agent_id = $1
          ORDER BY started_at DESC
@@ -128,23 +134,28 @@ const plugin = definePlugin({
       );
 
       const costRows = await ctx.db.query<CostEventRow>(
-        `SELECT run_id, model, cost_cents
+        `SELECT heartbeat_run_id, model, cost_cents
          FROM cost_events
-         WHERE agent_id = $1 AND run_id = ANY($2)`,
+         WHERE agent_id = $1 AND heartbeat_run_id = ANY($2)`,
         [agentId, runs.map((r) => r.id)],
       );
 
-      // Build cost map: run_id -> totalCents, and model map: run_id ->
-      // distinct non-null models in row order. cost_events.model is nullable.
+      // Build cost map: heartbeat_run_id -> totalCents, and model map:
+      // heartbeat_run_id -> distinct non-null models in row order.
+      // cost_events.model is nullable. `cost_cents` arrives as a string, so a
+      // `typeof === "number"` check would silently total $0.00.
       const costByRun = new Map<string, number>();
       const modelsByRun = new Map<string, Set<string>>();
       for (const row of costRows) {
-        const cents = typeof row.cost_cents === "number" ? row.cost_cents : 0;
-        costByRun.set(row.run_id, (costByRun.get(row.run_id) ?? 0) + cents);
+        const cents = Number(row.cost_cents);
+        costByRun.set(
+          row.heartbeat_run_id,
+          (costByRun.get(row.heartbeat_run_id) ?? 0) + (Number.isFinite(cents) ? cents : 0),
+        );
         if (row.model) {
-          const models = modelsByRun.get(row.run_id) ?? new Set<string>();
+          const models = modelsByRun.get(row.heartbeat_run_id) ?? new Set<string>();
           models.add(row.model);
-          modelsByRun.set(row.run_id, models);
+          modelsByRun.set(row.heartbeat_run_id, models);
         }
       }
 
@@ -172,9 +183,9 @@ const plugin = definePlugin({
 
         // Compute session duration from timestamps
         let sessionSeconds: number | null = null;
-        if (row.started_at && row.ended_at) {
+        if (row.started_at && row.finished_at) {
           const start = new Date(row.started_at).getTime();
-          const end = new Date(row.ended_at).getTime();
+          const end = new Date(row.finished_at).getTime();
           if (!isNaN(start) && !isNaN(end) && end >= start) {
             sessionSeconds = (end - start) / 1000;
           }
@@ -187,7 +198,7 @@ const plugin = definePlugin({
           id: row.id,
           status: row.status ?? null,
           startedAt: row.started_at ?? null,
-          endedAt: row.ended_at ?? null,
+          endedAt: row.finished_at ?? null,
           sessionRuntime,
           usage,
           costUsd: runCost / 100,

@@ -3,6 +3,7 @@ import manifest from "../src/manifest.js";
 import { createTestHarness } from "@paperclipai/plugin-sdk";
 import type { TestHarness } from "@paperclipai/plugin-sdk";
 import plugin from "../src/worker.js";
+import { assertQueryColumns, postgresRows } from "./paperclip-schema.js";
 
 interface SessionRuntime {
   fork: { requested: string; applied: boolean; activeSessionId: string } | null;
@@ -41,10 +42,13 @@ async function makeHarness(): Promise<TestHarness> {
 
 function stubDb(harness: TestHarness, runs: RunRow[], cost: RunRow[]) {
   // The SDK harness records (and discards) all queries; override so the
-  // handler under test receives fixture rows.
-  harness.ctx.db.query = vi.fn(async (sql: string, params?: unknown[]) => {
-    if (sql.includes("cost_events")) return cost;
-    return runs;
+  // handler under test receives rows shaped exactly as postgres.js returns them
+  // for the real schema (numeric as string, jsonb parsed).
+  const byTable: Record<string, RunRow[]> = { heartbeat_runs: runs, cost_events: cost };
+  harness.ctx.db.query = vi.fn(async (sql: string) => {
+    const table = sql.includes("cost_events") ? "cost_events" : "heartbeat_runs";
+    assertQueryColumns(sql, table);
+    return postgresRows(table, byTable[table]!);
   }) as unknown as typeof harness.ctx.db.query;
 }
 
@@ -52,7 +56,7 @@ const RUN_1 = {
   id: "run-1",
   status: "completed",
   started_at: "2026-09-01T10:00:00Z",
-  ended_at: "2026-09-01T10:30:00Z",
+  finished_at: "2026-09-01T10:30:00Z",
   result_json: {
     sessionRuntime: {
       fork: { requested: "sess-a", applied: true, activeSessionId: "sess-a" },
@@ -67,7 +71,7 @@ const RUN_2 = {
   id: "run-2",
   status: "failed",
   started_at: "2026-09-01T11:00:00Z",
-  ended_at: "2026-09-01T11:05:00Z",
+  finished_at: "2026-09-01T11:05:00Z",
   result_json: {
     sessionRuntime: {
       fork: { requested: "sess-x", applied: false, activeSessionId: "sess-b" },
@@ -81,10 +85,10 @@ describe("omp-session-overview data handler", () => {
   it("returns the expected overview shape from heartbeat_runs + cost_events", async () => {
     const harness = await makeHarness();
     stubDb(harness, [RUN_1, RUN_2], [
-      { run_id: "run-1", model: "gpt-4", cost_cents: 500 },
-      { run_id: "run-1", model: "gpt-4", cost_cents: 200 },
-      { run_id: "run-1", model: null, cost_cents: 0 },
-      { run_id: "run-2", model: "claude-3", cost_cents: 300 },
+      { heartbeat_run_id: "run-1", model: "gpt-4", cost_cents: 500 },
+      { heartbeat_run_id: "run-1", model: "gpt-4", cost_cents: 200 },
+      { heartbeat_run_id: "run-1", model: null, cost_cents: 0 },
+      { heartbeat_run_id: "run-2", model: "claude-3", cost_cents: 300 },
     ]);
 
     const overview = await harness.getData<OmpSessionOverview>(
@@ -128,17 +132,18 @@ describe("omp-session-overview data handler", () => {
     expect(overview.summary.totalCostUsd).toBe(10);
   });
 
-  it("converts cost_cents to USD using the real column (no cost_usd)", async () => {
+  it("parses a numeric cost_cents string instead of rendering $0.00", async () => {
     const harness = await makeHarness();
-    stubDb(harness, [RUN_1], [{ run_id: "run-1", model: "gpt-4", cost_cents: 123 }]);
+    stubDb(harness, [RUN_1], [{ heartbeat_run_id: "run-1", model: "gpt-4", cost_cents: 123.45 }]);
 
     const overview = await harness.getData<OmpSessionOverview>(
       "omp-session-overview",
       { agentId: "test-agent-1" },
     );
 
-    expect(overview.runs[0].costUsd).toBe(1.23);
-    expect(overview.summary.totalCostUsd).toBe(1.23);
+    // 123.45 cents = $1.2345 (fractional cents are real: numeric(24,7))
+    expect(overview.runs[0].costUsd).toBeCloseTo(1.2345);
+    expect(overview.summary.totalCostUsd).toBeCloseTo(1.2345);
   });
 
   it("scopes summary cost to the recent-runs window (excludes cost of runs outside the page)", async () => {
@@ -146,8 +151,8 @@ describe("omp-session-overview data handler", () => {
     // RUN_1 is the only run in the returned page; run-99 is NOT in the page but
     // has cost events. The summary total must reflect only the windowed runs.
     stubDb(harness, [RUN_1], [
-      { run_id: "run-1", model: "gpt-4", cost_cents: 200 },
-      { run_id: "run-99", model: "gpt-4", cost_cents: 5000 },
+      { heartbeat_run_id: "run-1", model: "gpt-4", cost_cents: 200 },
+      { heartbeat_run_id: "run-99", model: "gpt-4", cost_cents: 5000 },
     ]);
 
     const overview = await harness.getData<OmpSessionOverview>(
@@ -164,9 +169,9 @@ describe("omp-session-overview data handler", () => {
   it("joins distinct per-run models in first-seen order (failover retries)", async () => {
     const harness = await makeHarness();
     stubDb(harness, [RUN_1], [
-      { run_id: "run-1", model: "gpt-4", cost_cents: 100 },
-      { run_id: "run-1", model: "gpt-4", cost_cents: 100 },
-      { run_id: "run-1", model: "claude-3", cost_cents: 100 },
+      { heartbeat_run_id: "run-1", model: "gpt-4", cost_cents: 100 },
+      { heartbeat_run_id: "run-1", model: "gpt-4", cost_cents: 100 },
+      { heartbeat_run_id: "run-1", model: "claude-3", cost_cents: 100 },
     ]);
 
     const overview = await harness.getData<OmpSessionOverview>(
@@ -180,7 +185,7 @@ describe("omp-session-overview data handler", () => {
 
   it("leaves model null when every cost event has a null model", async () => {
     const harness = await makeHarness();
-    stubDb(harness, [RUN_1], [{ run_id: "run-1", model: null, cost_cents: 42 }]);
+    stubDb(harness, [RUN_1], [{ heartbeat_run_id: "run-1", model: null, cost_cents: 42 }]);
 
     const overview = await harness.getData<OmpSessionOverview>(
       "omp-session-overview",
