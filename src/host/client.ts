@@ -24,6 +24,7 @@ export class HostClient {
   readonly socketPath: string;
   private readonly socket: net.Socket;
   private readonly listeners = new Set<(frame: HostReply) => void>();
+  private readonly closeListeners = new Set<() => void>();
   private readonly frames: HostReply[] = [];
   private buffer = "";
   private closed = false;
@@ -34,6 +35,8 @@ export class HostClient {
     socket.on("error", () => {});
     socket.on("close", () => {
       this.closed = true;
+      for (const listener of this.closeListeners) listener();
+      this.closeListeners.clear();
     });
     socket.on("data", (chunk: Buffer) => {
       this.buffer += chunk.toString("utf8");
@@ -92,6 +95,16 @@ export class HostClient {
     return () => this.listeners.delete(listener);
   }
 
+  /** Fire once when the socket closes (EOF, error or close()); the transport must settle. */
+  onClose(listener: () => void): () => void {
+    if (this.closed) {
+      listener();
+      return () => {};
+    }
+    this.closeListeners.add(listener);
+    return () => this.closeListeners.delete(listener);
+  }
+
   /** Resolve with the next (or already seen) matching reply. */
   waitFor(predicate: (frame: HostReply) => boolean, timeoutMs = 30_000): Promise<HostReply> {
     const seen = this.frames.find(predicate);
@@ -108,7 +121,7 @@ export class HostClient {
       off();
       result.reject(new HostUnavailableError(`omp-host did not answer within ${timeoutMs}ms`));
     }, timeoutMs);
-    void new Promise<void>((resolve) => this.socket.once("close", resolve)).then(() => {
+    void new Promise<void>((resolve) => this.onClose(resolve)).then(() => {
       clearTimeout(timer);
       off();
       result.reject(new HostUnavailableError("the omp-host connection closed before the reply"));

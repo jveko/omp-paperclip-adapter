@@ -642,6 +642,7 @@ class Supervisor {
       }
       run.ompSessionId = sessionId;
       await this.journal(this.runRecord(run, "session_open", {
+        worker: this.ledgerWorker(worker),
         ompSessionId: sessionId,
         ...(run.sessionFile !== null ? { sessionFile: run.sessionFile } : {}),
       }));
@@ -653,6 +654,9 @@ class Supervisor {
       );
       this.attach(run);
       await this.journal(this.runRecord(run, "prompting", {
+        // The worker block rides every in-flight record: it is what the next
+        // host reconciles a crashed run against (pid + start identity).
+        worker: this.ledgerWorker(worker),
         lease: { owner: run.leaseOwner, expiresAt: new Date(run.leaseDeadline).toISOString() },
       }));
       worker.currentRun = run.runId;

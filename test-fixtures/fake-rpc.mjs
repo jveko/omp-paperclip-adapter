@@ -13,6 +13,9 @@ import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import readline from "node:readline";
 
 const mode = process.env.FAKE_RPC_MODE ?? "";
+// "survive" models the real failure the supervisor exists to reap: the worker
+// outlives its host (no stdin, no shutdown) and must be killed by pid+identity.
+if (mode === "survive") setInterval(() => {}, 1 << 30);
 const logFile = process.env.FAKE_RPC_LOG;
 const statsFile = process.env.FAKE_RPC_STATS;
 const send = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
@@ -128,7 +131,7 @@ rl.on("line", (line) => {
       succeed(id, "abort");
       // "deaf" models a worker that is alive but never reports the aborted
       // prompt, so the supervisor's second lease window must kill it.
-      if (pendingPrompt && mode !== "deaf") settlePrompt("aborted");
+      if (pendingPrompt && mode !== "deaf" && mode !== "survive") settlePrompt("aborted");
       return;
     case "host_tool_result":
       if (hostToolWaiter) {
@@ -157,7 +160,7 @@ rl.on("line", (line) => {
         send({ type: "host_tool_call", id: "htc-1", toolCallId: "tc-1", toolName: "connections_search", arguments: { query: "acme" } });
         return;
       }
-      if (mode === "hang" || mode === "deaf") {
+      if (mode === "hang" || mode === "deaf" || mode === "survive") {
         pendingPrompt = { id };
         return;
       }
