@@ -111,4 +111,14 @@ describe("prepareSessionScope", () => {
     }
     await expect(readdir(blocker)).rejects.toThrow();
   });
+
+  it("returns a typed error instead of throwing on an invalid instance id", async () => {
+    vi.stubEnv("PAPERCLIP_INSTANCE_ID", "../escape");
+    const out = await prepareSessionScope(
+      { sessionScope: "isolated", credentialMode: "broker", env: {} },
+      { companyId: "co-1", agentId: "agent-1" },
+    );
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.error).toContain("could not be resolved");
+  });
 });

@@ -72,7 +72,18 @@ export async function prepareSessionScope(
     return { ok: true, prepared: { scope: "shared", agentDir: null, config, warnings: [] } };
   }
   const warnings: string[] = [];
-  const agentDir = ompAgentDir(ids.companyId, ids.agentId);
+  let agentDir: string;
+  try {
+    // resolvePaperclipInstanceRootForAdapter throws on an invalid
+    // PAPERCLIP_INSTANCE_ID; the fence must degrade to a typed error, never an
+    // uncaught throw out of the run path.
+    agentDir = ompAgentDir(ids.companyId, ids.agentId);
+  } catch (err) {
+    return {
+      ok: false,
+      error: `sessionScope is 'isolated' but this agent's omp agent dir could not be resolved: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
   const env = { ...((config.env ?? {}) as Record<string, unknown>) };
   const configuredAgentDir = str(env.PI_CODING_AGENT_DIR) || str(process.env.PI_CODING_AGENT_DIR);
   if (configuredAgentDir && path.resolve(configuredAgentDir) !== path.resolve(agentDir)) {
