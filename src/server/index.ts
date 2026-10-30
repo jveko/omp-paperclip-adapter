@@ -52,7 +52,7 @@ async function detectOmpModelProbe() {
  * Paperclip contract HEAD declares `runtimeToolDelivery` on
  * `ServerAdapterModule` (adapter-utils types.ts:519) and the heartbeat path
  * reads it untyped (`adapter.runtimeToolDelivery ?? "invocation_context"`,
- * runtime-execution.ts:775-777), but the pinned 2026.824.1 declaration does not
+ * runtime-execution.ts:777-778), but the pinned 2026.824.1 declaration does not
  * carry the member. Re-declaring it here keeps the value checked without
  * bumping the dependency; this type is the one place the skew is recorded.
  */
@@ -72,8 +72,8 @@ export function createServerAdapter(): OmpServerAdapterModule {
     getConfigSchema: () => getSessionConfigSchema(),
     // Run identity: Paperclip mints the per-run JWT only for adapters that
     // declare this (runtime-execution.ts:249-260), and the engine turns the
-    // token into PAPERCLIP_API_KEY in the run child (acpx-engine
-    // execute.js:2098). That key is the single source for the session-snapshot
+    // token into PAPERCLIP_API_KEY in the run child (pinned acpx-engine
+    // execute.js:1014-1015). That key is the single source for the session-snapshot
     // and usage work products and for the bridge's approval round-trip; a
     // missing token keeps failing closed with the existing explicit errors.
     // Blast radius (company-scoped API access for the run) is stated in

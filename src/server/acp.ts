@@ -477,12 +477,13 @@ type OmpAcpExecutor = (ctx: AdapterExecutionContext) => Promise<AdapterExecution
  * Endpoint of the run-scoped connection-tools MCP server Paperclip offered this
  * run, or null when it offered none.
  *
- * `runtimeTools` ships at Paperclip contract HEAD (adapter-utils types.ts:272,
- * populated by runtime-execution.ts:793) but is absent from the pinned
- * 2026.824.1 declaration that `tsc` compiles against, so the member is narrowed
- * from the boundary value rather than asserted on the context. A server that
- * never sets it simply reads as null. Only the endpoint is read; the bearer
- * token in the same object must never enter a log, an event or a work product.
+ * `runtimeTools` ships at Paperclip contract HEAD (adapter-utils types.ts:273,
+ * passed to `adapter.execute()` at runtime-execution.ts:832) but is absent from
+ * the pinned 2026.824.1 declaration that `tsc` compiles against, so the member
+ * is narrowed from the boundary value rather than asserted on the context. A
+ * server that never sets it simply reads as null. Only the endpoint is read;
+ * the bearer token in the same object must never enter a log, an event or a
+ * work product.
  */
 function connectionToolsEndpoint(ctx: AdapterExecutionContext): string | null {
   if (!("runtimeTools" in ctx)) return null;

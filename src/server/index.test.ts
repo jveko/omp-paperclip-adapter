@@ -35,7 +35,7 @@ describe("createServerAdapter", () => {
     // ./index.ts); the server reads the member untyped.
     expect(mod.runtimeToolDelivery).toBe("native_mcp");
     expect(mod.supportsInstructionsBundle).toBe(true);
-    // The engine renders this key into the run prompt (execute.js:3118-3139),
+    // The engine renders this key into the run prompt (execute.js:1685-1701),
     // and the ephemeral skills file merges the same path.
     expect(mod.instructionsPathKey).toBe("instructionsFilePath");
   });
