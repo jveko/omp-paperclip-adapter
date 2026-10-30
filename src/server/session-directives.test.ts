@@ -2,8 +2,9 @@ import { describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
 import {
   getSessionConfigSchema, paperclipApiBase, readSessionIntelConfig, resolveRunDirective,
-  resolveSessionScope, sessionSnapshotDigestInput, thinkingLevelChanged, validateCredentialMode,
-  validateSessionScope, validThinkingLevel, validatePlanMode, validateThinkingLevel,
+  resolveSessionScope, resolveSubagentObservability, sessionSnapshotDigestInput, thinkingLevelChanged,
+  validateCredentialMode, validateSessionScope, validThinkingLevel, validatePlanMode,
+  validateSubagentObservability, validateThinkingLevel,
 } from "./session-directives.js";
 import { snapshotDigest } from "./session-state.js";
 
@@ -80,9 +81,18 @@ describe("getSessionConfigSchema", () => {
       "sessionForkToken", "sessionMaxRuns", "sessionMaxAgeHours",
       "credentialMode", "thinking", "fallbackChain",
       "fallbackOn", "fallbackRevertPolicy", "waitForUsageReset", "maxDelayMs",
-      "usageReport", "skillsAsTools", "steering", "executionMode", "governancePolicy",
+      "usageReport", "skillsAsTools", "steering", "subagentObservability", "executionMode", "governancePolicy",
     ]);
     for (const field of schema.fields) expect(field.hint).toContain("next run");
+  });
+  it("exposes subagentObservability as a summary-defaulted managed-lane select", () => {
+    const byKey = Object.fromEntries(getSessionConfigSchema().fields.map((f) => [f.key, f]));
+    const field = byKey.subagentObservability;
+    expect(field.type).toBe("select");
+    expect(field.default).toBe("summary");
+    expect(field.options.map((o: { value: string }) => o.value)).toEqual(["off", "summary", "events"]);
+    expect(field.hint).toMatch(/engine mode/i);
+    expect(field.hint).toMatch(/managed/i);
   });
   it("exposes steering as an off-by-default managed-lane toggle", () => {
     const byKey = Object.fromEntries(getSessionConfigSchema().fields.map((f) => [f.key, f]));
@@ -256,6 +266,23 @@ describe("validatePlanMode", () => {
     { name: "an agentCommand without --plan", config: { agentCommand: "omp acp --thinking high" } },
   ])("returns null for $name", ({ config }) => {
     expect(validatePlanMode(config)).toBeNull();
+  });
+});
+
+describe("subagentObservability", () => {
+  it("defaults to summary when unset or empty", () => {
+    expect(resolveSubagentObservability({})).toBe("summary");
+    expect(resolveSubagentObservability({ subagentObservability: "" })).toBe("summary");
+    expect(validateSubagentObservability({})).toBeNull();
+  });
+  it.each(["off", "summary", "events"] as const)("accepts %s", (level) => {
+    expect(resolveSubagentObservability({ subagentObservability: level })).toBe(level);
+    expect(validateSubagentObservability({ subagentObservability: level })).toBeNull();
+  });
+  it("refuses an unknown level with an actionable message", () => {
+    const message = validateSubagentObservability({ subagentObservability: "verbose" });
+    expect(message).toMatch(/subagentObservability/);
+    expect(message).toMatch(/'off'.*'summary'.*'events'/);
   });
 });
 

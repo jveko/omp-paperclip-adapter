@@ -24,6 +24,16 @@ import {
   writeDiscovery, type HostDiscovery,
 } from "./socket.js";
 import { McpHttpClient } from "./mcp.js";
+import {
+  SUBAGENT_EVENT_FRAME_CAP,
+  buildSubagentSnapshot,
+  readSubagentFrame,
+  readSubagentSnapshot,
+  rpcSubagentLevel,
+  type RpcSubagentLevel,
+  type SubagentObservation,
+  type SubagentSummary,
+} from "./subagents.js";
 import { RpcWorker, type RpcFrame } from "./worker.js";
 
 /**
@@ -170,6 +180,14 @@ interface RunState {
   lastAssistantText: string | null;
   /** Whether this run installed the connection tools on its worker. */
   hostToolsInstalled: boolean;
+  /** The omp subagent subscription this run applied (always reset per run). */
+  subagentLevel: RpcSubagentLevel;
+  /** Whether any subagent frame arrived, so the settle knows to ask for a roster. */
+  subagentSeen: boolean;
+  subagentFrames: number;
+  subagentCapWarned: boolean;
+  /** Bounded per-subagent observations, keyed by omp's subagent id. */
+  subagents: Map<string, SubagentObservation>;
 }
 
 interface Connection {
@@ -774,6 +792,11 @@ class Supervisor {
       unsubscribe: [],
       lastAssistantText: null,
       hostToolsInstalled: false,
+      subagentLevel: "off",
+      subagentSeen: false,
+      subagentFrames: 0,
+      subagentCapWarned: false,
+      subagents: new Map(),
     };
 
     let promptAccepted = false;
@@ -851,6 +874,19 @@ class Supervisor {
       }));
 
       run.statsBefore = readStats(await worker.worker.getStats().catch(() => ({})));
+
+      // Subscribe before the prompt so the run sees subagents it starts. omp
+      // filters at the subscription; `off` still has to be sent to clear a level
+      // a previous run left on a warm worker.
+      const wantedLevel = rpcSubagentLevel(begin.subagentObservability ?? "summary");
+      try {
+        run.subagentLevel = await worker.worker.setSubagentSubscription(wantedLevel);
+      } catch (err) {
+        this.emitEvent(run, "run.system", {
+          level: "warn",
+          message: `omp subagent observability is unavailable this run (${err instanceof Error ? err.message : String(err)}); continuing without it`,
+        });
+      }
 
       if (begin.connectionTools !== undefined && begin.connectionTools !== null) {
         await this.installHostTools(run, begin.connectionTools);
@@ -994,11 +1030,90 @@ class Supervisor {
       case "turn_end":
         this.emitEvent(run, "omp.turn", { event: frame.type });
         return;
+      case "subagent_lifecycle":
+      case "subagent_progress":
+      case "subagent_event":
+        this.onSubagentFrame(run, frame);
+        return;
       default:
         // Token deltas and UI frames never reach the board: the engine lane only
         // ever emitted turn-level activity, and a per-token event is not one.
         return;
     }
+  }
+
+  /**
+   * Turn one of omp's subagent frames into a bounded `omp.subagent` event.
+   *
+   * The observation map is updated before the frame cap is checked, so the
+   * settlement snapshot still counts every subagent the run saw; only the live
+   * event stream is capped. omp emits nothing at level `off`, and its event
+   * frames only at `events`; both are re-checked defensively because a warm
+   * worker's level changes between runs.
+   */
+  private onSubagentFrame(run: RunState, frame: RpcFrame): void {
+    if (run.subagentLevel === "off") return;
+    if (frame.type === "subagent_event" && run.subagentLevel !== "events") return;
+    const read = readSubagentFrame(frame);
+    if (read === null) return;
+    run.subagentSeen = true;
+    const existing = run.subagents.get(read.id);
+    // A terminal status stays terminal: omp removes finished subagents from its
+    // roster, and a late progress frame must not count one as running again.
+    const status = read.status === null
+      ? existing?.status ?? "running"
+      : existing !== undefined && existing.status !== "running" && read.status === "running"
+        ? existing.status
+        : read.status;
+    const observation: SubagentObservation = {
+      id: read.id,
+      index: read.index ?? existing?.index ?? run.subagents.size,
+      agent: read.agent ?? existing?.agent ?? "subagent",
+      status,
+      description: read.description ?? existing?.description ?? null,
+      parentToolCallId: read.parentToolCallId ?? existing?.parentToolCallId ?? null,
+      lastUpdate: Date.now(),
+    };
+    run.subagents.set(read.id, observation);
+    if (run.subagentFrames >= SUBAGENT_EVENT_FRAME_CAP) {
+      if (!run.subagentCapWarned) {
+        run.subagentCapWarned = true;
+        this.emitEvent(run, "run.system", {
+          level: "warn",
+          message: `subagent event cap (${SUBAGENT_EVENT_FRAME_CAP}) reached for this run; further subagent frames are dropped, and the settlement snapshot still counts every subagent`,
+        });
+      }
+      return;
+    }
+    run.subagentFrames += 1;
+    const payload: Record<string, unknown> = {
+      id: observation.id,
+      index: observation.index,
+      agent: observation.agent,
+      status: observation.status,
+      ...(observation.description !== null ? { description: observation.description } : {}),
+      ...(observation.parentToolCallId !== null ? { parentToolCallId: observation.parentToolCallId } : {}),
+      lastUpdate: observation.lastUpdate,
+    };
+    if (run.subagentLevel === "events" && read.event !== null) {
+      payload.event = read.event;
+      if (read.summary !== null) payload.summary = read.summary;
+    }
+    this.emitEvent(run, "omp.subagent", payload);
+  }
+
+  /**
+   * The run's compact subagent evidence at settle: the lifecycle this run
+   * observed, merged with the roster omp still reports running. Null when the
+   * run saw nothing, so runs without subagents keep their resultJson unchanged.
+   */
+  private async subagentSummary(run: RunState): Promise<SubagentSummary | null> {
+    if (run.subagentLevel === "off" && !run.subagentSeen) return null;
+    const roster = await run.worker.worker.getSubagents(5_000).catch(() => []);
+    const running = roster
+      .map((entry) => readSubagentSnapshot(entry))
+      .filter((entry): entry is SubagentObservation => entry !== null);
+    return buildSubagentSnapshot(run.subagents.values(), running);
   }
 
   /**
@@ -1206,6 +1321,9 @@ class Supervisor {
     run.worker.lastUsedAt = Date.now();
 
     const statsAfter = readStats(await run.worker.worker.getStats().catch(() => ({})));
+    // Ask before the worker is reused/retired; a run with no subagent activity
+    // and observability off skips the request and adds no empty field.
+    const subagents = await this.subagentSummary(run);
     const used = delta(run.statsBefore, statsAfter);
     const model = this.singleModel(used.routedModels) ?? run.begin.cell.model;
     const status = run.outcome?.status ?? (outcome.kind === "settled" ? "completed" : "error");
@@ -1248,6 +1366,7 @@ class Supervisor {
         reusedWorker: run.reusedWorker,
         routedModels: used.routedModels,
         ...(used.contextUsage !== null ? { contextUsage: used.contextUsage } : {}),
+        ...(subagents !== null ? { subagents } : {}),
       },
       summary: run.lastAssistantText ?? outcome.stopReason ?? status,
       ...(outcome.executionRecovery !== undefined ? { executionRecovery: outcome.executionRecovery } : {}),

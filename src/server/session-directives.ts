@@ -1,5 +1,8 @@
 import type { AdapterConfigSchema } from "@paperclipai/adapter-utils";
+import type { SubagentObservability } from "../host/protocol.js";
 import { validThinkingLevel } from "./thinking-levels.js";
+
+export type { SubagentObservability };
 
 export { validThinkingLevel } from "./thinking-levels.js";
 
@@ -121,6 +124,29 @@ export function resolveSteering(config: Record<string, unknown>): SteeringMode |
 export function validateSteering(config: Record<string, unknown>): string | null {
   if (resolveSteering(config) !== null) return null;
   return `steering is '${String(config.steering)}' but expected 'off' or 'on'.`;
+}
+
+/**
+ * How much subagent lifecycle the managed lane subscribes to.
+ *
+ * `summary` (the default) streams lifecycle/progress as bounded `omp.subagent`
+ * events and records a settlement snapshot; `events` adds each subagent's own
+ * event type and a content-free summary; `off` subscribes to nothing and adds
+ * no result evidence. Only the managed lane has an RPC surface for this, so the
+ * engine lane ignores the key. An unknown value is a config error, not a silent
+ * default: the levels differ in how much transcript-adjacent metadata leaves
+ * the worker.
+ */
+export function resolveSubagentObservability(config: Record<string, unknown>): SubagentObservability | null {
+  const raw = config.subagentObservability;
+  if (raw === undefined || raw === null || raw === "") return "summary";
+  if (raw === "off" || raw === "summary" || raw === "events") return raw;
+  return null;
+}
+
+export function validateSubagentObservability(config: Record<string, unknown>): string | null {
+  if (resolveSubagentObservability(config) !== null) return null;
+  return `subagentObservability is '${String(config.subagentObservability)}' but expected 'off', 'summary' or 'events'.`;
 }
 
 export type RunDirective =
@@ -307,6 +333,13 @@ export function getSessionConfigSchema(): AdapterConfigSchema {
           { label: "On (forward steer/follow_up to the live turn)", value: "on" },
         ],
         hint: `Managed lane only. When on, a steering request is forwarded to the running turn through omp RPC steer/follow_up; when off the supervisor refuses it. Engine mode has no steering transport, so this key has no effect there. ${NEXT_RUN}` },
+      { key: "subagentObservability", label: "Subagent observability", type: "select", default: "summary",
+        options: [
+          { label: "Off", value: "off" },
+          { label: "Summary (lifecycle, progress, run snapshot)", value: "summary" },
+          { label: "Events (summary plus subagent event type)", value: "events" },
+        ],
+        hint: `Managed lane only; engine mode has no subagent surface and ignores the key. summary subscribes to omp's lifecycle/progress and emits bounded omp.subagent events plus a resultJson.subagents snapshot at settle; events also carries each subagent's event type and a content-free summary. Subagent prompts, tool arguments, tokens and transcripts are never carried, and every string is capped. Off subscribes to nothing and adds no result evidence. ${NEXT_RUN}` },
       { key: "executionMode", label: "Execution lane", type: "select", default: "engine",
         options: [
           { label: "Engine (ACP, v0.11 behaviour)", value: "engine" },

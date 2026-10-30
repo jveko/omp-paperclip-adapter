@@ -338,6 +338,30 @@ export class RpcWorker {
   }
 
   /**
+   * Set omp's subagent subscription for the runs this worker serves. A warm
+   * worker keeps the last level, so every run sets it (including `off`) before
+   * it prompts; otherwise one run's `events` would leak into the next.
+   */
+  async setSubagentSubscription(
+    level: "off" | "progress" | "events",
+  ): Promise<"off" | "progress" | "events"> {
+    const response = await this.request({ type: "set_subagent_subscription", level });
+    const data = (response.data ?? {}) as Record<string, unknown>;
+    const applied = data.level;
+    return applied === "off" || applied === "progress" || applied === "events" ? applied : level;
+  }
+
+  /**
+   * The running subagents omp still holds at settle. Finished subagents leave
+   * omp's registry, so this is the live remainder, not the run's history.
+   */
+  async getSubagents(timeoutMs?: number): Promise<unknown[]> {
+    const response = await this.request({ type: "get_subagents" }, timeoutMs);
+    const data = (response.data ?? {}) as Record<string, unknown>;
+    return Array.isArray(data.subagents) ? data.subagents : [];
+  }
+
+  /**
    * Answer `host_tool_call` frames. `null` clears the handler at settle, so a
    * warm worker never answers a later run with an earlier run's credentials.
    */

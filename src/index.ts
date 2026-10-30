@@ -31,6 +31,7 @@ ACP stdio transport.
 | \`stateDir\`, \`instructionsFilePath\`, \`cwd\` | unset | passed through to engine |
 | \`sessionScope\` | \`shared\` | \`shared\` = the host's one omp agent dir; \`isolated\` = this agent's own (requires \`credentialMode: broker\`) |
 | \`sessionSnapshotDiagnostic\` | \`false\` | log counts from omp's host-wide \`_omp/*\` listing (never ids, cwds or titles) |
+| \`subagentObservability\` | \`summary\` | managed lane only: \`off\` / \`summary\` / \`events\`; engine mode ignores it |
 | \`warmHandleIdleMs\` | \`0\` | pinned to \`0\` on every run (see below). The engine sets \`PAPERCLIP_API_KEY\` only when it spawns the child, so a reused process would keep an earlier run's token |
 
 ### One run per session
@@ -155,6 +156,34 @@ ACP stdio transport.
   A value outside an enum is a config error (\`omp_config_error\`) instead of a
   file omp would silently discard — an unknown \`fallbackOn\` reads back as
   \`any\`, so a warn would be a knob that does nothing.
+
+### Subagent observability (managed lane)
+- \`subagentObservability\` decides how much of omp's subagent tree this run
+  subscribes to. \`summary\` (the default) sends \`set_subagent_subscription\`
+  at omp's \`progress\` level before the prompt and relays each
+  lifecycle/progress frame as a bounded \`omp.subagent\` event: id, index,
+  agent, status, description, parentToolCallId, lastUpdate. \`events\`
+  subscribes at omp's \`events\` level and adds the subagent's own event type
+  and a content-free summary (a tool event names the tool; a message event
+  carries no text). \`off\` subscribes to nothing and adds no result evidence.
+  An unknown value is a config error (\`omp_config_error\`).
+- The payload is bounded at the source: credential-shaped strings (JWTs,
+  bearer tokens, common token prefixes) are replaced with \`[redacted]\`,
+  every string is capped at 200 characters, the live stream at 100
+  \`omp.subagent\` frames per run (then one warning; the snapshot still counts
+  everything), and the snapshot's item list at 50. Subagent prompts, tool
+  arguments, tokens and full transcripts are never carried — the adapter
+  reads an allowlist of fields, not the frame.
+- At settle, a run that observed subagent activity reads \`get_subagents\`
+  and records \`resultJson.subagents\`:
+  \`{ total, completed, failed, cancelled, running, items }\`. Counts come from
+  the lifecycle this run saw; \`running\` includes what omp's roster still
+  holds. A run with no subagent activity adds no \`subagents\` field.
+- Engine mode has no subagent surface and ignores the key.
+- Cancelling or timing out a run kills the worker's process group, so its
+  children die with it. A per-subagent \`cancel_subagent\`/\`steer_subagent\`
+  control path is deliberately not exposed: the board contract for it does
+  not exist, and a control command without one would be a knob nobody owns.
 
 ### Run identity and control plane
 - Paperclip mints a per-run token for this adapter (\`supportsLocalAgentJwt\`)

@@ -1,6 +1,7 @@
 // Scripted `omp --mode rpc` responder for host tests. Speaks the JSONL RPC
 // subset the supervisor uses: ready, new_session, open_session, prompt,
-// abort, get_state, get_session_stats, set_host_tools, steer, follow_up.
+// abort, get_state, get_session_stats, set_host_tools, steer, follow_up,
+// set_subagent_subscription, get_subagents.
 //
 // Modes (FAKE_RPC_MODE):
 //   "" (default)  prompt settles immediately
@@ -9,6 +10,9 @@
 //   chunk         emits one logical frame split into two rpc_chunk frames
 //   hosttool      emits a host_tool_call on prompt and waits for the result
 //   nosettle      prompt_result reports sessionSettled:false; only session_settled follows
+//   subagents     three subagents: one completed, one failed, one still running
+//   subagents200  two hundred running subagents (frame-cap fixture)
+//   subagentsleak same as subagents, with credentials/prompt text in fields
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import readline from "node:readline";
 
@@ -25,6 +29,8 @@ let sessionFile = "/tmp/fake-session-1.json";
 let seq = 0;
 let pendingPrompt = null;
 let hostToolWaiter = null;
+let subagentLevel = "off";
+const subagents = new Map();
 
 let memoryStats = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
 const stats = () => {
@@ -74,6 +80,100 @@ const settlePrompt = (status) => {
   // Real omp emits the settle frame once the session goes quiet; every mode
   // here goes quiet immediately after the prompt's own work.
   send({ type: "session_settled" });
+};
+
+// Subagent observability, modelled on omp's registry: lifecycle frames are
+// recorded whatever the subscription, but only output at "progress"/"events";
+// subagent events need "events"; terminal subagents leave the roster.
+const subagentFrame = (frame) => {
+  if (subagentLevel === "off") return;
+  if (frame.type === "subagent_event" && subagentLevel !== "events") return;
+  send(frame);
+};
+
+const lifecycleFrame = (snapshot, status) =>
+  subagentFrame({
+    type: "subagent_lifecycle",
+    payload: {
+      id: snapshot.id, index: snapshot.index, agent: snapshot.agent,
+      agentSource: "bundled", status,
+      ...(snapshot.description === undefined ? {} : { description: snapshot.description }),
+      ...(snapshot.parentToolCallId === undefined ? {} : { parentToolCallId: snapshot.parentToolCallId }),
+    },
+  });
+
+const startSubagent = (id, index, agent, description) => {
+  const snapshot = {
+    id, index, agent, agentSource: "bundled", status: "running",
+    ...(description === undefined ? {} : { description }),
+    lastUpdate: Date.now(), parentToolCallId: "tc-parent",
+  };
+  subagents.set(id, snapshot);
+  lifecycleFrame(snapshot, "started");
+};
+
+const endSubagent = (id, status) => {
+  const snapshot = subagents.get(id);
+  if (snapshot === undefined) return;
+  subagents.delete(id);
+  lifecycleFrame(snapshot, status);
+};
+
+const progressSubagent = (id, status, description) => {
+  const snapshot = subagents.get(id);
+  if (snapshot === undefined) return;
+  snapshot.status = status;
+  if (description !== undefined) snapshot.description = description;
+  snapshot.lastUpdate = Date.now();
+  subagentFrame({
+    type: "subagent_progress",
+    payload: {
+      index: snapshot.index, agent: snapshot.agent, agentSource: "bundled",
+      // The task/assignment are prompt text: a fixture that leaks them proves
+      // the host never copies them into a frame.
+      task: "TASK-SENTINEL-IGNORE-ALL-PREVIOUS",
+      assignment: "ASSIGNMENT-SENTINEL-IGNORE-ALL-PREVIOUS",
+      progress: { ...snapshot, status, task: "PROMPT-SENTINEL-IGNORE-ALL-PREVIOUS" },
+      parentToolCallId: snapshot.parentToolCallId,
+    },
+  });
+};
+
+const eventSubagent = (id, event) => {
+  if (!subagents.has(id)) return;
+  subagentFrame({ type: "subagent_event", payload: { id, event } });
+};
+
+const emitSubagentWork = () => {
+  if (mode === "subagentsleak") {
+    startSubagent("sa-1", 0, "explore", "read the config");
+    startSubagent("sa-2", 1, "plan", "scan sk-live-ABCDEF1234567890 with Bearer abcdefghijklmnop");
+    startSubagent("sa-3", 2, "task", "keep working");
+    progressSubagent("sa-1", "running", "reading files");
+    eventSubagent("sa-1", {
+      type: "tool_execution_end", toolName: "read", isError: false,
+      arguments: { path: "ARG-SENTINEL-IGNORE-ALL-PREVIOUS" },
+    });
+    eventSubagent("sa-1", { type: "message_end", messageId: "msg-1", text: "TRANSCRIPT-SENTINEL" });
+    endSubagent("sa-1", "completed");
+    endSubagent("sa-2", "failed");
+    return;
+  }
+  if (mode === "subagents") {
+    startSubagent("sa-1", 0, "explore", "read the config");
+    startSubagent("sa-2", 1, "plan", "draft the plan");
+    startSubagent("sa-3", 2, "task", "keep working");
+    progressSubagent("sa-1", "running", "reading files");
+    eventSubagent("sa-1", { type: "message_end", messageId: "msg-1", text: "working" });
+    endSubagent("sa-1", "completed");
+    endSubagent("sa-2", "failed");
+    return;
+  }
+  if (mode === "subagents200") {
+    for (let index = 0; index < 200; index += 1) {
+      startSubagent(`sa-${String(index).padStart(3, "0")}`, index, "explore", `unit ${index}`);
+    }
+  }
 };
 
 send({
@@ -146,6 +246,18 @@ rl.on("line", (line) => {
       const names = Array.isArray(frame.tools) ? frame.tools.map((t) => t.name) : [];
       return send({ id, type: "response", command: "set_host_tools", success: true, data: { toolNames: names } });
     }
+    case "set_subagent_subscription": {
+      if (frame.level !== "off" && frame.level !== "progress" && frame.level !== "events") {
+        return send({
+          id, type: "response", command: frame.type, success: false,
+          error: `unsupported subagent subscription level: ${String(frame.level)}`,
+        });
+      }
+      subagentLevel = frame.level;
+      return succeed(id, "set_subagent_subscription", { level: subagentLevel });
+    }
+    case "get_subagents":
+      return succeed(id, "get_subagents", { subagents: [...subagents.values()] });
     case "steer":
     case "follow_up":
       if (mode === "hang") send({ type: "message_end", messageId: "steer-1", text: frame.message });
@@ -190,6 +302,7 @@ rl.on("line", (line) => {
       }
       pendingPrompt = { id };
       send({ type: "message_end", messageId: "m1", text: "working" });
+      emitSubagentWork();
       settlePrompt("completed");
       return;
     }

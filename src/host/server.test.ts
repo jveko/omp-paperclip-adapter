@@ -12,6 +12,7 @@ import { RUN_CONTEXT_FILE } from "./run-context.js";
 import { readProcessStartIdentity } from "./socket.js";
 import { acquireSessionLease } from "../server/session-lease.js";
 import { sessionIntelDir } from "../server/session-state.js";
+import { SUBAGENT_EVENT_FRAME_CAP, SUBAGENT_ITEM_CAP } from "./subagents.js";
 import { startFakeMcp } from "../../test/fake-mcp.js";
 
 const fixture = path.resolve(
@@ -281,6 +282,198 @@ describe("supervisor", () => {
       if (refused.type !== "run.steer.result") throw new Error("unreachable");
       expect(refused.ok).toBe(false);
       expect(refused.error).toContain("steering is disabled");
+    } finally {
+      client.close();
+    }
+  }, 20_000);
+
+  /* ---------------------------------------------------------------- */
+  /*  Subagent observability (v0.13)                                   */
+  /* ---------------------------------------------------------------- */
+
+  function subagentPayloads(frames: HostReply[]): Array<Record<string, unknown>> {
+    return frames
+      .filter((frame): frame is Extract<HostReply, { type: "run.event" }> =>
+        frame.type === "run.event" && frame.kind === "omp.subagent")
+      .map((frame) => frame.payload);
+  }
+
+  async function runFixture(
+    runId: string,
+    mode: string,
+    subagentObservability?: RunBeginFrame["subagentObservability"],
+  ): Promise<{ client: Client; log: string; settled: Extract<HostReply, { type: "run.settled" }> }> {
+    const log = path.join(root, `${runId}.log`);
+    const running = await start();
+    const client = await connectClient(running.socketPath);
+    client.send(beginFrame({
+      runId,
+      worker: {
+        command: process.execPath,
+        args: [fixture],
+        env: { FAKE_RPC_MODE: mode, FAKE_RPC_LOG: log },
+      },
+      ...(subagentObservability !== undefined ? { subagentObservability } : {}),
+    }));
+    const settled = await client.waitFor((frame) => frame.type === "run.settled" && frame.runId === runId);
+    if (settled.type !== "run.settled") throw new Error("unreachable");
+    return { client, log, settled };
+  }
+
+  async function commandLog(log: string): Promise<Array<{ type: string; level?: string }>> {
+    return (await readFile(log, "utf8")).trim().split("\n")
+      .map((line) => JSON.parse(line) as { type: string; level?: string });
+  }
+
+  it("subscribes at summary by default and emits ordered bounded events plus a snapshot", async () => {
+    const { client, log, settled } = await runFixture("run-subagents", "subagents");
+    try {
+      const payloads = subagentPayloads(client.frames);
+      expect(payloads.map((payload) => [payload.id, payload.status])).toEqual([
+        ["sa-1", "running"], ["sa-2", "running"], ["sa-3", "running"],
+        ["sa-1", "running"], ["sa-1", "completed"], ["sa-2", "failed"],
+      ]);
+      expect(payloads[3]).toMatchObject({
+        index: 0, agent: "explore", description: "reading files",
+      });
+      expect(payloads[0].parentToolCallId).toBe("tc-parent");
+      for (const payload of payloads) {
+        expect(payload).not.toHaveProperty("task");
+        expect(payload).not.toHaveProperty("assignment");
+        expect(payload).not.toHaveProperty("event");
+        expect(JSON.stringify(payload)).not.toContain("SENTINEL");
+      }
+      expect(settled.result.resultJson).toMatchObject({
+        subagents: { total: 3, completed: 1, failed: 1, cancelled: 0, running: 1 },
+      });
+      const summary = (settled.result.resultJson as Record<string, unknown>).subagents as {
+        items: Array<Record<string, unknown>>;
+      };
+      expect(summary.items.map((item) => item.id)).toEqual(["sa-1", "sa-2", "sa-3"]);
+      expect(summary.items[2]).toMatchObject({ index: 2, agent: "task", status: "running" });
+
+      const commands = await commandLog(log);
+      const subscription = commands.findIndex((command) => command.type === "set_subagent_subscription");
+      const prompt = commands.findIndex((command) => command.type === "prompt");
+      expect(subscription).toBeGreaterThan(-1);
+      expect(subscription).toBeLessThan(prompt);
+      expect(commands[subscription].level).toBe("progress");
+      expect(commands.filter((command) => command.type === "get_subagents")).toHaveLength(1);
+    } finally {
+      client.close();
+    }
+  }, 20_000);
+
+  it("adds the event type and a summary at the events level only", async () => {
+    const { client } = await runFixture("run-subagents-events", "subagents", "events");
+    try {
+      const payloads = subagentPayloads(client.frames);
+      const subagentEvent = payloads.find((payload) => payload.event === "message_end");
+      expect(subagentEvent).toMatchObject({ id: "sa-1", event: "message_end", summary: "message_end" });
+      expect(subagentEvent).not.toHaveProperty("text");
+      // Lifecycle frames carry no event field, only a status.
+      const lifecycle = payloads.find((payload) => payload.status === "completed");
+      expect(lifecycle).not.toHaveProperty("event");
+    } finally {
+      client.close();
+    }
+  }, 20_000);
+
+  it("resets a warm worker's subscription to off for the next run", async () => {
+    const log = path.join(root, "subagent-warm.log");
+    const worker = {
+      command: process.execPath,
+      args: [fixture],
+      env: { FAKE_RPC_MODE: "subagents", FAKE_RPC_LOG: log },
+    };
+    const running = await start();
+    const client = await connectClient(running.socketPath);
+    try {
+      client.send(beginFrame({
+        runId: "run-warm-events", sessionKey: "sk-subagents", worker, subagentObservability: "events",
+      }));
+      await client.waitFor((frame) => frame.type === "run.accepted" && frame.runId === "run-warm-events");
+      await client.waitFor((frame) => frame.type === "run.settled" && frame.runId === "run-warm-events");
+      expect(subagentPayloads(client.frames).length).toBeGreaterThan(0);
+
+      const before = client.frames.length;
+      client.send(beginFrame({
+        runId: "run-warm-off", sessionKey: "sk-subagents", worker,
+        session: { ompSessionId: "sess-1" }, subagentObservability: "off",
+      }));
+      const accepted = await client.waitFor(
+        (frame) => frame.type === "run.accepted" && frame.runId === "run-warm-off",
+      );
+      const settled = await client.waitFor(
+        (frame) => frame.type === "run.settled" && frame.runId === "run-warm-off",
+      );
+      if (accepted.type !== "run.accepted" || settled.type !== "run.settled") throw new Error("unreachable");
+      expect(accepted.reusedWorker).toBe(true);
+      expect(subagentPayloads(client.frames.slice(before))).toEqual([]);
+      expect(settled.result.resultJson).not.toHaveProperty("subagents");
+    } finally {
+      client.close();
+    }
+  }, 20_000);
+
+  it("emits nothing and adds no snapshot when observability is off", async () => {
+    const { client, log, settled } = await runFixture("run-subagents-off", "subagents", "off");
+    try {
+      expect(subagentPayloads(client.frames)).toEqual([]);
+      expect(settled.result.resultJson).not.toHaveProperty("subagents");
+      const commands = await commandLog(log);
+      const subscription = commands.find((command) => command.type === "set_subagent_subscription");
+      expect(subscription?.level).toBe("off");
+    } finally {
+      client.close();
+    }
+  }, 20_000);
+
+  it("caps a 200-subagent run's frames and snapshot without crashing", async () => {
+    const { client, settled } = await runFixture("run-subagents-200", "subagents200");
+    try {
+      expect(subagentPayloads(client.frames)).toHaveLength(SUBAGENT_EVENT_FRAME_CAP);
+      const warning = client.frames.find((frame) =>
+        frame.type === "run.event" && frame.kind === "run.system"
+        && String(frame.payload.message).includes("subagent event cap"));
+      expect(warning).toBeDefined();
+      expect(settled.result.resultJson).toMatchObject({
+        subagents: { total: 200, running: 200, completed: 0, failed: 0, cancelled: 0 },
+      });
+      const summary = (settled.result.resultJson as Record<string, unknown>).subagents as {
+        items: Array<Record<string, unknown>>;
+      };
+      expect(summary.items).toHaveLength(SUBAGENT_ITEM_CAP);
+      expect(summary.items[0]).toMatchObject({ id: "sa-000", index: 0 });
+      expect(summary.items.at(-1)).toMatchObject({ index: SUBAGENT_ITEM_CAP - 1 });
+    } finally {
+      client.close();
+    }
+  }, 20_000);
+
+  it("never carries credentials, prompt text, arguments or transcripts", async () => {
+    const { client, settled } = await runFixture("run-subagents-leak", "subagentsleak", "events");
+    try {
+      const allEvents = JSON.stringify(client.frames.filter((frame) => frame.type === "run.event"));
+      const allResult = JSON.stringify(settled.result);
+      const sentinels = [
+        "sk-live-ABCDEF", "Bearer abcdefghij", "TRANSCRIPT-SENTINEL",
+        "ARG-SENTINEL", "TASK-SENTINEL", "ASSIGNMENT-SENTINEL", "PROMPT-SENTINEL",
+        "jwt-SENTINEL",
+      ];
+      for (const sentinel of sentinels) {
+        expect(allEvents).not.toContain(sentinel);
+        expect(allResult).not.toContain(sentinel);
+      }
+      const payloads = subagentPayloads(client.frames);
+      const leaking = payloads.find((payload) => payload.id === "sa-2");
+      expect(leaking?.description).toBe("scan [redacted] with Bearer [redacted]");
+      const tool = payloads.find((payload) => payload.event === "tool_execution_end");
+      expect(tool?.summary).toBe("tool_execution_end: read");
+      for (const payload of payloads) {
+        expect(payload).not.toHaveProperty("task");
+        expect(payload).not.toHaveProperty("assignment");
+      }
     } finally {
       client.close();
     }

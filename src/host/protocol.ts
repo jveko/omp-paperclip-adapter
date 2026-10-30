@@ -127,7 +127,15 @@ export interface RunBeginFrame {
   limits: Limits;
   /** When true the supervisor forwards `run.steer` to the live turn. */
   steering?: boolean;
+  /**
+   * How much of omp's subagent lifecycle this run observes. `summary` streams
+   * lifecycle/progress as `omp.subagent`; `events` adds the subagent's own
+   * event type; `off` observes nothing. Absent means `summary` (managed lane).
+   */
+  subagentObservability?: SubagentObservability;
 }
+
+export type SubagentObservability = "off" | "summary" | "events";
 
 export interface RunHeartbeatFrame {
   id: string;
@@ -200,7 +208,7 @@ export interface RunAcceptedFrame {
 }
 
 /** The event vocabulary the adapter maps onto its own sinks. */
-export type RunEventKind = "acpx.tool_call" | "run.system" | "omp.turn" | "omp.usage" | "omp.log";
+export type RunEventKind = "acpx.tool_call" | "run.system" | "omp.turn" | "omp.usage" | "omp.log" | "omp.subagent";
 
 export interface RunEventFrame {
   type: "run.event";
@@ -290,7 +298,7 @@ const REPLY_TYPES: Record<HostReply["type"], true> = {
  * nested frame is proven an object before a field is read. It narrows to
  * `Record<string, unknown>`; fields are still checked one by one.
  */
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -341,6 +349,10 @@ function isWellFormed(frame: Record<string, unknown>): boolean {
         && isRecord(frame.limits)
         && typeof (frame.limits as Record<string, unknown>).runLeaseTtlMs === "number"
         && (frame.steering === undefined || typeof frame.steering === "boolean")
+        && (frame.subagentObservability === undefined
+          || frame.subagentObservability === "off"
+          || frame.subagentObservability === "summary"
+          || frame.subagentObservability === "events")
         && (frame.connectionTools === undefined || frame.connectionTools === null
           || (isRecord(frame.connectionTools)
             && isString(frame.connectionTools.endpoint)

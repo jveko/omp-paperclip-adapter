@@ -36,7 +36,7 @@ import {
 import {
   readSessionIntelConfig, resolveExecutionMode, resolveRunDirective, thinkingLevelChanged,
   validateCredentialMode, validateExecutionMode, validatePlanMode, validateSessionScope,
-  validateSteering, validateThinkingLevel,
+  validateSteering, validateSubagentObservability, validateThinkingLevel,
   type RunDirective, type SessionIntelConfig, type SessionScope,
 } from "../session-directives.js";
 
@@ -137,6 +137,10 @@ async function gateRunConfig(ctx: AdapterExecutionContext): Promise<RunRefusal |
   if (modeErr) return { errorCode: "omp_config_error", errorMessage: modeErr };
   const steeringErr = validateSteering(ctx.config);
   if (steeringErr) return { errorCode: "omp_config_error", errorMessage: steeringErr };
+  // A typo here would pick a different amount of subagent metadata on the
+  // managed lane, so it is a config error like the lane and steering keys.
+  const subagentErr = validateSubagentObservability(ctx.config);
+  if (subagentErr) return { errorCode: "omp_config_error", errorMessage: subagentErr };
   // Fail closed: broker credentialMode demands a resolved broker url+token.
   // Return before any engine work so a misconfigured agent never runs a
   // half-configured session.

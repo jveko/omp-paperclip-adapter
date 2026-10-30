@@ -11,7 +11,7 @@ import type {
   Credentials, HostReply, Manifests, RunAcceptedFrame, RunBeginFrame, RunEventFrame,
 } from "../../host/protocol.js";
 import { buildWorkerArgv, buildWorkerEnv } from "../../host/worker.js";
-import { resolveSteering } from "../session-directives.js";
+import { resolveSteering, resolveSubagentObservability } from "../session-directives.js";
 import { sessionLeaseKey } from "../session-lease.js";
 import { firstNonEmptyString, packageRootDir } from "../adapters/acp/launch.js";
 import { resolveOmpBillingIdentity } from "./billing.js";
@@ -211,6 +211,21 @@ function relayEvent(ctx: AdapterExecutionContext, frame: RunEventFrame): void {
       void ctx.onEvent?.(event);
       return;
     }
+    case "omp.subagent": {
+      // Bounded and content-free at the source (host/subagents.ts): the payload
+      // carries ids, an agent name, a status and an optional redacted
+      // description/summary — never prompt text, tool arguments or transcripts.
+      const event: AdapterRuntimeEvent = {
+        eventType: "omp.subagent",
+        stream: "system",
+        ...(typeof payload.agent === "string" && typeof payload.status === "string"
+          ? { message: `${payload.agent} ${payload.status}` }
+          : {}),
+        payload,
+      };
+      void ctx.onEvent?.(event);
+      return;
+    }
   }
 }
 
@@ -380,6 +395,9 @@ export function createHostTransport(options: HostTransportOptions): ManagedRun {
       manifests: manifestsOf(plan),
       limits: { timeoutMs: configuredTimeoutMs(ctx.config), runLeaseTtlMs: RUN_LEASE_TTL_MS },
       steering: resolveSteering(ctx.config) === "on",
+      // The config gate already refused an unknown value; an unset key means
+      // the managed lane's default (`summary`), applied by the supervisor.
+      subagentObservability: resolveSubagentObservability(ctx.config) ?? "summary",
     };
 
     let client: HostClient;

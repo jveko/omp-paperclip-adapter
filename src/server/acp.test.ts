@@ -199,6 +199,25 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     expect(merged.config.env?.OMP_PAPERCLIP_RETRY).toBeUndefined();
   });
 
+  it("leaves the engine lane without subagent evidence even when the knob is set", async () => {
+    const executorFn = fakeEngine({
+      exitCode: 0, signal: null, timedOut: false, resultJson: { status: "completed" },
+    });
+    const eventTypes: string[] = [];
+    const run = createOmpAcpExecutor();
+    const result = await run(baseCtx({
+      config: {
+        command: `${process.execPath} ${fakeAcp}`,
+        executionMode: "engine",
+        subagentObservability: "events",
+      },
+      onEvent: async (event) => { eventTypes.push(event.eventType); },
+    }));
+    expect(executorFn).toHaveBeenCalledTimes(1);
+    expect(eventTypes).not.toContain("omp.subagent");
+    expect(result.resultJson).not.toHaveProperty("subagents");
+  });
+
   it("forks at the source session's own cwd, not this run's workspace", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "omp-fork-cwd-"));
     try {
