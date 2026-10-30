@@ -5,7 +5,7 @@ import path from "node:path";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AdapterEnvironmentTestContext } from "@paperclipai/adapter-utils";
-import { evaluateOmpVersionCheck, testEnvironment } from "./test.js";
+import { evaluateConfigOptionCheck, evaluateOmpVersionCheck, testEnvironment } from "./test.js";
 import type * as AcpModule from "./acp.js";
 
 // Regression guard for env threading into the environment-test version probe.
@@ -226,6 +226,30 @@ describe("evaluateOmpVersionCheck", () => {
     expect(check.level).toBe("warn");
     expect(check.code).toBe("omp_version_unparsed");
     expect(check.detail).toContain("not a version");
+  });
+});
+
+describe("evaluateConfigOptionCheck", () => {
+  it("reports the configured-option surface when the build advertises all three ids", () => {
+    const check = evaluateConfigOptionCheck({ configOptionIds: ["mode", "model", "thinking"] });
+    expect(check.level).toBe("info");
+    expect(check.code).toBe("omp_config_options");
+    expect(check.message).toContain("model");
+  });
+
+  it("warns when the build drops the model id from its advertised config options", () => {
+    const check = evaluateConfigOptionCheck({ configOptionIds: ["mode", "thinking"] });
+    expect(check.level).toBe("warn");
+    expect(check.code).toBe("omp_config_option_model_missing");
+    expect(check.detail).toContain("mode");
+    expect(check.detail).toContain("thinking");
+    expect(check.detail).toContain("mode|model|thinking");
+  });
+
+  it("warns when the probe advertises no config option ids at all", () => {
+    const check = evaluateConfigOptionCheck({});
+    expect(check.level).toBe("warn");
+    expect(check.code).toBe("omp_config_option_model_missing");
   });
 });
 

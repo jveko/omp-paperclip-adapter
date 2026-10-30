@@ -972,22 +972,25 @@ function installGovernanceLane(pi: BridgePi): void {
       // already forbids, and never spend a board slot on it.
       if (guard?.block) return guard;
       const toolName = typeof event?.toolName === "string" ? event.toolName : "";
-      // The control-tool allowlist outranks approval too — holding `yield`
-      // for a human strands the run exactly like denying it would.
-      const rule = toolName === "" || CONTROL_TOOLS[toolName]
-        ? null
-        : (current.approvalRequired.find((candidate) => candidate.matches(toolName))
-          ?? restrictedFolderRule(event, ctx, current));
-      if (!rule) return guard;
-      // The approval round-trip is the lane's only awaited path, and every
-      // control-plane call inside it is self-bound. It normally holds; once a
-      // pending entry ages out, it resolves the board's verdict instead — so
-      // a warm handle cannot loop an already-approved action forever.
+      // The args that will actually run: a guardrail revision may rewrite
+      // paths, and a revision that lands in a restricted folder is still a
+      // restricted-folder call (omp's own prompt is proxy-answered here).
       const executed = isRecord(guard?.input)
         ? guard.input
         : isRecord(event?.input)
           ? event.input
           : {};
+      // The control-tool allowlist outranks approval too — holding `yield`
+      // for a human strands the run exactly like denying it would.
+      const rule = toolName === "" || CONTROL_TOOLS[toolName]
+        ? null
+        : (current.approvalRequired.find((candidate) => candidate.matches(toolName))
+          ?? restrictedFolderRule({ ...event, input: executed }, ctx, current));
+      if (!rule) return guard;
+      // The approval round-trip is the lane's only awaited path, and every
+      // control-plane call inside it is self-bound. It normally holds; once a
+      // pending entry ages out, it resolves the board's verdict instead — so
+      // a warm handle cannot loop an already-approved action forever.
       return holdForApproval(toolName, executed, rule, guard);
     } catch {
       // Never throw: omp turns a throwing handler into a blanket block.

@@ -1,4 +1,4 @@
-import { mkdir, open, readFile, unlink } from "node:fs/promises";
+import { mkdir, open, readFile, stat, unlink, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 
@@ -150,14 +150,30 @@ export async function acquireSessionLease(input: {
   }
 
   for (let attempt = 0; attempt < MAX_RECLAIM_ATTEMPTS; attempt += 1) {
-    let handle;
+    let handle: FileHandle | undefined;
     try {
       handle = await open(file, "wx");
       await handle.writeFile(`${JSON.stringify(record, null, 2)}\n`, "utf8");
+      // The file exists from `open` but is EMPTY until the write lands, so a
+      // concurrent acquirer can read it as stale and remove it in that window.
+      // Confirm the path still resolves to the inode this handle wrote before
+      // claiming: missing or inode-mismatched means this round lost the race
+      // and another process owns the session.
+      const mine = await handle.stat();
       await handle.close();
+      handle = undefined;
+      const onPath = await stat(file).catch(() => null);
+      if (!onPath || onPath.ino !== mine.ino) continue;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
-        await handle?.close().catch(() => {});
+        // A failed open created nothing; a failed write/close may have left a
+        // record naming this (live) pid, which would refuse every run for this
+        // session until its TTL. Remove only a record this call owns.
+        if (handle) {
+          await handle.close().catch(() => {});
+          const onPath = await readFile(file, "utf8").then(parseRecord).catch(() => null);
+          if (onPath?.owner === record.owner) await unlink(file).catch(() => {});
+        }
         return { ok: false, error: `could not write the session lease: ${err instanceof Error ? err.message : String(err)}` };
       }
       await handle?.close().catch(() => {});
@@ -170,8 +186,17 @@ export async function acquireSessionLease(input: {
       if (!isStale(existing, now)) {
         return { ok: false, error: heldMessage(existing as SessionLeaseRecord, file) };
       }
+      // Re-read right before removing: another process may have replaced the
+      // stale record with a live one since the read above, and an
+      // unconditional unlink would erase a legitimate holder. A changed owner
+      // means this round lost the race — loop and read it as held.
+      const latest = await readFile(file, "utf8").then(parseRecord).catch(() => null);
+      if (latest !== null && latest.owner !== existing?.owner) continue;
       // Reclaim: remove the stale record and race the next `wx` with any other
       // process doing the same. A lost race is just another held/retry round.
+      // (POSIX has no atomic compare-and-unlink, so the window between this
+      // read and the unlink is the one residual race; the inode check above
+      // keeps a stolen *new* claim from producing a second holder.)
       await unlink(file).catch(() => {});
       continue;
     }

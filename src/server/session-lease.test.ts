@@ -132,6 +132,29 @@ describe("acquireSessionLease", () => {
     await second.release();
   });
 
+  it("reclaims an empty lease file, which a crashed write can leave behind", async () => {
+    for (const [key, contents] of [["lease-empty", ""], ["lease-whitespace", "  \n"]] as const) {
+      const file = leaseFile(dir, key);
+      await mkdir(path.dirname(file), { recursive: true });
+      await writeFile(file, contents, "utf8");
+
+      const lease = await acquireSessionLease({ dir, key });
+      expectAcquired(lease);
+
+      const record = await readLeaseRecord(file);
+      expect(record.sessionKey).toBe(key);
+      expect(record.pid).toBe(process.pid);
+      expect(record.owner.length).toBeGreaterThan(0);
+
+      const second = await acquireSessionLease({ dir, key });
+      expect(second.ok).toBe(false);
+      if (second.ok) throw new Error(`expected the reclaimed lease to be held, got ok for ${key}`);
+      expect(second.error).toContain(String(process.pid));
+
+      await lease.release();
+    }
+  });
+
   it("reclaims a record whose pid is dead", async () => {
     const now = Date.now();
     await writeLeaseRecord(dir, "lease-dead", {

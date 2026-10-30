@@ -50,6 +50,13 @@ const RESTORE_MODEL_PATTERN = /Could not restore model/i;
  * fresh-session retry exists for, and the reason it must outrank the generic
  * `acpx_session_init_failed` exclusion (a real init failure, e.g. a missing
  * binary or an unreadable session, stays terminal).
+ *
+ * The retry uses the chain's existing `OMP_PAPERCLIP_RETRY` marker, which
+ * changes the config fingerprint: the recovered session is saved under the
+ * retry fingerprint, so the next normal run starts one more fresh session
+ * before resuming. That is one extra cold start in exchange for an employee
+ * that recovers inside the run; changing the chain's marker shape is
+ * deliberately out of scope.
  */
 export function isRestoreModelFailure(
   result: Pick<AdapterExecutionResult, "errorCode" | "errorMessage" | "errorMeta">,

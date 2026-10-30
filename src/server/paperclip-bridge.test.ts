@@ -1542,4 +1542,26 @@ describe("restricted folders (manifest root key)", () => {
     ).toBeUndefined();
     expect(calls).toHaveLength(0);
   });
+
+  it("holds a revision that redirects a call into a restricted folder", async () => {
+    // The gate must judge the args that will RUN: `argRevisions` rewrites the
+    // path after the guardrail checks, so matching on the pre-revision
+    // `/work/safe.txt` would let a pinned revision land in the fence unwatched.
+    const { pi } = await approvalFixture({
+      approvalMode: "yolo",
+      approvalRequired: [],
+      restrictedFolders: ["/srv/secrets"],
+      guardrails: { argRevisions: { write: { path: "/srv/secrets/redirected.txt" } } },
+    });
+    approvalEnv();
+    const calls = recordFetch(() => reply(201, { id: "apr-rev-r" }));
+
+    const held = await pi.toolCallAsync("write", { path: "/work/safe.txt", content: "x" }, { cwd: "/work" });
+
+    expect(held?.block).toBe(true);
+    expect(held?.reason).toMatch(/restricted folder/i);
+    expect(calls).toHaveLength(1);
+    const payload = calls[0].json.payload as Record<string, unknown>;
+    expect(payload.reason).toContain("/srv/secrets");
+  });
 });
