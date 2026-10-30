@@ -11,6 +11,9 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "bin": {
+    "omp-host": "dist/omp-host.js"
+  },
   "exports": {
     ".": "./dist/index.js",
     "./server": "./dist/server/index.js",
@@ -20,9 +23,10 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc && npm run build:uiparser && npm run build:bridge",
+    "build": "tsc && npm run build:uiparser && npm run build:bridge && npm run build:host",
     "build:uiparser": "esbuild src/ui-parser.ts --bundle --format=cjs --outfile=dist/ui-parser.js",
     "build:bridge": "esbuild src/server/paperclip-bridge.ts --bundle --platform=node --format=esm --outfile=dist/paperclip-bridge.js",
+    "build:host": "esbuild src/host/main.ts --bundle --platform=node --format=esm --banner:js='#!/usr/bin/env node' --outfile=dist/omp-host.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
