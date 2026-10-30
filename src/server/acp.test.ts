@@ -199,6 +199,17 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     expect(merged.config.env?.OMP_PAPERCLIP_RETRY).toBeUndefined();
   });
 
+  it("refuses an unknown subagentObservability before any engine work", async () => {
+    const executorFn = fakeEngine({ exitCode: 0 });
+    const run = createOmpAcpExecutor();
+    const result = await run(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, subagentObservability: "verbose" },
+    }));
+    expect(result.errorCode).toBe("omp_config_error");
+    expect(result.errorMessage).toContain("subagentObservability");
+    expect(executorFn).not.toHaveBeenCalled();
+  });
+
   it("leaves the engine lane without subagent evidence even when the knob is set", async () => {
     const executorFn = fakeEngine({
       exitCode: 0, signal: null, timedOut: false, resultJson: { status: "completed" },
