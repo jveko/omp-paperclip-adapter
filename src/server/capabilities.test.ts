@@ -160,6 +160,52 @@ describe("probeCapabilities — omp-named surface probes", () => {
   }, 30_000);
 });
 
+describe("probeCapabilities — real omp help layout", () => {
+  it("reads sub-verbs from the ACTION line a real `omp models --help` renders", async () => {
+    // Real omp 18.14.0 renders no COMMANDS block for a sub-command; the verbs
+    // live on the ACTION line. This is the layout the parser exists for.
+    const dir = await tmpDir("omp-action-help-");
+    const script = path.join(dir, "omp");
+    const modelsHelp = [
+      "List, search, and refresh available models",
+      "",
+      "USAGE",
+      "  $ omp models [ACTION] [PATTERN] [FLAGS]",
+      "",
+      "ARGUMENTS",
+      "  ACTION    ls (default) | find | refresh | <provider>",
+      "  PATTERN   Filter/search substring, or provider name (required for find)",
+      "",
+    ].join("\n");
+    const sessionHelp = [
+      "Hand a session to another machine: pack it, unpack it, or mark the local copy moved",
+      "",
+      "USAGE",
+      "  $ omp session ACTION [SOURCE] [OUTPUT] [FLAGS]",
+      "",
+      "ARGUMENTS",
+      "  ACTION   pack, unpack, or moved (pack|unpack|moved)",
+      "",
+    ].join("\n");
+    await writeFile(script, [
+      "#!/bin/sh",
+      `if [ "$1" = "acp" ]; then exec "${process.execPath}" "${fakeAcp}" "$@"; fi`,
+      `case "$*" in`,
+      `  "config list --json") printf '%s\\n' '{}' ;;`,
+      `  "--help") printf '%s\\n' 'omp v18.14.0\n\nCOMMANDS\n  models    models\n  session   sessions\n  gc        gc\n' ;;`,
+      `  "models --help") printf '%s\\n' '${modelsHelp}' ;;`,
+      `  "session --help") printf '%s\\n' '${sessionHelp}' ;;`,
+      `esac`,
+      "",
+    ].join("\n"), { mode: 0o755 });
+
+    const set = await probeCapabilities({ acp: { command: script, args: ["acp"] }, mode: "engine" });
+    expect(set.capabilities["cli.models.refresh"].state).toBe("yes");
+    expect(set.capabilities["cli.session.lease"].state).toBe("no");
+    expect(set.capabilities["cli.gc"].state).toBe("yes");
+  }, 30_000);
+});
+
 describe("probeCapabilities — managed worker frames", () => {
   it("probes the requestable frames on the worker connection in managed mode", async () => {
     const script = await fakeOmpBuild({ settingsKeys: [] });
@@ -202,7 +248,35 @@ describe("probeCapabilities — managed worker frames", () => {
   }, 30_000);
 });
 
+describe("probeCapabilities — failed handshake", () => {
+  it("reports the surfaces as unknown and emits no per-surface echo", async () => {
+    vi.stubEnv("FAKE_ACP_MODE", "error");
+    const set = await probeCapabilities({ acp: acpCommand(), mode: "engine" });
+    expect(set.acp.ok).toBe(false);
+    for (const id of ["acp.session/list", "acp.session/fork", "acp._omp/extensions", "acp.config.model"] as const) {
+      expect(set.capabilities[id].state).toBe("unknown");
+    }
+    // The handshake error is the diagnostic; the surface rows stay quiet.
+    expect(capabilityChecks(set).some((check) => check.code.startsWith("omp_session")
+      || check.code === "omp_config_option_model_missing")).toBe(false);
+  }, 30_000);
+});
+
 describe("capability cache", () => {
+  it("ignores a persisted entry that does not match this build's shape", async () => {
+    const dir = await tmpDir("omp-cap-corrupt-");
+    const input = { acp: acpCommand(), mode: "engine" as const, cacheDir: dir };
+    const key = capabilityCacheKey(input);
+    await writeFile(path.join(dir, "capabilities.json"), JSON.stringify({
+      entries: { [key]: { at: Date.now(), set: { key, mode: "engine", capabilities: {}, acp: { ok: true } } } },
+    }));
+    // An entry from a differently shaped adapter is not read...
+    expect(await loadCapabilities({ ...input, cacheOnly: true })).toBeNull();
+    // ...and a real read re-probes instead of trusting it.
+    const set = await loadCapabilities(input);
+    expect(set.capabilities["acp.session/list"].state).toBe("yes");
+  }, 30_000);
+
   it("single-flights concurrent probes for one (command, env) key", async () => {
     const dir = await tmpDir("omp-cap-cache-");
     const frameLog = path.join(dir, "frames.log");

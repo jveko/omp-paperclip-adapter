@@ -249,9 +249,11 @@ export function probeOmpAcpSession(
     const supportsSessionFork = advertisesSessionCapability(drive.initializeInfo, "fork");
     const advertisedSteering = advertisesSteering(drive.initializeInfo);
     if (!drive.ok) {
+      // A failed handshake proves nothing about the surfaces: report them as
+      // unknown (absent fields) so a dead binary reads as one handshake error,
+      // not as seven "this build does not advertise …" warnings.
       return {
-        ok: false, protocolVersion: drive.protocolVersion, supportsSessionList,
-        supportsSessionFork, supportsSteering: advertisedSteering, error: drive.error,
+        ok: false, protocolVersion: drive.protocolVersion, error: drive.error,
       };
     }
     const response = drive.responses[0];

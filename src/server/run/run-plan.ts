@@ -236,22 +236,31 @@ function runCapabilityFeatures(
 async function planCapabilities(
   ctx: AdapterExecutionContext,
   input: {
-    acp: { command: string; args: string[] };
-    env: Record<string, string>;
+    /**
+     * The agent config as the environment test sees it: before the session
+     * scope folds in `PI_CODING_AGENT_DIR` and before the manifests add
+     * `--extension` / `PAPERCLIP_*_MANIFEST` / `PI_CONFIG_FILES`. The probe
+     * cache key is built from this exact command and env, so a run and the
+     * environment test must derive them the same way or the run reads a key
+     * nobody wrote.
+     */
+    probeConfig: Record<string, unknown>;
     mode: "engine" | "managed";
     bridge: string;
     intel: SessionIntelConfig;
     directive: RunDirective;
   },
 ): Promise<void> {
-  if (path.basename(input.acp.command) !== "omp") return;
+  const acp = ompAcpCommand(input.probeConfig, input.bridge);
+  if (path.basename(acp.command) !== "omp") return;
   const features = runCapabilityFeatures(ctx, input);
   if (features.length === 0) return;
+  const env = ompEnv({ config: input.probeConfig });
   const capabilities = await loadCapabilities({
-    acp: { ...input.acp, env: input.env },
+    acp: { ...acp, env },
     mode: input.mode,
     ...(input.mode === "managed"
-      ? { worker: { ...buildWorkerArgv(ctx.config, input.bridge), env: input.env } }
+      ? { worker: { ...buildWorkerArgv(input.probeConfig, input.bridge), env } }
       : {}),
     cacheDir: capabilityCacheDir(),
     cacheOnly: true,
@@ -829,6 +838,12 @@ export async function buildRunPlan(
     return { kind: "refused", refusal: { errorCode: "omp_config_error", errorMessage: preparedScope.error } };
   }
   const sessionScope = preparedScope.prepared.scope;
+  // The agent config as it arrived, before the scope fence and the manifests
+  // change the command or the env. The capability probe is keyed by exactly
+  // that command+env (the same ones `testEnvironment` derives), so this is the
+  // snapshot the run's cache read must use. Copied, not referenced: the
+  // manifests fold their env into `ctx.config` (which may be this same object).
+  const probeConfig = { ...ctx.config };
   // The fenced config carries PI_CODING_AGENT_DIR (and the folded operator
   // config.yml) into the run child AND every side channel below; ompEnv
   // forwards the value it finds here.
@@ -905,8 +920,7 @@ export async function buildRunPlan(
     intelDir,
   });
   await planCapabilities(ctx, {
-    acp: ompAcpCommand(ctx.config, deps.bridge),
-    env: sideChannelEnv,
+    probeConfig,
     mode: executionMode,
     bridge: deps.bridge,
     intel: session.intel,

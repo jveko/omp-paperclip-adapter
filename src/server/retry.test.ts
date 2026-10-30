@@ -141,6 +141,15 @@ describe("isTerminalRetryable — engine classification", () => {
       errorCode: "acpx_auth_required", errorFamily: "transient_upstream",
     }, NOW)).toBe(false);
   });
+
+  it("lets a non-retryable family veto an explicit engine retryable flag", () => {
+    expect(isTerminalRetryable({
+      errorCode: "acpx_turn_failed", errorFamily: "configuration", errorMeta: { retryable: true },
+    }, NOW)).toBe(false);
+    expect(isTerminalRetryable({
+      errorCode: "acpx_turn_failed", errorFamily: "model_refusal", errorMeta: { retryable: true },
+    }, NOW)).toBe(false);
+  });
 });
 
 describe("forceFreshSession", () => {

@@ -64,14 +64,14 @@ export type CapabilityId =
   | "rpc.set_subagent_subscription";
 
 /** The settings keys the adapter's overlays write, in probe order. */
-export const PROBED_SETTINGS_KEYS = [
+const PROBED_SETTINGS_KEYS = [
   "session.maxCost",
   "tools.restrictedFolders",
   "defaultThinkingLevel",
 ] as const;
 
 /** The worker frames the managed lane consumes. */
-export const PROBED_RPC_FRAMES = [
+const PROBED_RPC_FRAMES = [
   "get_session_stats",
   "set_host_tools",
   "set_subagent_subscription",
@@ -84,6 +84,12 @@ export interface CapabilitySet {
   observedAt: string;
   version: string | null;
   mode: "engine" | "managed";
+  /**
+   * Whether the settings/CLI group was probed at all. It is skipped for a
+   * command not named `omp`, whose help/settings are its own; those rows must
+   * then read as "not applicable", never as "missing".
+   */
+  surfaceProbed: boolean;
   capabilities: Record<CapabilityId, Capability>;
   /** The handshake's own report, so the environment test need not re-probe. */
   acp: {
@@ -347,8 +353,13 @@ function probeRpcFrames(
     resolve(results);
   };
   const timer = setTimeout(finish, timeoutMs);
+  // Frames are newline-delimited and can straddle a chunk boundary, so keep
+  // the unterminated tail for the next chunk instead of dropping it.
+  let pending = "";
   child.process.stdout?.on("data", (chunk: Buffer) => {
-    for (const line of chunk.toString().split("\n")) {
+    const lines = (pending + chunk.toString()).split("\n");
+    pending = lines.pop() ?? "";
+    for (const line of lines) {
       if (line.trim() === "") continue;
       let frame: unknown;
       try { frame = JSON.parse(line); } catch { continue; }
@@ -395,6 +406,11 @@ async function probeAcp(command: CapabilityCommand, at: string): Promise<Capabil
   );
   const ids = probe.configOptionIds ?? [];
   const handshakeSource = "initialize.agentCapabilities.sessionCapabilities";
+  // Without a completed handshake there is no config-option set to judge: an
+  // empty list there is missing evidence, not a build without the ids.
+  const configCapability = (id: string): Capability => probe.ok
+    ? capabilityForConfigId(ids, id, "session/new configOptions", at)
+    : stateOf(undefined, "session/new configOptions", at);
   return {
     ok: probe.ok,
     ...(probe.protocolVersion !== undefined ? { protocolVersion: probe.protocolVersion } : {}),
@@ -406,9 +422,9 @@ async function probeAcp(command: CapabilityCommand, at: string): Promise<Capabil
       "acp.session/fork": stateOf(probe.supportsSessionFork, `${handshakeSource}.fork`, at),
       "acp._session/steering": stateOf(probe.supportsSteering, "_meta.steering.supported / _session/steering probe", at),
       "acp._omp/extensions": stateOf(probe.supportsExtensions, "_omp/extensions probe", at),
-      "acp.config.mode": capabilityForConfigId(ids, "mode", "session/new configOptions", at),
-      "acp.config.model": capabilityForConfigId(ids, "model", "session/new configOptions", at),
-      "acp.config.thinking": capabilityForConfigId(ids, "thinking", "session/new configOptions", at),
+      "acp.config.mode": configCapability("mode"),
+      "acp.config.model": configCapability("model"),
+      "acp.config.thinking": configCapability("thinking"),
     },
   };
 }
@@ -470,6 +486,7 @@ export async function probeCapabilities(input: CapabilityProbeInput): Promise<Ca
     observedAt: at,
     version: input.version ?? null,
     mode: input.mode,
+    surfaceProbed: namedOmp,
     capabilities: capabilities as Record<CapabilityId, Capability>,
     acp: {
       ok: acp.ok,
@@ -485,13 +502,38 @@ interface PersistedCache {
   entries: Record<string, { at: number; set: CapabilitySet }>;
 }
 
+/**
+ * A persisted entry is only reusable when it still has the shape this build
+ * expects: the file outlives an adapter upgrade, and an entry written by a
+ * version with different capability ids must be ignored (re-probed), not read
+ * as if the ids were known.
+ */
+function isCapabilitySet(value: unknown): value is CapabilitySet {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  if (typeof record.key !== "string") return false;
+  if (record.mode !== "engine" && record.mode !== "managed") return false;
+  if (typeof record.surfaceProbed !== "boolean") return false;
+  const capabilities = record.capabilities;
+  if (typeof capabilities !== "object" || capabilities === null || Array.isArray(capabilities)) return false;
+  for (const id of Object.keys(DEGRADATION)) {
+    const entry = (capabilities as Record<string, unknown>)[id];
+    if (entry === undefined) continue;
+    if (typeof entry !== "object" || entry === null) return false;
+    const state = (entry as { state?: unknown }).state;
+    if (state !== "yes" && state !== "no" && state !== "unknown") return false;
+  }
+  const acp = record.acp;
+  return typeof acp === "object" && acp !== null && typeof (acp as { ok?: unknown }).ok === "boolean";
+}
+
 async function readPersisted(cacheDir: string, key: string, now: number): Promise<CapabilitySet | null> {
   try {
     const raw = await fs.readFile(path.join(cacheDir, CACHE_FILE), "utf8");
     const parsed = JSON.parse(raw) as PersistedCache;
     const entry = parsed.entries?.[key];
     if (!entry || typeof entry.at !== "number" || now - entry.at > PERSISTED_TTL_MS) return null;
-    return entry.set;
+    return isCapabilitySet(entry.set) ? entry.set : null;
   } catch {
     return null;
   }
@@ -780,10 +822,19 @@ const DEGRADATION: Record<CapabilityId, {
 export function capabilityChecks(set: CapabilitySet): AdapterEnvironmentCheck[] {
   const checks: AdapterEnvironmentCheck[] = [];
   for (const [id, capability] of Object.entries(set.capabilities) as Array<[CapabilityId, Capability]>) {
+    // A row this adapter no longer knows (a cache written by another version)
+    // is ignored rather than indexed into the table.
+    if (!Object.hasOwn(DEGRADATION, id)) continue;
     // The worker-frame group is a managed-lane surface. An engine-only install
     // never probes it, so reporting "unknown" here would warn every engine
     // deployment about capabilities it does not use.
     if (id.startsWith("rpc.") && set.mode !== "managed") continue;
+    // A wrapper's settings/help are its own: "not applicable", not "missing".
+    if (!set.surfaceProbed && (id.startsWith("settings.") || id.startsWith("cli."))) continue;
+    // A failed handshake already says why nothing ACP-shaped could be read;
+    // reporting each surface as unknown on top of that is seven echoes of one
+    // error.
+    if (!set.acp.ok && id.startsWith("acp.")) continue;
     if (capability.state === "yes") continue;
     const row = capability.state === "no" ? DEGRADATION[id].absent : DEGRADATION[id].unknown;
     checks.push({
@@ -845,6 +896,10 @@ export function capabilityDiagnostics(
   const diagnostics: CapabilityDiagnostic[] = [];
   for (const feature of new Set(features)) {
     const capability = set.capabilities[FEATURE_CAPABILITY[feature]];
+    if (capability === undefined) continue;
+    // A wrapper's settings are not omp's, so a fence/budget claim cannot be
+    // made either way; the environment test reports the version as unverified.
+    if (!set.surfaceProbed && (feature === "budgetHardCap" || feature === "folderFence")) continue;
     if (capability.state === "yes") continue;
     const row = capability.state === "no" ? DEGRADATION[FEATURE_CAPABILITY[feature]].absent
       : DEGRADATION[FEATURE_CAPABILITY[feature]].unknown;

@@ -43,10 +43,10 @@ export function normalizeGolden<T>(value: T, replacements: Record<string, string
 }
 
 /** The replacements every profile uses. */
-export function runReplacements(extra: Record<string, string> = {}): Record<string, string> {
+export function runReplacements(): Record<string, string> {
   return {
     "/tmp/omp-conformance-": "<tmp>/",
-    ...extra,
+    "/tmp/ompcf-": "<tmp>/",
   };
 }
 
@@ -59,13 +59,4 @@ export async function checkGolden(name: string, actual: unknown): Promise<void> 
   }
   const golden: unknown = JSON.parse(await readFile(file, "utf8"));
   expect(actual).toEqual(golden);
-}
-
-/**
- * The event order, reduced to what the board acts on: the kind and level.
- * Engine phase timings and payloads are deliberately out of the golden — they
- * are per-run measurements, and the adapter owns the kinds, not the numbers.
- */
-export function eventKinds(events: ReadonlyArray<{ eventType: string; level?: string }>): string[] {
-  return events.map((event) => `${event.eventType}:${event.level ?? "info"}`);
 }
