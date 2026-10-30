@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
-import { TESTED_OMP_MINOR } from "./acp.js";
+import { TESTED_OMP_MINORS } from "./acp.js";
 
 /**
  * The published upgrade contract: Paperclip installs this adapter beside an
@@ -27,8 +27,8 @@ beforeAll(async () => {
 });
 
 describe("upgrade contract", () => {
-  it("pins the omp peer dependency to the tested minor and marks it optional", () => {
-    expect(manifest.peerDependencies?.[OMP_PACKAGE]).toBe(">=18.13.0 <18.14.0");
+  it("pins the omp peer dependency to the tested minors and marks it optional", () => {
+    expect(manifest.peerDependencies?.[OMP_PACKAGE]).toBe(">=18.13.0 <18.15.0");
     expect(manifest.peerDependenciesMeta?.[OMP_PACKAGE]?.optional).toBe(true);
   });
 
@@ -36,7 +36,7 @@ describe("upgrade contract", () => {
     expect(manifest.dependencies?.[ADAPTER_UTILS]).toBe("2026.824.1");
   });
 
-  it("keeps the peer range's targeted minor in sync with TESTED_OMP_MINOR", () => {
+  it("keeps the peer range's tested minors in sync with TESTED_OMP_MINORS", () => {
     const range = manifest.peerDependencies?.[OMP_PACKAGE];
     const match =
       typeof range === "string"
@@ -45,13 +45,16 @@ describe("upgrade contract", () => {
     expect(match).not.toBeNull();
 
     const [, lowerMajor, lowerMinor, lowerPatch, upperMajor, upperMinor, upperPatch] = match!;
-    expect({ major: Number(lowerMajor), minor: Number(lowerMinor) }).toEqual({
-      major: TESTED_OMP_MINOR.major,
-      minor: TESTED_OMP_MINOR.minor,
-    });
+    const tested = [...TESTED_OMP_MINORS];
+    // A contiguous range is the manifest shape; its ends must be the tested
+    // set's ends, so adding or dropping a minor cannot leave a stale peer pin.
+    expect(tested.every((m, i) => i === 0 || (m.major === tested[i - 1].major && m.minor === tested[i - 1].minor + 1))).toBe(true);
+    const first = tested[0];
+    const last = tested[tested.length - 1];
+    expect({ major: Number(lowerMajor), minor: Number(lowerMinor) }).toEqual(first);
     expect(Number(lowerPatch)).toBe(0);
-    expect(Number(upperMajor)).toBe(TESTED_OMP_MINOR.major);
-    expect(Number(upperMinor)).toBe(TESTED_OMP_MINOR.minor + 1);
+    expect(Number(upperMajor)).toBe(last.major);
+    expect(Number(upperMinor)).toBe(last.minor + 1);
     expect(Number(upperPatch)).toBe(0);
   });
 });

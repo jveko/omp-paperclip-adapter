@@ -1,5 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { resolveProviderQualifiedSelector, type OmpModelInfo } from "./models.js";
 
 /**
  * Fixed filename for this run's failover overlay, overwritten in place whenever
@@ -110,6 +111,48 @@ export function readRetryFallbackSettings(config: Record<string, unknown>): Retr
 export function validateRetryFallbackConfig(config: Record<string, unknown>): string | null {
   const read = readRetryFallbackSettings(config);
   return read.ok ? null : read.error;
+}
+
+/** One operator-supplied selector omp treats as provider-qualified (`/`). */
+export interface ProviderQualifiedSelector {
+  field: "model" | "fallbackChain";
+  selector: string;
+}
+
+/**
+ * Every selector omp resolves exactly rather than fuzzily: the primary `model`
+ * and each `fallbackChain` leg that contains `/`. Bare selectors (`opus`) are
+ * deliberately absent — fuzzy matching for those is an adapter feature and omp
+ * keeps it on 18.14.
+ */
+export function providerQualifiedSelectors(
+  config: Record<string, unknown>,
+): ProviderQualifiedSelector[] {
+  const out: ProviderQualifiedSelector[] = [];
+  const model = typeof config.model === "string" ? config.model.trim() : "";
+  if (model.includes("/")) out.push({ field: "model", selector: model });
+  for (const selector of parseFallbackChain(config)) {
+    if (selector.includes("/")) out.push({ field: "fallbackChain", selector });
+  }
+  return out;
+}
+
+/**
+ * Refuse a config omp 18.14 would quietly degrade: a provider-qualified
+ * selector that is not an exact catalog id makes a `--model` fail and a
+ * `fallbackChain` leg be skipped (warn + continue upstream), which narrows the
+ * chain the operator wrote. Same posture as the enum refusals above: name the
+ * value, say why, and do not write a config that does nothing.
+ */
+export function validateProviderQualifiedSelectors(
+  config: Record<string, unknown>,
+  models: OmpModelInfo[],
+): string | null {
+  const unresolved = providerQualifiedSelectors(config)
+    .filter(({ selector }) => resolveProviderQualifiedSelector(selector, models) === null);
+  if (unresolved.length === 0) return null;
+  const named = unresolved.map(({ field, selector }) => `${field} '${selector}'`).join(", ");
+  return `${named} ${unresolved.length === 1 ? "is a provider-qualified selector that does" : "are provider-qualified selectors that do"} not name an exact id in the omp model catalog. omp 18.14 resolves a provider-qualified selector exactly: a near match fails instead of selecting a sibling, and a fallbackChain leg that does not resolve is skipped, so this config would run a narrower chain than written. Use an id from \`omp models ls --json\` for ${unresolved.length === 1 ? "it" : "them"}; bare selectors still match fuzzily.`;
 }
 
 /**

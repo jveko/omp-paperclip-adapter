@@ -36,6 +36,10 @@ const engineMocks = vi.hoisted(() => ({
 const modelsMocks = vi.hoisted(() => ({
   defaultModels: [
     { id: "prov/m", label: "M", cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } },
+    { id: "prov/backup", label: "Backup" },
+    { id: "brokerco/main", label: "Broker Main" },
+    { id: "brokerco/fast", label: "Broker Fast" },
+    { id: "chainco/backup", label: "Chain Backup" },
   ],
   listOmpModels: vi.fn(),
 }));
@@ -344,6 +348,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
       { id: "prov/m", label: "M", priced: false },
       { id: "omi/r", label: "R", priced: false },
       { id: "chainco/b", label: "B", priced: false },
+      { id: "chainco/backup", label: "Chain Backup", priced: false },
       { id: "axon-compat/q", label: "Q", priced: false },
     ]);
     const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
@@ -640,6 +645,76 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     // omp discards an unknown enum and reads the default, so a warn would be a
     // knob that silently does nothing: refuse before any engine work instead.
     expect(engineMocks.createAcpxEngineExecutor.mock.calls.length).toBe(0);
+  });
+
+  it("fails the run before the engine when a provider-qualified model is not an exact catalog id", async () => {
+    modelsMocks.listOmpModels.mockImplementation(async () => modelsMocks.defaultModels);
+    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "x", sessionKey: "sk" } });
+    const res = await createOmpAcpExecutor()(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, model: "prov/m-old" },
+    }));
+    expect(res.errorCode).toBe("omp_config_error");
+    expect(res.errorMessage).toContain("prov/m-old");
+    expect(res.errorMessage).toContain("18.14");
+    // omp would fail the explicit --model outright; refusing here keeps the
+    // message actionable instead of a model miss mid-run.
+    expect(engineMocks.createAcpxEngineExecutor.mock.calls.length).toBe(0);
+  });
+
+  it("fails the run when a fallbackChain leg is a provider-qualified near match", async () => {
+    modelsMocks.listOmpModels.mockImplementation(async () => [
+      { id: "prov/m", label: "M" },
+      { id: "prov/backup-v2", label: "Backup v2" },
+    ]);
+    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "x", sessionKey: "sk" } });
+    const res = await createOmpAcpExecutor()(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, model: "prov/m", fallbackChain: "prov/backup" },
+    }));
+    expect(res.errorCode).toBe("omp_config_error");
+    expect(res.errorMessage).toContain("fallbackChain");
+    expect(res.errorMessage).toContain("prov/backup");
+    expect(engineMocks.createAcpxEngineExecutor.mock.calls.length).toBe(0);
+  });
+
+  it("canonicalizes a raw aggregator id for the ACP model option", async () => {
+    modelsMocks.listOmpModels.mockImplementation(async () => [
+      { id: "openrouter/meta-llama/llama-3.3-70b", label: "Llama 3.3" },
+    ]);
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+    await createOmpAcpExecutor()(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, model: "meta-llama/llama-3.3-70b" },
+    }));
+    // ACP set_config_option compares the composed id byte-exactly, so the raw
+    // id the operator wrote must be rewritten rather than forwarded.
+    const merged = executorFn.mock.calls[0][0];
+    expect(merged.config.model).toBe("openrouter/meta-llama/llama-3.3-70b");
+  });
+
+  it("canonicalizes a case variant of a provider-qualified model", async () => {
+    modelsMocks.listOmpModels.mockImplementation(async () => [
+      { id: "zai/glm-5.2", label: "GLM 5.2" },
+    ]);
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+    await createOmpAcpExecutor()(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, model: "ZAI/GLM-5.2" },
+    }));
+    const merged = executorFn.mock.calls[0][0];
+    expect(merged.config.model).toBe("zai/glm-5.2");
+  });
+
+  it("passes provider-qualified selectors through with a warning when the catalog is unavailable", async () => {
+    modelsMocks.listOmpModels.mockImplementation(async () => []);
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "x", sessionKey: "sk" } });
+    const events: Array<{ level?: string; message?: string }> = [];
+    await createOmpAcpExecutor()(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, model: "prov/m", fallbackChain: "prov/backup" },
+      onEvent: async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); },
+    }));
+    expect(executorFn).toHaveBeenCalledOnce();
+    const warn = events.find((e) => e.level === "warn" && /catalog unavailable/.test(e.message ?? ""));
+    expect(warn).toBeTruthy();
+    expect(warn!.message).toContain("prov/m");
+    expect(warn!.message).toContain("prov/backup");
   });
 
   it("fails the run early when broker mode lacks env", async () => {

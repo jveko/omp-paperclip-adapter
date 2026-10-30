@@ -5,8 +5,11 @@ import path from "node:path";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AdapterEnvironmentTestContext } from "@paperclipai/adapter-utils";
-import { evaluateConfigOptionCheck, evaluateOmpVersionCheck, testEnvironment } from "./test.js";
+import {
+  evaluateConfigOptionCheck, evaluateModelSelectorCheck, evaluateOmpVersionCheck, testEnvironment,
+} from "./test.js";
 import type * as AcpModule from "./acp.js";
+import type { OmpModelInfo } from "./models.js";
 
 // Regression guard for env threading into the environment-test version probe.
 // testEnvironment's execFile probe must carry the side-channel env
@@ -181,18 +184,22 @@ describe("testEnvironment OTLP diagnostic", () => {
 });
 
 describe("evaluateOmpVersionCheck", () => {
-  it("accepts a build inside the tested 18.13 line", () => {
-    const check = evaluateOmpVersionCheck({ major: 18, minor: 13, patch: 1 }, "omp/18.13.1", "/usr/bin/omp");
+  it.each([
+    { minor: 13, patch: 1, output: "omp/18.13.1" },
+    { minor: 14, patch: 0, output: "omp/18.14.0" },
+  ])("accepts a build inside the tested 18.$minor line", ({ minor, patch, output }) => {
+    const check = evaluateOmpVersionCheck({ major: 18, minor, patch }, output, "/usr/bin/omp");
     expect(check.level).toBe("info");
     expect(check.code).toBe("omp_version");
   });
 
-  it("rejects a newer minor on a directly executed omp and names the supported range", () => {
-    const check = evaluateOmpVersionCheck({ major: 18, minor: 14, patch: 0 }, "omp/18.14.0", "/usr/bin/omp");
+  it("rejects an untested minor on a directly executed omp and names both tested lines", () => {
+    const check = evaluateOmpVersionCheck({ major: 18, minor: 15, patch: 0 }, "omp/18.15.0", "/usr/bin/omp");
     expect(check.level).toBe("error");
     expect(check.code).toBe("omp_version_unsupported");
-    expect(check.message).toContain("18.14.0");
+    expect(check.message).toContain("18.15.0");
     expect(check.message).toContain("18.13");
+    expect(check.message).toContain("18.14");
   });
 
   it.each([
@@ -215,7 +222,7 @@ describe("evaluateOmpVersionCheck", () => {
   it.each(["/usr/bin/node", "mise"])(
     "does not fail a wrapper command (%s) whose reported version is outside the range",
     (command) => {
-      const check = evaluateOmpVersionCheck({ major: 18, minor: 14, patch: 0 }, "omp/18.14.0", command);
+      const check = evaluateOmpVersionCheck({ major: 18, minor: 15, patch: 0 }, "omp/18.15.0", command);
       expect(check.level).toBe("warn");
       expect(check.code).toBe("omp_version_unverified");
     },
@@ -269,7 +276,7 @@ describe("testEnvironment omp version gate", () => {
     // command must be a real executable file; only --version is stubbed.
     const ompPath = path.join(tmpDir, "omp");
     await writeFile(ompPath, "#!/bin/sh\n", { mode: 0o755 });
-    execFileMock.mockImplementation((_c, _a, _o, cb) => cb(null, "omp/18.14.0"));
+    execFileMock.mockImplementation((_c, _a, _o, cb) => cb(null, "omp/18.15.0"));
 
     const res = await testEnvironment(envTestCtx({ command: ompPath }));
 
@@ -278,5 +285,67 @@ describe("testEnvironment omp version gate", () => {
     expect(check).toBeTruthy();
     expect(check!.level).toBe("error");
     expect(res.status).toBe("fail");
+  });
+});
+describe("evaluateModelSelectorCheck", () => {
+  const models: OmpModelInfo[] = [
+    { id: "zai/glm-5.2", label: "GLM 5.2" },
+    { id: "anthropic/claude-sonnet-4-5", label: "Claude Sonnet 4.5" },
+  ];
+
+  it("passes a config with no provider-qualified selector untouched", () => {
+    expect(evaluateModelSelectorCheck({ model: "opus", fallbackChain: "sonnet" }, models)).toBeNull();
+  });
+
+  it("passes provider-qualified selectors that are exact catalog ids", () => {
+    expect(evaluateModelSelectorCheck(
+      { model: "zai/glm-5.2", fallbackChain: "anthropic/claude-sonnet-4-5" },
+      models,
+    )).toBeNull();
+  });
+
+  it("reports an unresolved provider-qualified model as a config error", () => {
+    const check = evaluateModelSelectorCheck({ model: "anthropic/claude-sonnet-4" }, models);
+    expect(check?.level).toBe("error");
+    expect(check?.code).toBe("omp_config_error");
+    expect(check?.message).toContain("anthropic/claude-sonnet-4");
+    expect(check?.message).toContain("18.14");
+  });
+
+  it("reports an unresolved fallback chain leg as a config error naming the leg", () => {
+    const check = evaluateModelSelectorCheck({ fallbackChain: "anthropic/claude-sonnet-4" }, models);
+    expect(check?.level).toBe("error");
+    expect(check?.message).toContain("fallbackChain");
+    expect(check?.message).toContain("anthropic/claude-sonnet-4");
+  });
+
+  it("warns instead of failing when the catalog is unavailable", () => {
+    const check = evaluateModelSelectorCheck({ model: "zai/glm-5.2" }, []);
+    expect(check?.level).toBe("warn");
+    expect(check?.code).toBe("omp_model_catalog_unavailable");
+    expect(check?.message).toContain("zai/glm-5.2");
+  });
+});
+
+describe("testEnvironment provider-qualified selector check", () => {
+  beforeEach(() => execFileMock.mockReset());
+  afterEach(() => vi.restoreAllMocks());
+
+  it("fails the environment test when a provider-qualified model is not an exact catalog id", async () => {
+    execFileMock.mockImplementation((_c, args, _o, cb) => {
+      if ((args as string[]).includes("models")) {
+        cb(null, JSON.stringify({ models: [{ provider: "zai", id: "glm-5.2" }] }));
+      } else {
+        cb(null, "omp/18.13.1");
+      }
+    });
+
+    const res = await testEnvironment(envTestCtx({ model: "zai/glm-5.3" }));
+
+    expect(res.status).toBe("fail");
+    const check = res.checks.find((c) => c.code === "omp_config_error");
+    expect(check?.level).toBe("error");
+    expect(check?.message).toContain("zai/glm-5.3");
+    expect(check?.message).toContain("18.14");
   });
 });

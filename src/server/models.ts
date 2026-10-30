@@ -109,6 +109,85 @@ export function normalizeOmpModelId(model: string, models: OmpModelInfo[]): stri
   return null;
 }
 
+/**
+ * The catalog id a value names exactly: the composed `provider/id` (the
+ * catalog's `selector`), or a row's RAW id for an aggregator row
+ * (`provider: "openrouter"`, `id: "meta-llama/llama-3.3-70b"`). Compared
+ * case-insensitively, as omp's exact phases do. No suffix stripping.
+ *
+ * The composed id wins over another row's raw id, matching omp's phase-1
+ * index before its phase-2 raw-id compare.
+ */
+export function exactOmpModelId(value: string, models: OmpModelInfo[]): string | null {
+  const lower = value.trim().toLowerCase();
+  if (!lower) return null;
+  const composed = models.find((m) => m.id.toLowerCase() === lower);
+  if (composed) return composed.id;
+  const raw = models.find((m) => {
+    const slash = m.id.indexOf("/");
+    return slash > 0 && m.id.slice(slash + 1).toLowerCase() === lower;
+  });
+  return raw ? raw.id : null;
+}
+
+/**
+ * Resolve a PROVIDER-QUALIFIED selector to a catalog id, exactly.
+ *
+ * omp 18.14 (`config/model-resolver.ts` matchModel, CHANGELOG 18.14.0) stops a
+ * selector naming a known provider after its exact phases: a near match fails
+ * instead of silently selecting a sibling, and a `fallbackChain` leg that does
+ * not resolve is warned about and skipped. The adapter must therefore never
+ * pass a provider-qualified near match through and pretend it will work.
+ *
+ * "Exact" is omp's, not a byte compare against one composed id:
+ * - the composed `provider/id` and the row's RAW id both count, case
+ *   insensitively (`exactOmpModelId`), because matchModel's exact-id phase runs
+ *   before the known-provider cut-off precisely so raw aggregator ids work;
+ * - a trailing `:<suffix>` never decides the model: omp splits a thinking
+ *   level, an OpenRouter route suffix, or — for any other suffix — warns and
+ *   uses the base (`allowInvalidThinkingSelectorFallback` defaults true for
+ *   role values), so the base is what must name an exact id;
+ * - OpenRouter's `-YYYYMMDD` date fallback re-queues the stripped id.
+ *
+ * Deliberately absent: label/name matching (omp's exact phases never match a
+ * display name) and the alias/revision-spelling fallbacks (dotted vs dashed
+ * revisions, `@upstream` routing, wire-route collapsing). A selector that needs
+ * one of those is refused rather than passed through; the fix is to use the
+ * catalog id. Bare selectors are not handled here: omp keeps fuzzy matching for
+ * those, and their resolution is an adapter feature (`normalizeOmpModelId`).
+ * Returns null when the value is bare or names no exact catalog id.
+ */
+export function resolveProviderQualifiedSelector(
+  selector: string,
+  models: OmpModelInfo[],
+): string | null {
+  const candidate = selector.trim();
+  if (!candidate.includes("/")) return null;
+  const variations = [candidate];
+  if (candidate.slice(0, candidate.indexOf("/")).toLowerCase() === "openrouter") {
+    // OpenRouter's date fallback re-queues each stripped id, so `x-20250101`
+    // and `x-20250101:free` both reach `x`.
+    let current = candidate;
+    for (;;) {
+      const stripped = current.replace(/-\d{8}(?=$|:)/i, "");
+      if (stripped === current) break;
+      variations.push(stripped);
+      current = stripped;
+    }
+  }
+  for (const value of variations) {
+    const direct = exactOmpModelId(value, models);
+    if (direct) return direct;
+    const colon = value.lastIndexOf(":");
+    if (colon <= 0) continue;
+    const base = value.slice(0, colon).trim();
+    if (!base.includes("/")) continue;
+    const suffixed = exactOmpModelId(base, models);
+    if (suffixed) return suffixed;
+  }
+  return null;
+}
+
 const cache = new Map<string, { at: number; models: OmpModelInfo[] }>();
 const CACHE_TTL_MS = 5 * 60 * 1000;
 

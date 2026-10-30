@@ -5,6 +5,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { createOmpAcpExecutor } from "./acp.js";
 import { FAILOVER_CONFIG_FILE } from "./failover-config.js";
+import type * as ModelsModule from "./models.js";
 import { GOVERNANCE_CONFIG_FILE } from "./governance-overlay.js";
 import { sessionIntelDir } from "./session-state.js";
 
@@ -17,15 +18,23 @@ import { sessionIntelDir } from "./session-state.js";
 const mocks = vi.hoisted(() => ({
   listOmpModels: vi.fn(async () => [{ id: "prov/m", label: "M", priced: false }]),
   normalizeOmpModelId: vi.fn((model: string) => model),
+  resolveProviderQualifiedSelector: vi.fn((model: string) => model),
   isFreeCost: vi.fn(() => false),
   createAcpxEngineExecutor: vi.fn(),
 }));
 
-vi.mock("./models.js", () => ({
-  isFreeCost: mocks.isFreeCost,
-  listOmpModels: mocks.listOmpModels,
-  normalizeOmpModelId: mocks.normalizeOmpModelId,
-}));
+// Spread the real module so every other models.ts export the run path uses
+// stays importable; only the spies below are replaced.
+vi.mock("./models.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof ModelsModule>();
+  return {
+    ...actual,
+    isFreeCost: mocks.isFreeCost,
+    listOmpModels: mocks.listOmpModels,
+    normalizeOmpModelId: mocks.normalizeOmpModelId,
+    resolveProviderQualifiedSelector: mocks.resolveProviderQualifiedSelector,
+  };
+});
 
 vi.mock("@paperclipai/adapter-utils/acpx-engine/execute", () => ({
   createAcpxEngineExecutor: mocks.createAcpxEngineExecutor,

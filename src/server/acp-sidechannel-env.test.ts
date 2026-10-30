@@ -7,6 +7,7 @@ import { createOmpAcpExecutor } from "./acp.js";
 import { FAILOVER_CONFIG_FILE } from "./failover-config.js";
 import { GOVERNANCE_CONFIG_FILE } from "./governance-overlay.js";
 import { ompAgentDir, sessionIntelDir } from "./session-state.js";
+import type * as ModelsModule from "./models.js";
 
 // Regression guards for env threading into the fork and session-query side
 // channels. The fork and query call sites in createOmpAcpExecutor must forward
@@ -23,6 +24,20 @@ const mocks = vi.hoisted(() => ({
   })),
   createAcpxEngineExecutor: vi.fn(),
 }));
+
+// The chain legs are provider-qualified, so the run resolves them against the
+// catalog; keep the answer deterministic instead of spawning the host's omp.
+const modelMocks = vi.hoisted(() => ({
+  listOmpModels: vi.fn(async () => [
+    { id: "brokerco/main", label: "Broker Main" },
+    { id: "brokerco/fast", label: "Broker Fast" },
+  ]),
+}));
+
+vi.mock("./models.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof ModelsModule>();
+  return { ...actual, listOmpModels: modelMocks.listOmpModels };
+});
 
 vi.mock("./session-intel.js", () => ({
   forkOmpSession: mocks.forkOmpSession,

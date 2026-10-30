@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   detectOmpConfiguredModel, listOmpModels, normalizeOmpModelId, parseOmpModelsJson,
-  refreshOmpModelCatalog, type OmpModelInfo,
+  refreshOmpModelCatalog, resolveProviderQualifiedSelector, type OmpModelInfo,
 } from "./models.js";
 import { deriveDefaultTimeoutSec } from "./acp.js";
 
@@ -390,5 +390,87 @@ describe("normalizeOmpModelId", () => {
       { id: "b/y", label: "z", priced: true },
     ];
     expect(normalizeOmpModelId("b/y", precedence)).toBe("b/y");
+  });
+});
+
+describe("resolveProviderQualifiedSelector", () => {
+  const models: OmpModelInfo[] = [
+    { id: "zai/glm-5.2", label: "GLM 5.2" },
+    { id: "anthropic/claude-sonnet-4-20250514", label: "Claude Sonnet 4" },
+    { id: "openrouter/x:exacto", label: "Exacto" },
+    { id: "openrouter/meta-llama/llama-3.3-70b", label: "Llama 3.3" },
+  ];
+
+  it("resolves an exact provider/id", () => {
+    expect(resolveProviderQualifiedSelector("zai/glm-5.2", models)).toBe("zai/glm-5.2");
+  });
+
+  it("does not resolve a provider-qualified near match to a sibling", () => {
+    // omp 18.14 stops after the exact phases for a slash-prefixed selector.
+    expect(resolveProviderQualifiedSelector("anthropic/claude-sonnet-4", models)).toBeNull();
+  });
+
+  it("leaves bare selectors to omp's fuzzy matching", () => {
+    expect(resolveProviderQualifiedSelector("glm-5.2", models)).toBeNull();
+  });
+
+  it("resolves a provider-qualified selector carrying a thinking suffix", () => {
+    expect(resolveProviderQualifiedSelector("zai/glm-5.2:high", models)).toBe("zai/glm-5.2");
+  });
+
+  it("does not strip a colon that belongs to the catalog id", () => {
+    expect(resolveProviderQualifiedSelector("openrouter/x:exacto", models)).toBe(
+      "openrouter/x:exacto",
+    );
+  });
+
+  it("does not resolve a bare base whose suffix parses as a thinking level", () => {
+    expect(resolveProviderQualifiedSelector("glm-5.2:high", models)).toBeNull();
+  });
+
+  it("resolves an aggregator row by its raw id, which omp matches exactly", () => {
+    expect(resolveProviderQualifiedSelector("meta-llama/llama-3.3-70b", models)).toBe(
+      "openrouter/meta-llama/llama-3.3-70b",
+    );
+  });
+
+  it("matches ids case-insensitively, as omp's exact phases do", () => {
+    expect(resolveProviderQualifiedSelector("ZAI/GLM-5.2", models)).toBe("zai/glm-5.2");
+  });
+
+  it("resolves an OpenRouter routed suffix against the base row", () => {
+    expect(resolveProviderQualifiedSelector("openrouter/meta-llama/llama-3.3-70b:free", models))
+      .toBe("openrouter/meta-llama/llama-3.3-70b");
+  });
+
+  it("resolves an OpenRouter date suffix against the base row", () => {
+    expect(resolveProviderQualifiedSelector("openrouter/meta-llama/llama-3.3-70b-20250101", models))
+      .toBe("openrouter/meta-llama/llama-3.3-70b");
+  });
+
+  it("resolves an :auto thinking suffix, which omp's pattern parser accepts", () => {
+    expect(resolveProviderQualifiedSelector("zai/glm-5.2:auto", models)).toBe("zai/glm-5.2");
+  });
+
+  it("resolves the base when the suffix is not a thinking level (omp warns and runs it)", () => {
+    expect(resolveProviderQualifiedSelector("zai/glm-5.2:turbo", models)).toBe("zai/glm-5.2");
+  });
+
+  it("still refuses a near-match base that carries a suffix", () => {
+    expect(resolveProviderQualifiedSelector("anthropic/claude-sonnet-4:high", models)).toBeNull();
+  });
+
+  it("resolves stacked OpenRouter date and route suffixes", () => {
+    expect(resolveProviderQualifiedSelector("openrouter/meta-llama/llama-3.3-70b-20250101:free", models))
+      .toBe("openrouter/meta-llama/llama-3.3-70b");
+    expect(resolveProviderQualifiedSelector("openrouter/x:exacto:free", models))
+      .toBe("openrouter/x:exacto");
+  });
+
+  it("does not accept a display name that happens to contain a slash", () => {
+    expect(resolveProviderQualifiedSelector(
+      "brand/model",
+      [{ id: "otherco/model2", label: "brand/model" }],
+    )).toBeNull();
   });
 });

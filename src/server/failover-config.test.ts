@@ -3,8 +3,10 @@ import path from "node:path";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import {
-  FAILOVER_CONFIG_FILE, materializeFailoverOverlay, validateRetryFallbackConfig,
+  FAILOVER_CONFIG_FILE, materializeFailoverOverlay, providerQualifiedSelectors,
+  validateProviderQualifiedSelectors, validateRetryFallbackConfig,
 } from "./failover-config.js";
+import type { OmpModelInfo } from "./models.js";
 
 describe("materializeFailoverOverlay", () => {
   it("returns none when there is no fallback chain", async () => {
@@ -197,5 +199,54 @@ describe("validateRetryFallbackConfig", () => {
     expect(validateRetryFallbackConfig({ waitForUsageReset: "yes" })).toContain("waitForUsageReset");
     expect(validateRetryFallbackConfig({ maxDelayMs: -1 })).toContain("maxDelayMs");
     expect(validateRetryFallbackConfig({ maxDelayMs: "soon" })).toContain("maxDelayMs");
+  });
+});
+
+describe("provider-qualified selectors", () => {
+  const models: OmpModelInfo[] = [
+    { id: "zai/glm-5.2", label: "GLM 5.2" },
+    { id: "anthropic/claude-sonnet-4-5", label: "Claude Sonnet 4.5" },
+  ];
+
+  it("collects the primary model and every slash-containing chain leg", () => {
+    const config = {
+      model: "zai/glm-5.2",
+      fallbackChain: "anthropic/claude-sonnet-4-5\nopus\n\nzai/glm-5.2:high",
+    };
+    expect(providerQualifiedSelectors(config)).toEqual([
+      { field: "model", selector: "zai/glm-5.2" },
+      { field: "fallbackChain", selector: "anthropic/claude-sonnet-4-5" },
+      { field: "fallbackChain", selector: "zai/glm-5.2:high" },
+    ]);
+  });
+
+  it("ignores bare selectors, which keep omp's fuzzy matching", () => {
+    expect(providerQualifiedSelectors({ model: "opus", fallbackChain: "sonnet" })).toEqual([]);
+  });
+
+  it("names only the selectors that are not exact catalog ids", () => {
+    const error = validateProviderQualifiedSelectors({
+      model: "anthropic/claude-sonnet-4",
+      fallbackChain: "zai/glm-5.2:high",
+    }, models);
+    expect(error).toContain("model 'anthropic/claude-sonnet-4'");
+    expect(error).not.toContain("glm-5.2");
+  });
+
+  it("names the value and omp 18.14's exact-id requirement", () => {
+    const error = validateProviderQualifiedSelectors(
+      { fallbackChain: "anthropic/claude-sonnet-4" },
+      models,
+    );
+    expect(error).toContain("anthropic/claude-sonnet-4");
+    expect(error).toContain("18.14");
+    expect(error).toContain("exact");
+  });
+
+  it("accepts a config whose provider-qualified selectors all resolve", () => {
+    expect(validateProviderQualifiedSelectors(
+      { model: "zai/glm-5.2", fallbackChain: "anthropic/claude-sonnet-4-5" },
+      models,
+    )).toBeNull();
   });
 });

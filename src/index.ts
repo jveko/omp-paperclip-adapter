@@ -219,12 +219,24 @@ ACP stdio transport.
   \`detectModel\` reads the configured \`modelRoles.default\` instead of opening a
   throwaway ACP session, and returns the same \`provider/id\` shape the catalog
   uses. Both use the default omp on PATH, not any agent's \`command\` override.
-- Tested against omp **18.13.x** (verified 18.13.1). \`testEnvironment\` fails for
-  a command named \`omp\` outside that minor, and \`peerDependencies\` declares the
-  same range (\`@oh-my-pi/pi-coding-agent\`, optional so npm does not pull the
-  CLI for you). Wrapper commands report their own version, so they are reported
-  as unverified rather than failed. \`omp models ls --json\` is unversioned; the
+- Tested against omp **18.13.x** (verified live on 18.13.1) and **18.14.x**
+  (source-audited against the 18.14.0 release, not executed on this host).
+  \`testEnvironment\` fails for a command named \`omp\` outside those minors,
+  and \`peerDependencies\` declares the same range
+  (\`@oh-my-pi/pi-coding-agent\`, optional so npm does not pull the CLI for
+  you). Wrapper commands report their own version, so they are reported as
+  unverified rather than failed. \`omp models ls --json\` is unversioned; the
   catalog is parsed by field, so a missing or future \`schemaVersion\` is inert.
+- A provider-qualified model selector (anything containing \`/\`) must be an
+  exact catalog id, for \`model\` and every \`fallbackChain\` leg. omp 18.14
+  resolves such a selector exactly: a near match fails instead of selecting a
+  sibling, and a chain leg that does not resolve is skipped, silently
+  narrowing the chain. The adapter therefore resolves slash-containing values
+  against \`omp models ls --json\` and refuses the run with
+  \`omp_config_error\` (and the environment test with an error check) naming
+  the value. Bare selectors (\`opus\`) keep omp's fuzzy matching. When the
+  catalog cannot be read at all, the selectors pass through as before with a
+  warning instead of failing the run.
 - systemd may strip mise shims from PATH; prefer an absolute \`command\`.
 `.trim();
 

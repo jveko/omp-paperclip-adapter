@@ -23,6 +23,7 @@ import {
   DEFAULT_ACP_ENGINE_PERMISSION_MODE,
 } from "@paperclipai/adapter-utils/acpx-engine/constants";
 import {
+  exactOmpModelId,
   isFreeCost,
   listOmpModels,
   normalizeOmpModelId,
@@ -31,7 +32,10 @@ import {
 import { attributeRunCost, type RunCostFields } from "./cost-truth.js";
 import { buildSkillsInstructions, skillsDir, type SkillMarkdownSource } from "./skills.js";
 import { readRetryConfig, runWithFreshSessionRetry, withRetryChain } from "./retry.js";
-import { materializeFailoverOverlay, parseFallbackChain, validateRetryFallbackConfig } from "./failover-config.js";
+import {
+  materializeFailoverOverlay, parseFallbackChain, providerQualifiedSelectors, validateProviderQualifiedSelectors,
+  validateRetryFallbackConfig,
+} from "./failover-config.js";
 import { ompEnv } from "./omp-env.js";
 import { prepareSessionScope } from "./session-scope.js";
 import { forkOmpSession, findOmpSessionCwd, queryOmpSessions } from "./session-intel.js";
@@ -317,15 +321,21 @@ export function parseOmpVersion(output: string): { major: number; minor: number;
 }
 
 /**
- * The omp minor this adapter is tested against (18.13.x, verified against
- * 18.13.1). The adapter compensates for that minor's engine behavior — the
+ * The omp minors this adapter is tested against, as a contiguous range:
+ * 18.13.x (verified against the live 18.13.1 install) and 18.14.x
+ * (source-audited against the 18.14.0 release, which changed
+ * provider-qualified selector resolution — see resolveProviderQualifiedSelector).
+ * The adapter compensates for engine behavior that moves between minors — the
  * session-key fingerprint, the permission-proxy coercion, `usage_update`'s
- * breakdown, `session/set_config_option`'s id set — so a different minor is
- * untested rather than "probably fine". `testEnvironment` enforces this and
+ * breakdown, `session/set_config_option`'s id set — so a minor outside this set
+ * is untested rather than "probably fine". `testEnvironment` enforces this and
  * `package.json`'s peerDependencies pins the same range; the upgrade-contract
  * test keeps the two from drifting.
  */
-export const TESTED_OMP_MINOR = { major: 18, minor: 13 } as const;
+export const TESTED_OMP_MINORS = [
+  { major: 18, minor: 13 },
+  { major: 18, minor: 14 },
+] as const;
 
 export function resolveOmpBillingIdentity(ctx: Pick<AdapterExecutionContext, "config">): AcpxEngineBillingIdentity {
   const env = (ctx.config.env ?? {}) as Record<string, unknown>;
@@ -700,8 +710,9 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     // models.ts, keyed by command+env so different agents' credentials never
     // share a catalog). Built on first actual run, inside this memoized
     // closure, so probe-only paths never spawn `omp models`. The fetch is
-    // skipped when no model is configured — a broken/missing `omp` would
-    // otherwise add up to 20s of uncached failure latency per run.
+    // skipped when no model is configured AND no chain leg is
+    // provider-qualified — a broken/missing `omp` would otherwise add up to
+    // 20s of uncached failure latency per run.
     const failoverOverlay = await materializeFailoverOverlay(ctx.config, intelDir);
     const failoverOverlayPath =
       failoverOverlay.status === "ok" ? failoverOverlay.path : null;
@@ -718,14 +729,37 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     // trailing tokens are never confused with the base command.
     const acpIdx = ompTokens.indexOf("acp");
     const base = acpIdx >= 0 ? ompTokens.slice(0, acpIdx) : ompTokens;
-    const models = firstNonEmptyString(ctx.config.model)
+    const providerSelectors = providerQualifiedSelectors(ctx.config);
+    const models = firstNonEmptyString(ctx.config.model) || providerSelectors.length > 0
       ? await listOmpModels({
           command: base[0],
           args: [...base.slice(1), "models", "ls", "--json"],
           env: sideChannelEnv,
         })
       : [];
-    const resolveModel = (model: string): string | null => normalizeOmpModelId(model, models);
+    // omp 18.14 resolves a provider-qualified selector (anything with `/`)
+    // exactly: a near match fails for `model` and is skipped for a chain leg,
+    // so passing one through would run a narrower chain than configured. Bare
+    // selectors keep omp's fuzzy matching. An unreadable catalog cannot prove
+    // anything, so it degrades to the old pass-through with a warning.
+    if (providerSelectors.length > 0) {
+      if (models.length === 0) {
+        await ctx.onEvent?.({
+          eventType: "run.system", stream: "system", level: "warn",
+          message: `omp model catalog unavailable (unreadable or empty): provider-qualified selectors (${providerSelectors.map(({ selector }) => selector).join(", ")}) pass through unresolved; omp 18.14 fails a near-match model and skips such a fallback leg`,
+        });
+      } else {
+        const selectorErr = validateProviderQualifiedSelectors(ctx.config, models);
+        if (selectorErr) {
+          return { exitCode: 1, signal: null, timedOut: false, errorCode: "omp_config_error", errorMessage: selectorErr };
+        }
+      }
+    }
+    // Bare selectors keep fuzzy resolution; a provider-qualified id omp accepts
+    // only in raw or non-canonical case form is rewritten to the composed
+    // `provider/id`, because ACP's `set_config_option` is byte-exact.
+    const resolveModel = (model: string): string | null =>
+      normalizeOmpModelId(model, models) ?? exactOmpModelId(model, models);
     const resolveCost = (model: string): OmpModelCost | null =>
       models.find((m) => m.id === model)?.cost ?? null;
     // Lazy-skill bridge: when skillsAsTools is on, materialize the skills

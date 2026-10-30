@@ -10,8 +10,10 @@ import {
   ensureAdapterExecutionTargetCommandResolvable,
   resolveAdapterExecutionTargetCwd,
 } from "@paperclipai/adapter-utils/execution-target";
-import { parseOmpVersion, probeOmpAcpSession, resolveOmpAgentCommand, TESTED_OMP_MINOR, type OmpAcpProbeResult } from "./acp.js";
+import { parseOmpVersion, probeOmpAcpSession, resolveOmpAgentCommand, TESTED_OMP_MINORS, type OmpAcpProbeResult } from "./acp.js";
 import { ompEnv } from "./omp-env.js";
+import { listOmpModels, type OmpModelInfo } from "./models.js";
+import { providerQualifiedSelectors, validateProviderQualifiedSelectors } from "./failover-config.js";
 import { resolveSessionScope, validateSessionScope } from "./session-directives.js";
 
 function run(command: string, args: string[], timeoutMs: number, env?: Record<string, string>): Promise<string> {
@@ -59,14 +61,41 @@ export function evaluateSessionScopeCheck(
 }
 
 /**
- * Enforce the tested omp MINOR, not just "a version parsed".
+ * Check provider-qualified model selectors (`model`, `fallbackChain`) against
+ * the catalog. omp 18.14 resolves anything containing `/` exactly: a near match
+ * fails for `model` and is skipped for a chain leg, which would silently narrow
+ * the chain. An unreadable catalog proves nothing, so it warns instead of
+ * failing — the run path then passes the selectors through as before.
+ * Returns null when there is nothing to check or everything resolves.
+ */
+export function evaluateModelSelectorCheck(
+  config: Record<string, unknown>,
+  models: OmpModelInfo[],
+): AdapterEnvironmentCheck | null {
+  const selectors = providerQualifiedSelectors(config);
+  if (selectors.length === 0) return null;
+  if (models.length === 0) {
+    return {
+      level: "warn",
+      code: "omp_model_catalog_unavailable",
+      message: `the omp model catalog could not be read (or lists no models), so provider-qualified selectors (${selectors.map(({ selector }) => selector).join(", ")}) cannot be verified; omp 18.14 fails a near-match model and skips such a fallback leg`,
+    };
+  }
+  const invalid = validateProviderQualifiedSelectors(config, models);
+  return invalid ? { level: "error", code: "omp_config_error", message: invalid } : null;
+}
+
+/**
+ * Enforce the tested omp MINORS, not just "a version parsed".
  *
  * The adapter compensates for engine behavior that moves between minors, so an
  * untested minor is a heartbeat failure waiting to happen; the environment test
- * is where it must surface, with a readable message, instead. Only a command
- * literally named `omp` is enforced: the docs already note that wrapper
- * commands report their own version, and failing a wrapper would be a false
- * negative. A build that reports nothing parseable stays a warning, unchanged.
+ * is where it must surface, with a readable message, instead. The tested set is
+ * a range, not one minor: 18.13.x is the live-verified build and 18.14.x is
+ * source-audited, so either may run. Only a command literally named `omp` is
+ * enforced: the docs already note that wrapper commands report their own
+ * version, and failing a wrapper would be a false negative. A build that
+ * reports nothing parseable stays a warning, unchanged.
  */
 export function evaluateOmpVersionCheck(
   version: { major: number; minor: number; patch: number } | null,
@@ -82,26 +111,30 @@ export function evaluateOmpVersionCheck(
     };
   }
   const shown = `${version.major}.${version.minor}.${version.patch}`;
+  const testedRange = TESTED_OMP_MINORS.map((m) => `${m.major}.${m.minor}.x`).join(" or ");
   if (path.basename(command) !== "omp") {
     return {
       level: "warn",
       code: "omp_version_unverified",
       message: `probed '${command}' -> ${shown}; version enforcement is skipped because only a command named 'omp' reports omp's own version (wrapper commands report their own)`,
-      detail: `The adapter is tested against omp ${TESTED_OMP_MINOR.major}.${TESTED_OMP_MINOR.minor}.x.`,
+      detail: `The adapter is tested against omp ${testedRange}.`,
     };
   }
-  if (version.major !== TESTED_OMP_MINOR.major || version.minor !== TESTED_OMP_MINOR.minor) {
+  const tested = TESTED_OMP_MINORS.some(
+    (m) => m.major === version.major && m.minor === version.minor,
+  );
+  if (!tested) {
     return {
       level: "error",
       code: "omp_version_unsupported",
-      message: `omp ${shown} is outside the tested range ${TESTED_OMP_MINOR.major}.${TESTED_OMP_MINOR.minor}.x: this adapter compensates for that minor's engine behavior, so a different minor is untested (a renamed config key or surface fails a heartbeat instead of this check)`,
-      detail: `Install omp ${TESTED_OMP_MINOR.major}.${TESTED_OMP_MINOR.minor}.x, or upgrade this adapter and its peerDependencies range.`,
+      message: `omp ${shown} is outside the tested range ${testedRange}: this adapter compensates for those minors' engine behavior, so a different minor is untested (a renamed config key or surface fails a heartbeat instead of this check)`,
+      detail: `Install omp ${testedRange}, or upgrade this adapter and its peerDependencies range.`,
     };
   }
   return {
     level: "info",
     code: "omp_version",
-    message: `probed '${command}' -> ${shown} (the tested minor)`,
+    message: `probed '${command}' -> ${shown} (a tested minor)`,
   };
 }
 
@@ -284,7 +317,17 @@ export async function testEnvironment(
   }
   // 7. session scope (item 18 containment control)
   checks.push(evaluateSessionScopeCheck(config));
-  // 8. OTLP export diagnostic (agent env overrides host env)
+  // 8. provider-qualified model selectors (omp 18.14 resolves them exactly)
+  if (providerQualifiedSelectors(config).length > 0) {
+    const catalog = await listOmpModels({
+      command: base[0],
+      args: [...base.slice(1), "models", "ls", "--json"],
+      env: spawnEnv,
+    });
+    const selectorCheck = evaluateModelSelectorCheck(config, catalog);
+    if (selectorCheck) checks.push(selectorCheck);
+  }
+  // 9. OTLP export diagnostic (agent env overrides host env)
   checks.push(evaluateOtlpCheck({ ...pickOtel(process.env), ...pickOtel(env) }));
 
   return {
