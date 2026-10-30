@@ -6,9 +6,10 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AdapterEnvironmentTestContext } from "@paperclipai/adapter-utils";
 import {
-  evaluateConfigOptionCheck, evaluateModelSelectorCheck, evaluateOmpVersionCheck, testEnvironment,
+  evaluateModelSelectorCheck, evaluateOmpVersionCheck, testEnvironment,
 } from "./test.js";
-import type * as AcpModule from "./acp.js";
+import type * as AcpClientModule from "./adapters/acp/client.js";
+import { clearCapabilityCache } from "./capabilities.js";
 import type { OmpModelInfo } from "./models.js";
 
 // Regression guard for env threading into the environment-test version probe.
@@ -27,15 +28,33 @@ vi.mock("node:child_process", async (importOriginal) => {
 const acpMocks = vi.hoisted(() => ({
   probeOmpAcpSession: vi.fn(async () => ({
     ok: true, protocolVersion: 1, currentModel: "glm-5.2",
+    supportsSessionList: true, supportsSessionFork: true,
+    supportsSteering: true, supportsExtensions: true,
+    configOptionIds: ["mode", "model", "thinking"],
   })),
 }));
 
 // Capture the ACP handshake probe so we can assert its env (the execFile mock
 // only covers the version probe). Real parseOmpVersion/resolveOmpAgentCommand
-// stay intact; only probeOmpAcpSession is intercepted.
-vi.mock("./acp.js", async (importOriginal) => {
-  const actual = await importOriginal<AcpModule>();
+// stay intact; only probeOmpAcpSession is intercepted. The capability layer
+// imports it from this module, which is why the seam is mocked here.
+vi.mock("./adapters/acp/client.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof AcpClientModule>();
   return { ...actual, probeOmpAcpSession: acpMocks.probeOmpAcpSession };
+});
+
+/** Keep the capability probe's persisted cache out of the real instance root. */
+let capabilityHome: string;
+beforeAll(async () => {
+  capabilityHome = await mkdtemp(path.join(os.tmpdir(), "omp-cap-home-"));
+});
+afterAll(async () => {
+  await rm(capabilityHome, { recursive: true, force: true });
+});
+beforeEach(async () => {
+  vi.stubEnv("PAPERCLIP_HOME", capabilityHome);
+  await rm(path.join(capabilityHome, "instances"), { recursive: true, force: true });
+  clearCapabilityCache();
 });
 
 const execFileMock = vi.mocked(execFile);
@@ -104,26 +123,28 @@ describe("testEnvironment multi-token command probes", () => {
     expect(calls[1][0]).toBe("mise");
     expect(calls[1][1]).toEqual(["x", "omp", "--", "auth-broker", "status", "--json"]);
   });
-  it("strips trailing --thinking flags from BOTH probes for a thinking-configured agent", async () => {
+  it("strips trailing --thinking flags from the version and broker probes", async () => {
     // With thinking set, resolveOmpAgentCommand yields `omp acp --thinking medium`.
     // The base split (indexOf "acp") must still yield `omp` so the version probe
     // is `omp --version` and the broker probe is `omp auth-broker status --json`,
     // not a mangled `omp acp --thinking medium --version` that starts an ACP
-    // server and times out.
-    execFileMock
-      .mockImplementationOnce((_c, _a, _o, cb) => cb(null, "omp/18.13.1"))
-      .mockImplementationOnce((_c, _a, _o, cb) => cb(null, '{"ok":true,"url":"http://b:8765","version":"18"}'));
+    // server and times out. The capability probe adds its own base-command
+    // calls (`config list`, `--help`), so find the two probes by argv.
+    execFileMock.mockImplementation((_c, args, _o, cb) => {
+      cb(null, args.includes("--version") ? "omp/18.13.1" : '{"ok":true,"url":"http://b:8765","version":"18"}');
+    });
     await testEnvironment(envTestCtx({
       credentialMode: "broker",
       command: "omp",
       thinking: "medium",
       env: { OMP_AUTH_BROKER_URL: "http://b:8765", OMP_AUTH_BROKER_TOKEN: "tok" },
     }));
-    const calls = execFileMock.mock.calls;
-    expect(calls[0][0]).toBe("omp");
-    expect(calls[0][1]).toEqual(["--version"]);
-    expect(calls[1][0]).toBe("omp");
-    expect(calls[1][1]).toEqual(["auth-broker", "status", "--json"]);
+    const calls = execFileMock.mock.calls.map((call) => ({ command: call[0], args: call[1] as string[] }));
+    expect(calls.every((call) => call.command === "omp")).toBe(true);
+    expect(calls.some((call) => call.args.includes("acp") || call.args.includes("--thinking"))).toBe(false);
+    expect(calls.find((call) => call.args.includes("--version"))?.args).toEqual(["--version"]);
+    expect(calls.find((call) => call.args.includes("auth-broker"))?.args)
+      .toEqual(["auth-broker", "status", "--json"]);
   });
 });
 
@@ -193,30 +214,35 @@ describe("evaluateOmpVersionCheck", () => {
     expect(check.code).toBe("omp_version");
   });
 
-  it("rejects an untested minor on a directly executed omp and names both tested lines", () => {
+  it("warns (never errors) on an untested minor and names the tested lines", () => {
+    // The capability checks are the gate: a newer minor is unverified, not
+    // refused, because the surfaces it exposes are what get validated.
     const check = evaluateOmpVersionCheck({ major: 18, minor: 15, patch: 0 }, "omp/18.15.0", "/usr/bin/omp");
-    expect(check.level).toBe("error");
-    expect(check.code).toBe("omp_version_unsupported");
+    expect(check.level).toBe("warn");
+    expect(check.code).toBe("omp_version_untested_minor");
     expect(check.message).toContain("18.15.0");
     expect(check.message).toContain("18.13");
     expect(check.message).toContain("18.14");
+    expect(check.message).toContain("capability checks");
   });
 
   it.each([
-    {
-      name: "a major bump",
-      version: { major: 19, minor: 0, patch: 0 },
-      output: "omp/19.0.0",
-    },
-    {
-      name: "an older minor",
-      version: { major: 18, minor: 12, patch: 9 },
-      output: "omp/18.12.9",
-    },
-  ])("rejects $name on a directly executed omp", ({ version, output }) => {
+    { name: "a newer minor", version: { major: 18, minor: 12, patch: 9 }, output: "omp/18.12.9" },
+    { name: "a newer major's first minor", version: { major: 18, minor: 16, patch: 0 }, output: "omp/18.16.0" },
+  ])("warns on $name of a directly executed omp", ({ version, output }) => {
+    const check = evaluateOmpVersionCheck(version, output, "omp");
+    expect(check.level).toBe("warn");
+    expect(check.code).toBe("omp_version_untested_minor");
+  });
+
+  it.each([
+    { name: "a newer major", version: { major: 19, minor: 0, patch: 0 }, output: "omp/19.0.0" },
+    { name: "an older major", version: { major: 17, minor: 9, patch: 0 }, output: "omp/17.9.0" },
+  ])("errors on $name, which no capability probe covers", ({ version, output }) => {
     const check = evaluateOmpVersionCheck(version, output, "omp");
     expect(check.level).toBe("error");
     expect(check.code).toBe("omp_version_unsupported");
+    expect(check.message).toContain("major");
   });
 
   it.each(["/usr/bin/node", "mise"])(
@@ -236,30 +262,6 @@ describe("evaluateOmpVersionCheck", () => {
   });
 });
 
-describe("evaluateConfigOptionCheck", () => {
-  it("reports the configured-option surface when the build advertises all three ids", () => {
-    const check = evaluateConfigOptionCheck({ configOptionIds: ["mode", "model", "thinking"] });
-    expect(check.level).toBe("info");
-    expect(check.code).toBe("omp_config_options");
-    expect(check.message).toContain("model");
-  });
-
-  it("warns when the build drops the model id from its advertised config options", () => {
-    const check = evaluateConfigOptionCheck({ configOptionIds: ["mode", "thinking"] });
-    expect(check.level).toBe("warn");
-    expect(check.code).toBe("omp_config_option_model_missing");
-    expect(check.detail).toContain("mode");
-    expect(check.detail).toContain("thinking");
-    expect(check.detail).toContain("mode|model|thinking");
-  });
-
-  it("warns when the probe advertises no config option ids at all", () => {
-    const check = evaluateConfigOptionCheck({});
-    expect(check.level).toBe("warn");
-    expect(check.code).toBe("omp_config_option_model_missing");
-  });
-});
-
 describe("testEnvironment omp version gate", () => {
   let tmpDir: string;
   beforeAll(async () => {
@@ -271,9 +273,10 @@ describe("testEnvironment omp version gate", () => {
   beforeEach(() => execFileMock.mockReset());
   afterEach(() => vi.restoreAllMocks());
 
-  it("fails the environment test when a directly executed omp is outside the tested range", async () => {
+  it("warns — and does not fail — when a directly executed omp is outside the tested minors", async () => {
     // ensureAdapterExecutionTargetCommandResolvable runs for real, so the
-    // command must be a real executable file; only --version is stubbed.
+    // command must be a real executable file; only --version is stubbed. An
+    // untested minor is a warning now; the capability checks decide the rest.
     const ompPath = path.join(tmpDir, "omp");
     await writeFile(ompPath, "#!/bin/sh\n", { mode: 0o755 });
     execFileMock.mockImplementation((_c, _a, _o, cb) => cb(null, "omp/18.15.0"));
@@ -281,10 +284,11 @@ describe("testEnvironment omp version gate", () => {
     const res = await testEnvironment(envTestCtx({ command: ompPath }));
 
     expect(res.checks.some((c) => c.code === "omp_command_resolvable")).toBe(true);
-    const check = res.checks.find((c) => c.code === "omp_version_unsupported");
+    const check = res.checks.find((c) => c.code === "omp_version_untested_minor");
     expect(check).toBeTruthy();
-    expect(check!.level).toBe("error");
-    expect(res.status).toBe("fail");
+    expect(check!.level).toBe("warn");
+    expect(res.checks.some((c) => c.code === "omp_version_unsupported")).toBe(false);
+    expect(res.status).toBe("warn");
   });
 });
 describe("evaluateModelSelectorCheck", () => {

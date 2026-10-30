@@ -17,6 +17,12 @@ export interface OmpAcpProbeResult {
   currentModel?: string;
   /** The build advertises ACP `session/list`, the read the snapshot depends on. */
   supportsSessionList?: boolean;
+  /** The build advertises ACP `session/fork`, the run directive's dependency. */
+  supportsSessionFork?: boolean;
+  /** `_session/steering` answers (advertised in `_meta` or behaviourally). */
+  supportsSteering?: boolean;
+  /** `_omp/extensions` answers with the loaded-extension list. */
+  supportsExtensions?: boolean;
   /** Ids the handshake advertised; omp accepts only mode|model|thinking. */
   configOptionIds?: string[];
   error?: string;
@@ -29,7 +35,7 @@ export interface AcpFrameRequest {
 export interface AcpFrameResponse {
   id: number;
   result?: Record<string, unknown>;
-  error?: { code: number; message: string };
+  error?: { code: number; message: string; data?: unknown };
 }
 export interface AcpDriveResult {
   ok: boolean;
@@ -146,6 +152,7 @@ export function driveAcpSession(
           error: {
             code: Number((err as { code?: unknown }).code ?? 0),
             message: "message" in (err as object) ? String((err as { message: unknown }).message) : JSON.stringify(err),
+            ...("data" in (err as object) ? { data: (err as { data?: unknown }).data } : {}),
           },
         });
       } else if (typeof result === "object" && result !== null) {
@@ -163,46 +170,118 @@ export function driveAcpSession(
 }
 
 /**
- * Whether the agent's initialize result advertises ACP `session/list`. The
- * snapshot read has no host-wide fallback by design (see `queryOmpSessions`),
- * so an omp build without it silently produces no session-snapshot card — the
- * environment test is the only place that can say so up front. Unknown shape
- * counts as absent.
+ * Whether the agent's initialize result advertises one ACP session
+ * capability. The snapshot read has no host-wide fallback by design (see
+ * `queryOmpSessions`), so an omp build without `list` silently produces no
+ * session-snapshot card — the environment test is the only place that can say
+ * so up front. Unknown shape counts as absent.
  */
-function advertisesSessionList(initializeInfo: Record<string, unknown> | undefined): boolean {
-  if (!initializeInfo || !("agentCapabilities" in initializeInfo)) return false;
+function advertisesSessionCapability(
+  initializeInfo: Record<string, unknown> | undefined,
+  capability: "list" | "fork",
+): boolean {
+  if (!initializeInfo) return false;
   const capabilities = initializeInfo.agentCapabilities;
-  if (typeof capabilities !== "object" || capabilities === null) return false;
-  if (!("sessionCapabilities" in capabilities)) return false;
+  if (!isRecordObject(capabilities)) return false;
   const sessionCapabilities = capabilities.sessionCapabilities;
-  if (typeof sessionCapabilities !== "object" || sessionCapabilities === null) return false;
-  return "list" in sessionCapabilities && sessionCapabilities.list !== null;
+  if (!isRecordObject(sessionCapabilities)) return false;
+  return sessionCapabilities[capability] !== undefined && sessionCapabilities[capability] !== null;
+}
+
+function isRecordObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** `_meta.steering.supported`, the bit claude-agent-acp/codex-acp advertise. */
+function advertisesSteering(initializeInfo: Record<string, unknown> | undefined): boolean {
+  if (!initializeInfo) return false;
+  const meta = initializeInfo._meta;
+  if (!isRecordObject(meta)) return false;
+  const steering = meta.steering;
+  return isRecordObject(steering) && steering.supported === true;
+}
+
+/** A session id no build can hold, so the steering probe does no work. */
+const STEERING_PROBE_SESSION_ID = "paperclip-capability-probe";
+
+/** The `details` string of a JSON-RPC error, when the build sends one. */
+function errorDetails(error: { data?: unknown }): string | null {
+  const data = error.data;
+  if (typeof data !== "object" || data === null || !("details" in data)) return null;
+  return typeof data.details === "string" ? data.details : null;
+}
+
+/**
+ * Whether an error means "this build has no such method". omp answers an
+ * unknown method with -32601, and an unknown `_omp/*` ext method with -32603
+ * whose `data.details` names the method (`acp-agent.ts` "Unknown ACP ext
+ * method: <name>"). The message alone is just "Internal error", so the details
+ * field is what identifies an absent ext surface.
+ */
+function isMethodAbsent(error: { code: number; message: string; data?: unknown }, method: string): boolean {
+  if (error.code === -32601) return true;
+  const text = [error.message, errorDetails(error) ?? ""].join("\n");
+  return /Unknown ACP ext method/i.test(text) && text.includes(method);
 }
 
 export function probeOmpAcpSession(
   omp: { command: string; args?: string[]; env?: Record<string, string> },
   timeoutMs = 10_000,
 ): Promise<OmpAcpProbeResult> {
+  const cwd = process.cwd();
+  // One process, one handshake, four questions: the advertised capability
+  // block, the config-option id set, and two behavioural probes that mark the
+  // surfaces a build may simply not have. All are read-only: the steering
+  // probe names a session that cannot exist, and `_omp/extensions` is a disk
+  // scan.
   return driveAcpSession(omp, [
-    { method: "session/new", params: { cwd: process.cwd(), mcpServers: [] } },
+    { method: "session/new", params: { cwd, mcpServers: [] } },
+    { method: "_omp/extensions", params: { cwd } },
+    {
+      method: "_session/steering",
+      params: {
+        sessionId: STEERING_PROBE_SESSION_ID,
+        prompt: [{ type: "text", text: "capability probe" }],
+      },
+    },
   ], timeoutMs).then((drive): OmpAcpProbeResult => {
-    const supportsSessionList = advertisesSessionList(drive.initializeInfo);
+    const supportsSessionList = advertisesSessionCapability(drive.initializeInfo, "list");
+    const supportsSessionFork = advertisesSessionCapability(drive.initializeInfo, "fork");
+    const advertisedSteering = advertisesSteering(drive.initializeInfo);
     if (!drive.ok) {
-      return { ok: false, protocolVersion: drive.protocolVersion, supportsSessionList, error: drive.error };
+      return {
+        ok: false, protocolVersion: drive.protocolVersion, supportsSessionList,
+        supportsSessionFork, supportsSteering: advertisedSteering, error: drive.error,
+      };
     }
     const response = drive.responses[0];
     if (response?.error) {
-      return { ok: false, supportsSessionList, error: `ACP error on request id ${response.id}: ${response.error.message}` };
+      return {
+        ok: false, supportsSessionList, supportsSessionFork,
+        supportsSteering: advertisedSteering,
+        error: `ACP error on request id ${response.id}: ${response.error.message}`,
+      };
     }
     const options = Array.isArray(response?.result?.configOptions)
       ? (response.result?.configOptions as Array<Record<string, unknown>>)
       : [];
     const model = options.find((o) => o.id === "model") as { currentValue?: unknown } | undefined;
+    const extensions = drive.responses[1];
+    const steering = drive.responses[2];
     return {
       ok: true,
       protocolVersion: 1,
       currentModel: typeof model?.currentValue === "string" ? model.currentValue : undefined,
       supportsSessionList,
+      supportsSessionFork,
+      // A method that exists answers the bogus session id with invalid params
+      // (or its outcome); only method-not-found means the build lacks it.
+      supportsSteering: steering?.error
+        ? !isMethodAbsent(steering.error, "_session/steering")
+        : steering !== undefined || advertisedSteering,
+      supportsExtensions: extensions?.error
+        ? !isMethodAbsent(extensions.error, "_omp/extensions")
+        : Array.isArray(extensions?.result?.extensions),
       configOptionIds: options
         .map((option) => (typeof option.id === "string" ? option.id : ""))
         .filter((id) => id.length > 0),

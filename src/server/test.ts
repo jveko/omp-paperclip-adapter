@@ -10,11 +10,13 @@ import {
   ensureAdapterExecutionTargetCommandResolvable,
   resolveAdapterExecutionTargetCwd,
 } from "@paperclipai/adapter-utils/execution-target";
-import { parseOmpVersion, probeOmpAcpSession, resolveOmpAgentCommand, TESTED_OMP_MINORS, type OmpAcpProbeResult } from "./acp.js";
+import { bridgePath, parseOmpVersion, resolveOmpAgentCommand, TESTED_OMP_MINORS } from "./acp.js";
+import { capabilityCacheDir, capabilityChecks, loadCapabilities } from "./capabilities.js";
+import { buildWorkerArgv } from "../host/worker.js";
 import { ompEnv } from "./omp-env.js";
 import { listOmpModels, type OmpModelInfo } from "./models.js";
 import { providerQualifiedSelectors, validateProviderQualifiedSelectors } from "./failover-config.js";
-import { resolveSessionScope, validateSessionScope } from "./session-directives.js";
+import { resolveExecutionMode, resolveSessionScope, validateSessionScope } from "./session-directives.js";
 
 function run(command: string, args: string[], timeoutMs: number, env?: Record<string, string>): Promise<string> {
   return new Promise<string>((resolve) => {
@@ -86,16 +88,15 @@ export function evaluateModelSelectorCheck(
 }
 
 /**
- * Enforce the tested omp MINORS, not just "a version parsed".
+ * Report the build's version against the tested lines — as a claim, not a gate.
  *
- * The adapter compensates for engine behavior that moves between minors, so an
- * untested minor is a heartbeat failure waiting to happen; the environment test
- * is where it must surface, with a readable message, instead. The tested set is
- * a range, not one minor: 18.13.x is the live-verified build and 18.14.x is
- * source-audited, so either may run. Only a command literally named `omp` is
- * enforced: the docs already note that wrapper commands report their own
- * version, and failing a wrapper would be a false negative. A build that
- * reports nothing parseable stays a warning, unchanged.
+ * The capability probes are the gate now: a build can be outside the tested
+ * minors and still expose every surface this adapter reads, and a tested minor
+ * can lose one. So a minor outside the tested set is a warning naming the
+ * tested lines and pointing at the capability checks; only a MAJOR mismatch is
+ * an error, because the ACP lane itself is not covered by the capability set
+ * (a new major may remove the protocol). A command not literally named `omp`
+ * reports its own version, so enforcement there would be a false negative.
  */
 export function evaluateOmpVersionCheck(
   version: { major: number; minor: number; patch: number } | null,
@@ -117,7 +118,17 @@ export function evaluateOmpVersionCheck(
       level: "warn",
       code: "omp_version_unverified",
       message: `probed '${command}' -> ${shown}; version enforcement is skipped because only a command named 'omp' reports omp's own version (wrapper commands report their own)`,
-      detail: `The adapter is tested against omp ${testedRange}.`,
+      detail: `The adapter is tested against omp ${testedRange}; the capability checks below are the gate.`,
+    };
+  }
+  const testedMajors: number[] = [...new Set(TESTED_OMP_MINORS.map((m) => m.major))];
+  if (!testedMajors.includes(version.major)) {
+    const direction = version.major > Math.max(...testedMajors) ? "newer" : "older";
+    return {
+      level: "error",
+      code: "omp_version_unsupported",
+      message: `omp ${shown} is a ${direction} major than the tested ${testedRange}: a major change can move or remove the ACP lane itself, which no capability probe covers`,
+      detail: `Install omp ${testedRange}, or upgrade this adapter and its peerDependencies range.`,
     };
   }
   const tested = TESTED_OMP_MINORS.some(
@@ -125,10 +136,10 @@ export function evaluateOmpVersionCheck(
   );
   if (!tested) {
     return {
-      level: "error",
-      code: "omp_version_unsupported",
-      message: `omp ${shown} is outside the tested range ${testedRange}: this adapter compensates for those minors' engine behavior, so a different minor is untested (a renamed config key or surface fails a heartbeat instead of this check)`,
-      detail: `Install omp ${testedRange}, or upgrade this adapter and its peerDependencies range.`,
+      level: "warn",
+      code: "omp_version_untested_minor",
+      message: `omp ${shown} is outside the tested lines ${testedRange}; the capability checks below are what this adapter validates, so a missing surface appears as its own warning rather than as this one`,
+      detail: `Tested: ${TESTED_OMP_MINORS.map((m) => `${m.major}.${m.minor}.x`).join(", ")}.`,
     };
   }
   return {
@@ -139,49 +150,22 @@ export function evaluateOmpVersionCheck(
 }
 
 /**
- * Pin the ACP config-option id contract: omp's `session/set_config_option`
- * accepts exactly `mode`, `model` and `thinking`, and this adapter reads the
- * `model` option to report the active model. A build that renames those ids
- * fails here with a readable message instead of leaving model selection inert.
+ * Report the capability surfaces this build exposes. The per-capability
+ * degradation text lives in `capabilities.ts` (one table, one owner), so this
+ * only summarises what WAS found; the absent surfaces come back as their own
+ * named warnings from `capabilityChecks`.
  */
-export function evaluateConfigOptionCheck(
-  probe: Pick<OmpAcpProbeResult, "configOptionIds">,
+export function evaluateCapabilitySummaryCheck(
+  capabilities: Record<string, { state: string }>,
 ): AdapterEnvironmentCheck {
-  const ids = probe.configOptionIds ?? [];
-  if (ids.includes("model")) {
-    return {
-      level: "info",
-      code: "omp_config_options",
-      message: `ACP config options: ${ids.join(", ") || "none"}`,
-    };
-  }
+  const present = Object.entries(capabilities)
+    .filter(([, capability]) => capability.state === "yes")
+    .map(([id]) => id);
   return {
-    level: "warn",
-    code: "omp_config_option_model_missing",
-    message: "the ACP handshake advertised no `model` config option, so the adapter cannot report the active model and model selection may be inert",
-    detail: `Advertised: ${ids.join(", ") || "none"}. omp accepts only mode|model|thinking; a renamed id is an upgrade cliff.`,
+    level: "info",
+    code: "omp_capabilities",
+    message: `${present.length}/${Object.keys(capabilities).length} probed surfaces present: ${present.join(", ") || "none"}`,
   };
-}
-
-/**
- * Report whether this omp build can serve the session snapshot. The snapshot
- * read uses ACP `session/list` with no host-wide fallback (by design — see
- * queryOmpSessions), so a build without that surface produces no card at all
- * and the environment test is the only place that can say why.
- */
-export function evaluateSessionListCheck(supportsSessionList: boolean): AdapterEnvironmentCheck {
-  return supportsSessionList
-    ? {
-        level: "info",
-        code: "omp_session_list_supported",
-        message: "ACP session/list available: the session snapshot stays scoped to this agent's workspace",
-      }
-    : {
-        level: "warn",
-        code: "omp_session_list_unsupported",
-        message: "this omp build does not advertise ACP session/list; the session snapshot work product will be skipped rather than widened to a host-wide listing",
-        detail: "Upgrade omp, or accept no session browser for this agent.",
-      };
 }
 
 export function evaluateOtlpCheck(env: Record<string, unknown>): AdapterEnvironmentCheck {
@@ -268,28 +252,42 @@ export async function testEnvironment(
 
   const spawnEnv = ompEnv({ config });
   const versionOut = await run(base[0], [...base.slice(1), "--version"], 10_000, spawnEnv);
-  checks.push(evaluateOmpVersionCheck(parseOmpVersion(versionOut), versionOut, bin));
+  const parsedVersion = parseOmpVersion(versionOut);
+  checks.push(evaluateOmpVersionCheck(parsedVersion, versionOut, bin));
 
-  // 4. ACP handshake + active model detection
-  const probe = await probeOmpAcpSession({ command: bin, args: acpArgs, env: spawnEnv });
-  if (probe.ok) {
+  // 4. What this build actually supports (one cached, bounded probe pass).
+  // The ACP handshake is part of it, so this replaces the separate probe and
+  // its one-per-test throwaway session is now paid once per (command, env).
+  const mode = resolveExecutionMode(config) ?? "engine";
+  const capabilities = await loadCapabilities({
+    acp: { command: bin, args: acpArgs, env: spawnEnv },
+    mode,
+    ...(mode === "managed" ? { worker: buildWorkerArgv(config, bridgePath) } : {}),
+    version: parsedVersion === null
+      ? null
+      : `${parsedVersion.major}.${parsedVersion.minor}.${parsedVersion.patch}`,
+    cacheDir: capabilityCacheDir(),
+  });
+  if (capabilities.acp.ok) {
     checks.push({
       level: "info",
       code: "acp_handshake_ok",
-      message: "ACP initialize+session/new OK",
-      detail: probe.currentModel ? `active model: ${probe.currentModel}` : undefined,
+      message: capabilities.acp.configOptionIds.length > 0
+        ? `ACP initialize+session/new OK (config options: ${capabilities.acp.configOptionIds.join(", ")})`
+        : "ACP initialize+session/new OK (no config options advertised)",
+      detail: capabilities.acp.currentModel ? `active model: ${capabilities.acp.currentModel}` : undefined,
     });
-    // Only a completed handshake can report the advertised capabilities.
-    checks.push(evaluateSessionListCheck(probe.supportsSessionList === true));
-    checks.push(evaluateConfigOptionCheck(probe));
+    checks.push(evaluateCapabilitySummaryCheck(capabilities.capabilities));
   } else {
+    // The handshake is the one hard capability: without it no run can start.
     checks.push({
       level: "error",
       code: "acp_handshake_failed",
       message: "ACP handshake failed",
-      detail: probe.error,
+      detail: capabilities.acp.error,
     });
   }
+  checks.push(...capabilityChecks(capabilities));
 
   // 5. billing env validation
   const env =

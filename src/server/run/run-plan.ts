@@ -29,10 +29,11 @@ import { materializeBudgetOverlay } from "../budget-overlay.js";
 import { materializeThinkingOverlay, requestedThinkingLevel } from "../thinking-overlay.js";
 import { mergePiConfigFiles, type OverlayEntry } from "./overlays.js";
 import { loadState, saveState, sessionIntelDir, type SessionIntelState } from "../session-state.js";
+import { buildOmpAcpConfig, bridgeArtifactError, configuredWarmHandleIdleMs, firstNonEmptyString, isGovernanceArmed, resolveBridgeRunMode, resolveOmpAgentCommand, resolveSessionCwd } from "../adapters/acp/launch.js";
 import {
-  buildOmpAcpConfig, bridgeArtifactError, configuredWarmHandleIdleMs, firstNonEmptyString,
-  isGovernanceArmed, resolveBridgeRunMode, resolveOmpAgentCommand, resolveSessionCwd,
-} from "../adapters/acp/launch.js";
+  capabilityCacheDir, capabilityDiagnostics, loadCapabilities, type CapabilityFeature,
+} from "../capabilities.js";
+import { buildWorkerArgv } from "../../host/worker.js";
 import {
   readSessionIntelConfig, resolveExecutionMode, resolveRunDirective, thinkingLevelChanged,
   validateCredentialMode, validateExecutionMode, validatePlanMode, validateSessionScope,
@@ -170,6 +171,99 @@ async function gateRunConfig(ctx: AdapterExecutionContext): Promise<RunRefusal |
   return null;
 }
 
+function ompBaseCommand(
+  config: Record<string, unknown>,
+  bridge: string,
+): { command: string; args: string[] } {
+  const tokens = resolveOmpAgentCommand(config, bridge).split(/\s+/);
+  // The resolved agent command may carry trailing flags (`--extension <path>`,
+  // the `off` thinking flag, or an operator's own). Locate `acp` by index so
+  // trailing tokens are never confused with the base command.
+  const acpIdx = tokens.indexOf("acp");
+  const base = acpIdx >= 0 ? tokens.slice(0, acpIdx) : tokens;
+  return { command: base[0], args: base.slice(1) };
+}
+
+/**
+ * The ACP-lane command with its `acp` sub-command and trailing flags — the
+ * shape the capability probe's ACP group drives (`<command> <args...>`).
+ */
+function ompAcpCommand(
+  config: Record<string, unknown>,
+  bridge: string,
+): { command: string; args: string[] } {
+  const tokens = resolveOmpAgentCommand(config, bridge).split(/\s+/);
+  return { command: tokens[0], args: tokens.slice(1) };
+}
+
+/** The capabilities THIS run leans on, given its lane and its config. */
+function runCapabilityFeatures(
+  ctx: AdapterExecutionContext,
+  input: { mode: "engine" | "managed"; intel: SessionIntelConfig; directive: RunDirective },
+): CapabilityFeature[] {
+  if (input.mode === "managed") {
+    // The supervisor always reads stats and always resets the subagent
+    // subscription; host tools only when Paperclip offered them.
+    return ctx.runtimeTools !== undefined
+      ? ["managedUsage", "managedSubagents", "managedHostTools"]
+      : ["managedUsage", "managedSubagents"];
+  }
+  const features: CapabilityFeature[] = [];
+  const policy = parseGovernancePolicy(ctx.config.governancePolicy);
+  if (input.intel.browser) features.push("sessionSnapshot");
+  if (input.directive.kind === "fork") features.push("sessionFork");
+  if (requestedThinkingLevel(ctx.config) !== "") features.push("thinkingLevel");
+  if (policy.kind === "ok" && policy.policy.budgetCapUsd !== undefined) features.push("budgetHardCap");
+  if (policy.kind === "ok" && (policy.policy.restrictedFolders?.length ?? 0) > 0) features.push("folderFence");
+  if (governancePolicyActive(ctx.config)) features.push("governanceExtensions");
+  return features;
+}
+
+/**
+ * Read the build's capability set for the features this run depends on and
+ * report the ones it lacks, naming the feature and what happens instead.
+ *
+ * The run path READS the cache and never probes: a heartbeat must not gain a
+ * probe process (the capability contract's cost rule), and the probe itself is
+ * owned by `testEnvironment`, which runs when the agent is validated. A cold
+ * cache therefore reports nothing here — the environment test is where the
+ * surfaces are discovered, and its result is what the runs read.
+ *
+ * Only a command literally named `omp` is consulted: a wrapper prints its own
+ * help/settings, so its surface probe would describe the wrapper. Nothing here
+ * can refuse a run.
+ */
+async function planCapabilities(
+  ctx: AdapterExecutionContext,
+  input: {
+    acp: { command: string; args: string[] };
+    env: Record<string, string>;
+    mode: "engine" | "managed";
+    bridge: string;
+    intel: SessionIntelConfig;
+    directive: RunDirective;
+  },
+): Promise<void> {
+  if (path.basename(input.acp.command) !== "omp") return;
+  const features = runCapabilityFeatures(ctx, input);
+  if (features.length === 0) return;
+  const capabilities = await loadCapabilities({
+    acp: { ...input.acp, env: input.env },
+    mode: input.mode,
+    ...(input.mode === "managed"
+      ? { worker: { ...buildWorkerArgv(ctx.config, input.bridge), env: input.env } }
+      : {}),
+    cacheDir: capabilityCacheDir(),
+    cacheOnly: true,
+  });
+  if (capabilities === null) return;
+  for (const diagnostic of capabilityDiagnostics(capabilities, features)) {
+    await ctx.onEvent?.({
+      eventType: "run.system", stream: "system", level: diagnostic.level, message: diagnostic.message,
+    });
+  }
+}
+
 /**
  * Resolve the model catalog the run shapes itself from. Resolvers are backed by
  * the cached `omp models ls` list (5-min TTL inside models.ts, keyed by
@@ -190,17 +284,12 @@ async function planModelCatalog(
       resolveCost: (model: string) => OmpModelCost | null;
     }
 > {
-  const ompTokens = resolveOmpAgentCommand(ctx.config, input.bridge).split(/\s+/);
-  // The resolved agent command may carry trailing flags (`--extension <path>`,
-  // the `off` thinking flag, or an operator's own). Locate `acp` by index so
-  // trailing tokens are never confused with the base command.
-  const acpIdx = ompTokens.indexOf("acp");
-  const base = acpIdx >= 0 ? ompTokens.slice(0, acpIdx) : ompTokens;
+  const base = ompBaseCommand(ctx.config, input.bridge);
   const providerSelectors = providerQualifiedSelectors(ctx.config);
   const models = firstNonEmptyString(ctx.config.model) || providerSelectors.length > 0
     ? await listOmpModels({
-        command: base[0],
-        args: [...base.slice(1), "models", "ls", "--json"],
+        command: base.command,
+        args: [...base.args, "models", "ls", "--json"],
         env: input.sideChannelEnv,
       })
     : [];
@@ -814,6 +903,14 @@ export async function buildRunPlan(
     sessionScope,
     scopeAgentDir: preparedScope.prepared.agentDir,
     intelDir,
+  });
+  await planCapabilities(ctx, {
+    acp: ompAcpCommand(ctx.config, deps.bridge),
+    env: sideChannelEnv,
+    mode: executionMode,
+    bridge: deps.bridge,
+    intel: session.intel,
+    directive: session.directive,
   });
   const applied = await applySessionDirective(ctx, {
     directive: session.directive,

@@ -45,8 +45,22 @@ rl.on("line", (line) => {
       protocolVersion: mode === "badversion" ? 99 : 1,
       agentInfo: { name: "fake-acp", title: "Fake", version: "0.0.1" },
       authMethods: [{ id: "agent", name: "agent" }],
-      agentCapabilities: mode === "nolist" ? {} : { sessionCapabilities: { list: {} } },
+      agentCapabilities: mode === "nolist"
+        ? {}
+        : { sessionCapabilities: mode === "nofork" ? { list: {} } : { list: {}, fork: {} } },
+      ...(mode === "nosteering" ? {} : { _meta: { steering: { supported: true } } }),
     } });
+  } else if (msg.method === "_session/steering") {
+    // Real omp: an unknown session id is invalid params, never work. `nosteering`
+    // removes the method entirely, which is JSON-RPC method-not-found.
+    if (mode === "nosteering") {
+      send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601,
+        message: 'Method not found: _session/steering' } });
+      return;
+    }
+    send({ jsonrpc: "2.0", id: msg.id, error: { code: -32602,
+      message: "Invalid params",
+      data: { method: "_session/steering", details: `unknown session: ${msg.params?.sessionId}` } } });
   } else if (msg.method === "session/list") {
     // ACP session/list: cwd-scoped when the client passes one, paged at 50 by
     // real omp (acp-agent.ts:897-911). `page2` returns a cursor so the caller
@@ -107,6 +121,7 @@ rl.on("line", (line) => {
         { id: "mode", name: "Mode", type: "select", currentValue: "default", options: [] },
         { id: "model", name: "Model", type: "select", currentValue: "prov/model-a",
           options: [{ value: "prov/model-a", name: "Model A" }] },
+        { id: "thinking", name: "Thinking", type: "select", currentValue: "auto", options: [] },
       ],
     } });
   } else if (typeof msg.method === "string" && msg.method.startsWith("_omp/")) {
@@ -132,6 +147,16 @@ rl.on("line", (line) => {
       send({ jsonrpc: "2.0", id: msg.id, result: { sessions: [
         { sessionId: "sess-a", cwd: msg.params?.cwd ?? "/w", title: "First",
           updatedAt: "2026-08-28T00:00:00Z", _meta: { messageCount: 3, size: 120 } },
+      ] } });
+    } else if (msg.method === "_omp/extensions") {
+      // Real omp lists what its module loader discovered; `noextensions` models
+      // a build that never grew the method (the unknown-ext fallback below).
+      if (mode === "noextensions") {
+        send({ jsonrpc: "2.0", id: msg.id, error: unknownExtMethod(msg.method) });
+        return;
+      }
+      send({ jsonrpc: "2.0", id: msg.id, result: { extensions: [
+        { path: "/opt/omp/extensions/paperclip-bridge.js", loaded: true },
       ] } });
     } else if (msg.method === "_omp/subagents") {
       // omp's ACP extMethod switch has no subagent bridge (only RPC mode

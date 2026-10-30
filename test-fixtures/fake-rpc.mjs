@@ -213,6 +213,13 @@ rl.on("line", (line) => {
   }
   log(frame);
   const id = frame.id;
+  // "norpc" models a build that answers the managed lane's requestable frames
+  // with the real unknown-command error, so the capability probe can classify
+  // them as absent rather than as present-but-refused.
+  if (mode === "norpc"
+    && (frame.type === "get_session_stats" || frame.type === "set_host_tools" || frame.type === "set_subagent_subscription")) {
+    return send({ id, type: "response", command: frame.type, success: false, error: `Unknown command: ${frame.type}` });
+  }
   switch (frame.type) {
     case "new_session":
       seq += 1;

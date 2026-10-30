@@ -249,14 +249,25 @@ ACP stdio transport.
   \`detectModel\` reads the configured \`modelRoles.default\` instead of opening a
   throwaway ACP session, and returns the same \`provider/id\` shape the catalog
   uses. Both use the default omp on PATH, not any agent's \`command\` override.
-- Tested against omp **18.13.x** (verified live on 18.13.1) and **18.14.x**
-  (source-audited against the 18.14.0 release, not executed on this host).
-  \`testEnvironment\` fails for a command named \`omp\` outside those minors,
-  and \`peerDependencies\` declares the same range
-  (\`@oh-my-pi/pi-coding-agent\`, optional so npm does not pull the CLI for
-  you). Wrapper commands report their own version, so they are reported as
-  unverified rather than failed. \`omp models ls --json\` is unversioned; the
-  catalog is parsed by field, so a missing or future \`schemaVersion\` is inert.
+- Compatibility is a probed capability set, not a version number. Tested
+  against omp **18.13.x** (verified live on 18.13.1) and **18.14.x**
+  (source-audited against the 18.14.0 release, not executed on this host), and
+  \`peerDependencies\` declares that range (\`@oh-my-pi/pi-coding-agent\`,
+  optional so npm does not pull the CLI for you). \`testEnvironment\` probes
+  what the build actually exposes — ACP \`session/list\`, \`session/fork\`,
+  \`_session/steering\`, \`_omp/extensions\`, the \`mode|model|thinking\` config
+  ids, the \`session.maxCost\` / \`tools.restrictedFolders\` /
+  \`defaultThinkingLevel\` settings keys, the \`models refresh\` /
+  \`session lease\` / \`gc\` verbs, and (managed lane only) the
+  \`get_session_stats\` / \`set_host_tools\` / \`set_subagent_subscription\`
+  worker frames — and names the feature each absent surface disables. A build
+  outside the tested minors is a **warning** that points at those checks; only
+  a different major is an error, because the ACP lane itself is not covered by
+  a capability probe. Wrapper commands report their own version, so they are
+  reported as unverified rather than failed. The probe is cached per command
+  and environment; the run path only reads that cache and never spawns a probe
+  of its own. \`omp models ls --json\` is unversioned; the catalog is parsed by
+  field, so a missing or future \`schemaVersion\` is inert.
 - A provider-qualified model selector (anything containing \`/\`) must be an
   exact catalog id, for \`model\` and every \`fallbackChain\` leg. omp 18.14
   resolves such a selector exactly: a near match fails instead of selecting a

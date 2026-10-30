@@ -313,12 +313,12 @@ export function parseOmpVersion(output: string): { major: number; minor: number;
  * 18.13.x (verified against the live 18.13.1 install) and 18.14.x
  * (source-audited against the 18.14.0 release, which changed
  * provider-qualified selector resolution — see resolveProviderQualifiedSelector).
- * The adapter compensates for engine behavior that moves between minors — the
- * session-key fingerprint, the permission-proxy coercion, `usage_update`'s
- * breakdown, `session/set_config_option`'s id set — so a minor outside this set
- * is untested rather than "probably fine". `testEnvironment` enforces this and
- * `package.json`'s peerDependencies pins the same range; the upgrade-contract
- * test keeps the two from drifting.
+ *
+ * This is a claim, not the gate. `testEnvironment` reports a minor outside the
+ * set as a WARNING that names these lines, and the capability probe (`../..
+ * capabilities.ts`) is what decides whether a run's surfaces exist; only a
+ * different major is an error. `package.json`'s peerDependencies declares the
+ * same range, and the upgrade-contract test keeps the two from drifting.
  */
 export const TESTED_OMP_MINORS = [
   { major: 18, minor: 13 },
