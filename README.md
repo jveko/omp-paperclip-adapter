@@ -52,29 +52,31 @@ Hot-registers — no service restart needed (`requiresRestart` only on reinstall
 | `mode` | `persistent` | `persistent` \| `oneshot` |
 | `permissionMode` | `approve-all` | `approve-reads` / `deny-all` to tighten |
 | `nonInteractivePermissions` | `deny` | fail-closed headless turns |
-| `warmHandleIdleMs` | `0` | > 0 keeps a warm ACP process between heartbeats |
-| `timeoutSec` / `graceSec` | `0` / `20` | run timeout / SIGTERM grace |
+| `warmHandleIdleMs` | `0` | pinned to `0` for every run: a reused child keeps the spawning run's `PAPERCLIP_API_KEY`, so a warm hit would act as an earlier run. An operator value > 0 is dropped with a run warning |
+| `timeoutSec` / `graceSec` | `0` / `15` | run timeout / SIGTERM grace (the engine default; the adapter forwards an explicit value) |
 | `stateDir`, `instructionsFilePath`, `cwd`, `env` | unset | passed through to the engine |
+| `sessionScope` | `"shared"` | `shared` = omp's host agent dir (every employee on the host shares sessions). `isolated` requires `credentialMode: broker`, fences the agent dir per employee, and fails fast otherwise |
 
 Permissions are owned by these engine knobs — the adapter never passes `--auto-approve`.
 
 ## Cost transparency
 
 Cost originates from the model's rate card (`omp models ls --json`), parsed into
-`OmpModelInfo.cost` (input, output, cacheRead, cacheWrite in USD per token) and
-the `priced` boolean. The Paperclip engine accumulates cost as cumulative USD
-through `usage_update` heartbeats; the adapter never computes cost itself.
+`OmpModelInfo.cost` (**USD per 1M tokens**: input, output, cacheRead, cacheWrite).
+The engine accumulates cost through `usage_update` heartbeats; the adapter maps
+omp's own `pricingStatus` onto the receipt instead of guessing from a zero card:
 
-**Three-way `priced` distinction:**
-
-| `priced` | `cost` | Interpretation |
+| omp `pricingStatus` | `costStatus` | `pricingProvenance` |
 |---|---|---|
-| `true` | nonzero card | Real cost — server reports `costStatus: "reported"` |
-| `false` | all-zero `{input:0, output:0, cacheRead:0, cacheWrite:0}` | Declared-free model |
-| `false` | undefined | Unpriced / unknown — no rate card available |
+| `fixed`, `variable` | `estimated` | `rate_card` |
+| `free` | `estimated` (zero card) | `rate_card` |
+| `included` | `reported` (zero; operator's `billingType` stands) | `operator` |
+| `unknown` | `unpriced` | `unknown` |
 
-Models with cache-only costs (nonzero `cacheRead`/`cacheWrite` but zero
-`input`/`output`) are correctly flagged `priced: true`.
+`usageByModel` carries one entry only when the run used a single model; with a
+fallback chain configured, the aggregate is reported without a per-model receipt
+and the run says why. `budgetCapUsd` in `governancePolicy` is forwarded to omp as
+`session.maxCost` (hard stop) plus an adapter-derived `session.warnCost` at 80%.
 
 **Billing identity** is reported as `billingType: "api"` by default. Override
 per agent via `OMP_PAPERCLIP_BILLING_TYPE` in the `env` map:
@@ -89,7 +91,7 @@ Unknown values fall back to `"api"`; the environment check flags unknown `OMP_PA
 
 ```sh
 npm install
-npm test          # vitest unit suite (25 tests)
+npm test          # vitest unit suite
 npm run build     # tsc + self-contained ui-parser bundle
 npm run typecheck
 ```

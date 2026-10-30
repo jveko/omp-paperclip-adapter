@@ -12,9 +12,10 @@ machines.
 - **RPC lane (v1.0)** — `omp --mode rpc` for the surfaces ACP cannot carry: subagent
   control, host tools, live steering, side questions. Same employee, second transport.
 
-**Priority order is now correctness → containment → spend truth → fleet → org runtime.**
-v0.4–v0.8 shipped several features that cannot execute (no run token, wrong SQL) and one
-that can leak between tenants (shared `~/.omp`). Those outrank every new capability.
+**Priority order: correctness → containment → spend truth → fleet → org runtime.**
+v0.9 repaired the features that could not execute (no run token, wrong SQL) and fenced the data that
+could cross tenant lines (shared `~/.omp`). v0.10 is next, limited to work whose lever exists in the
+current engine.
 
 ---
 
@@ -46,10 +47,12 @@ where each one moved and why.
 
 ---
 
-## P0 — v0.9 "Correctness & containment"
+## P0 — v0.9 "Correctness & containment" — **shipped in 0.9.0 (2026-10-30)**
 
-Everything here is adapter-local unless marked. Ordered by dependency, not by size.
-**Rule for this release: no new capability until every item below is true.**
+Items 17–23 below are done; `CHANGELOG.md` carries the release notes and the honest limits. The
+detail is kept as the record of what shipped, with one correction: items 17 and 18 landed in the
+order shown, and item 18's fence is `sessionScope` (`shared` by default, `isolated` broker-only),
+not an unconditional per-agent dir.
 
 ### 17. Run identity and control-plane delivery
 
@@ -276,6 +279,15 @@ covered by tests.
 *Historical entries are preserved as written. Where an entry states a blocker that the
 2026-10-30 assessment resolved (for example the "resume fingerprint instability"), the
 assessment above supersedes it.*
+
+- **2026-10-30 — v0.9.0 (Correctness & containment).** Items 17–23 shipped in four sequential lanes
+  (26 commits, 588 tests): run identity (`supportsLocalAgentJwt`, `native_mcp` delivery, instructions
+  bundle) with the warm-handle pin; the session fence (`sessionScope`, cwd-scoped ACP `session/list`,
+  counts-only diagnostic); the repair pass (plugin SQL, catalog refresh, read-only `detectModel`,
+  bounded work-product POSTs, dead `_omp/subagents` probe removed); cost truth from `pricingStatus`
+  plus `session.maxCost`/`warnCost`; the per-session lease, fork cwd and restore-model classifier;
+  governance fail-closed on a missing bridge artifact with bridge-enforced `restrictedFolders`; and
+  the upgrade contract (tested omp minor enforced, `adapter-utils` pinned). Limits in `CHANGELOG.md`.
 
 - **2026-09-03 — v0.8.0 (Governance & control).** Guardrail `tool_call` engine (path/bash/deny/revise,
   control-tool-allowlist, mtime re-read) via the paperclip bridge as the sole deny point

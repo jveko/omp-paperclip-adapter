@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.9.0 — 2026-10-30
+
+Correctness & containment. The features v0.4–v0.8 shipped but could not execute now do, and the
+data that could cross tenant lines is fenced. Adapter-local; no upstream change required.
+
+- **Run identity** — `supportsLocalAgentJwt`, `runtimeToolDelivery: "native_mcp"`,
+  `supportsInstructionsBundle` + `instructionsPathKey`. Paperclip now mints the run token, the engine
+  injects `PAPERCLIP_API_KEY`, and the session-snapshot/usage work products and the bridge's approval
+  round-trip work instead of failing closed. The declared delivery channel is read: a run that offers
+  connection tools without an MCP server carrying them emits one fail-soft warning. Warm-handle reuse
+  is pinned to `0` for every run (a reused child keeps the spawning run's token, which would
+  authenticate later work as an earlier run); an operator opt-in is dropped with a warning.
+- **Tenancy fence** — the session snapshot is now one cwd-scoped ACP `session/list`; `_omp/*` is
+  demoted to a counts-only diagnostic with no ids, cwds or titles. `sessionScope: "shared" |
+  "isolated"` (default `shared`) fences the whole omp agent dir per employee; `isolated` requires
+  `credentialMode: broker` and fails fast otherwise. Scope flips warn once instead of silently
+  cold-starting, and the shared-scope posture is reported by `testEnvironment`.
+- **Repair pass** — session-panel SQL now matches the real schema (`finished_at`,
+  `heartbeat_run_id`, numeric cost) with a schema-derived fixture; `refreshModels` actually runs
+  `omp models refresh` and returns rate cards; `detectModel` reads config instead of persisting a
+  probe session and returns `provider/id`; work-product POSTs are gated on a real issue and bounded;
+  the dead `_omp/subagents` probe is gone.
+- **Cost truth** — omp's `pricingStatus` drives `costStatus`/`pricingProvenance` (`unknown` is
+  `unpriced`, never free; declared-free is an estimate over a zero card; `included` is a
+  reported zero with operator provenance). `usageByModel` is emitted only for single-model runs and
+  omitted with an explanation when a fallback chain is configured.
+- **Spend that stops** — `governancePolicy.budgetCapUsd` is forwarded as omp's `session.maxCost`
+  (hard stop, subagents included) plus an adapter-derived `session.warnCost` at 80%, through a
+  settings overlay so changing the number does not rotate the session. The bridge's soft cap stays
+  the earlier signal.
+- **Session correctness** — a per-`sessionKey` lease (atomic claim, owner-checked release, TTL
+  reclaim) covers `execute()`, so two overlapping heartbeats cannot fork one session file silently;
+  `session/fork` passes the source session's recorded cwd; `Could not restore model` rotates to a
+  fresh session instead of stranding the employee. Context pressure stays unimplemented: the engine
+  does not expose `used`/`size` on the adapter result, and parsing run logs is not a contract.
+- **Governance integrity** — a materialized policy now fails the run when the bridge artifact is
+  missing or unreadable (`omp_governance_unavailable`); `governancePolicy.restrictedFolders` is
+  written to omp and enforced by the bridge (the omp prompt alone is auto-allowed on this lane);
+  `deny-all` plus a policy that presumes a gated tool runs is rejected at config time.
+- **Upgrade contract** — the tested omp minor is enforced by `testEnvironment`, `adapter-utils` is
+  pinned to the tested build, and `omp models --json` is parsed by field rather than position.
+
+Honest limits: no provider quota cards (`getQuotaWindows` takes no agent config, so it could only
+report the host's login); no plan mode (no elicitation client on this lane, so approval would be
+silently auto-granted); no stdio MCP; the `isolated` scope does not carry `models.yml`/`secrets.yml`;
+retention is an operator command (`omp gc --agent-dir …`), not an adapter schedule; nothing here was
+verified against a live Paperclip instance — the end-to-end smoke uses a stubbed engine.
+
 ## 0.8.0 — 2026-09-03
 
 Governance & control: the omp employee runs *under policy*. Builds on the v0.7 bridge into a
