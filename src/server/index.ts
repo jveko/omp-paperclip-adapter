@@ -1,9 +1,9 @@
 import type { ServerAdapterModule } from "@paperclipai/adapter-utils";
 import { sessionCodec } from "@paperclipai/adapter-utils/acpx-engine/session-codec";
 import { execute } from "./execute.js";
-import { listOmpModels } from "./models.js";
+import { detectOmpConfiguredModel, refreshOmpModelCatalog, type OmpModelCost } from "./models.js";
 import { listOmpSkillsSnapshot, syncOmpSkills } from "./skills.js";
-import { probeOmpAcpSession, resolveOmpAgentCommand, RUN_IDENTITY_ENABLED } from "./acp.js";
+import { RUN_IDENTITY_ENABLED } from "./acp.js";
 import { testEnvironment } from "./test.js";
 import { agentConfigurationDoc, type } from "../index.js";
 import { getSessionConfigSchema } from "./session-directives.js";
@@ -16,34 +16,40 @@ interface DetectedOmpModel {
   source: string;
 }
 
+/**
+ * The installed adapter-utils `AdapterModel` declares only id/label; contract
+ * HEAD's model consumers read the rate card and context window, and the
+ * registry hands this array to the board verbatim. Re-declaring the extras here
+ * is the one place the dependency skew is recorded (same pattern as
+ * `runtimeToolDelivery` below).
+ */
+interface OmpAdapterModel {
+  id: string;
+  label: string;
+  contextWindow?: number;
+  cost?: OmpModelCost;
+}
+
 let detectCache: { at: number; value: Promise<DetectedOmpModel | null> } | null = null;
 const DETECT_TTL_MS = 60_000;
 
-async function refreshModels() {
-  const models = await listOmpModels({ force: true });
-  return models.map((m) => ({ id: m.id, label: m.label }));
+async function refreshModels(): Promise<OmpAdapterModel[]> {
+  const models = await refreshOmpModelCatalog();
+  return models.map((m) => ({
+    id: m.id,
+    label: m.label,
+    ...(m.contextWindow !== undefined ? { contextWindow: m.contextWindow } : {}),
+    ...(m.cost !== undefined ? { cost: m.cost } : {}),
+  }));
 }
 
 async function detectModel(): Promise<DetectedOmpModel | null> {
   const cached = detectCache;
   if (cached && Date.now() - cached.at < DETECT_TTL_MS) return cached.value;
-  // Single-flight: overlapping callers share one in-flight probe.
-  const value = detectOmpModelProbe();
+  // Single-flight: overlapping callers share one in-flight read.
+  const value = detectOmpConfiguredModel();
   detectCache = { at: Date.now(), value };
   return value;
-}
-
-async function detectOmpModelProbe() {
-  const tokens = resolveOmpAgentCommand({}).split(/\s+/);
-  const probe = await probeOmpAcpSession({ command: tokens[0], args: tokens.slice(1) });
-  if (!probe.ok || !probe.currentModel) return null;
-  const slash = probe.currentModel.indexOf("/");
-  if (slash < 0) return null;
-  return {
-    model: probe.currentModel.slice(slash + 1),
-    provider: probe.currentModel.slice(0, slash),
-    source: "acp-session",
-  };
 }
 
 /**
