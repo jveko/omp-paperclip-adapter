@@ -101,6 +101,14 @@ rl.on("line", (line) => {
       sessionFile = `/tmp/fake-session-new-${seq}.json`;
       return succeed(id, "new_session", { cancelled: false });
     case "open_session":
+      if (mode === "freshopen") {
+        // What omp does on an empty session dir: a fresh session, not a resume.
+        sessionId = "sess-fresh-1";
+        sessionFile = "/tmp/fake-session-fresh-1.json";
+        return succeed(id, "open_session", {
+          cancelled: false, resumed: false, sessionId, sessionFile,
+        });
+      }
       if (mode === "openfail") {
         // What omp does when the stored session cannot be resumed in this cwd.
         return succeed(id, "open_session", { cancelled: true, resumed: false, sessionId });

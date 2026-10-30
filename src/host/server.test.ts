@@ -415,6 +415,36 @@ describe("supervisor", () => {
     }
   }, 20_000);
 
+  it("adopts and warns when a named session cannot be resumed", async () => {
+    const running = await start();
+    const client = await connectClient(running.socketPath);
+    try {
+      client.send(beginFrame({
+        runId: "run-fresh", sessionKey: "sk-fresh",
+        worker: {
+          command: process.execPath,
+          args: [fixture],
+          env: { FAKE_RPC_MODE: "freshopen" },
+        },
+        session: { ompSessionId: "sess-stored" },
+      }));
+      const settled = await client.waitFor(
+        (frame) => frame.type === "run.settled" && frame.runId === "run-fresh",
+      );
+      if (settled.type !== "run.settled") throw new Error("unreachable");
+      // A named session in a fresh directory is a new session, not a failure.
+      expect(settled.result.exitCode).toBe(0);
+      expect(settled.result.sessionParams?.acpSessionId).toBe("sess-fresh-1");
+      expect(client.frames.some(
+        (frame) => frame.type === "run.event" && frame.kind === "run.system"
+          && frame.payload.level === "warn"
+          && String(frame.payload.message).includes("could not be resumed"),
+      )).toBe(true);
+    } finally {
+      client.close();
+    }
+  }, 20_000);
+
   it("spawns a second worker for another cwd and leaves the first warm", async () => {
     const a = path.join(root, "work-a");
     const b = path.join(root, "work-b");

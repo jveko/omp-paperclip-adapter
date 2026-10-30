@@ -796,8 +796,18 @@ class Supervisor {
           if (fresh.cancelled) throw new Error("omp refused to open or create a session for this run");
           sessionId = "";
         } else {
+          const namedBeforeOpen = begin.session.ompSessionId;
           sessionId = opened.sessionId;
           run.sessionFile = opened.sessionFile ?? null;
+          // A named session that could not be resumed (fresh directory, moved
+          // workspace) is adopted as a new one, but never silently: the operator
+          // is looking for that transcript, and the adapter records the new id.
+          if (opened.resumed === false && namedBeforeOpen !== null && namedBeforeOpen !== "") {
+            this.emitEvent(run, "run.system", {
+              level: "warn",
+              message: `stored omp session ${namedBeforeOpen} could not be resumed in this session directory; this run started ${sessionId || "a new session"}`,
+            });
+          }
           // The worker resumes by session DIRECTORY (omp picks the newest
           // session there), so a stored id and the opened id may legitimately
           // differ (rotation, adoption) — the opened id is then the truth and is
