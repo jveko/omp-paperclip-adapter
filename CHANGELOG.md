@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.14.1 — 2026-10-30
+
+Install fix for 0.14.0. `@paperclipai/adapter-utils@2026.1023.0` carries a nested `esbuild@0.28.2`
+while the root devDependency was `0.25.12`; npm 11 links a single `@esbuild/linux-x64`, so the nested
+postinstall validated the 0.25.12 binary and aborted (`Expected "0.28.2" but got "0.25.12"`). A fresh
+`npm ci` failed deterministically, which 0.14.0's own release did not catch because master and the
+lane worktree had different install states.
+
+The devDependency is now `^0.28.2`, one version for the tree. Verified from a clean clone:
+`npm ci` → typecheck → 813 tests → 9 conformance tests.
+
 ## 0.14.0 — 2026-10-30
 
 The engine pin moves, the pin workarounds die, and version gates become capability probes.
