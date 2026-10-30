@@ -28,9 +28,10 @@ import {
   normalizeOmpModelId,
   type OmpModelCost,
 } from "./models.js";
+import { attributeRunCost, type RunCostFields } from "./cost-truth.js";
 import { buildSkillsInstructions, skillsDir, type SkillMarkdownSource } from "./skills.js";
 import { readRetryConfig, runWithFreshSessionRetry, withRetryChain } from "./retry.js";
-import { materializeFailoverOverlay } from "./failover-config.js";
+import { materializeFailoverOverlay, parseFallbackChain } from "./failover-config.js";
 import { ompEnv } from "./omp-env.js";
 import { prepareSessionScope } from "./session-scope.js";
 import { forkOmpSession, queryOmpSessions } from "./session-intel.js";
@@ -1055,6 +1056,27 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     const resultJson = Object.keys(sessionRuntime).length > 0
       ? { ...(result.resultJson ?? {}), sessionRuntime }
       : result.resultJson;
-    return withRetryChain(resultJson ? { ...result, resultJson } : result, chain);
+    // Cost truth: omp's catalog status decides whether the reported amount is
+    // an estimate, a declared zero, or unpriced. `result.model` is the model
+    // the engine asked for; the configured (normalized) value is the same in
+    // practice and the fallback keeps a receipt when the engine omits it.
+    const attributedModel = result.model ?? (rawModel ? (resolveModel(rawModel) ?? rawModel) : null);
+    const attribution = attributeRunCost({
+      pricingStatus: models.find((m) => m.id === attributedModel)?.pricingStatus ?? null,
+      costUsd: result.costUsd,
+      usage: result.usage,
+      model: attributedModel,
+      failoverConfigured: parseFallbackChain(ctx.config).length > 0,
+    });
+    for (const warning of attribution.warnings) {
+      await ctx.onEvent?.({ eventType: "run.system", stream: "system", level: "info", message: warning });
+    }
+    // `costUsd` is the one field the result already declares (nullable there),
+    // so only the added accounting fields ride the intersection.
+    const final: AdapterExecutionResult & Omit<RunCostFields, "costUsd"> = {
+      ...withRetryChain(resultJson ? { ...result, resultJson } : result, chain),
+      ...attribution.fields,
+    };
+    return final;
   };
 }

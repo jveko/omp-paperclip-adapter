@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
+import type * as FailoverConfigModule from "./failover-config.js";
 import { createOmpAcpExecutor } from "./acp.js";
 import { materializeFailoverOverlay } from "./failover-config.js";
 
@@ -9,10 +10,12 @@ const engineMocks = vi.hoisted(() => ({ createAcpxEngineExecutor: vi.fn() }));
 vi.mock("@paperclipai/adapter-utils/acpx-engine/execute", () => ({
   createAcpxEngineExecutor: engineMocks.createAcpxEngineExecutor,
 }));
-vi.mock("./failover-config.js", () => ({
-  FAILOVER_CONFIG_FILE: "omp-failover-config.yml",
-  materializeFailoverOverlay: vi.fn(),
-}));
+vi.mock("./failover-config.js", async (importOriginal) => {
+  // Vitest types `importOriginal` as returning `unknown`; the module namespace
+  // is the one this file imported above.
+  const actual = (await importOriginal()) as typeof FailoverConfigModule;
+  return { ...actual, materializeFailoverOverlay: vi.fn() };
+});
 
 function ctxWith(onEvent: (e: unknown) => Promise<void>): AdapterExecutionContext {
   return {

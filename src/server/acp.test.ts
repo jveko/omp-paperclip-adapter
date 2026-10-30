@@ -1125,6 +1125,55 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     expect(executorFn).toHaveBeenCalledOnce();
   });
 
+  it("reports a run on a model omp cannot price as unpriced, never as free", async () => {
+    modelsMocks.listOmpModels.mockImplementation(async () => [
+      { id: "prov/m", label: "M", pricingStatus: "unknown" },
+    ]);
+    fakeEngine({
+      exitCode: 0, model: "prov/m", costUsd: 0,
+      usage: { inputTokens: 10, outputTokens: 5 }, usageBasis: "per_run",
+      sessionParams: { acpSessionId: "s", sessionKey: "sk" },
+    });
+    const out = await createOmpAcpExecutor()(baseCtx({ config: { command: "omp", model: "prov/m" } }));
+    expect(out).toMatchObject({
+      costStatus: "unpriced",
+      pricingProvenance: { source: "unknown", evidence: "omp models pricingStatus=unknown" },
+    });
+    expect((out as { usageByModel?: unknown }).usageByModel).toBeUndefined();
+  });
+
+  it("carries a declared-free model as a zero estimate with a per-model receipt", async () => {
+    modelsMocks.listOmpModels.mockImplementation(async () => [
+      { id: "prov/m", label: "M", pricingStatus: "free" },
+    ]);
+    fakeEngine({
+      exitCode: 0, model: "prov/m", costUsd: null,
+      usage: { inputTokens: 10, outputTokens: 5 }, usageBasis: "per_run",
+      sessionParams: { acpSessionId: "s", sessionKey: "sk" },
+    });
+    const out = await createOmpAcpExecutor()(baseCtx({ config: { command: "omp", model: "prov/m" } }));
+    expect(out).toMatchObject({
+      costUsd: 0, costStatus: "estimated",
+      pricingProvenance: { source: "rate_card", evidence: "omp models pricingStatus=free" },
+      usageByModel: [{ model: "prov/m", costUsd: 0 }],
+    });
+  });
+
+  it("refuses to name a billed model when a fallback chain could have switched", async () => {
+    fakeEngine({
+      exitCode: 0, model: "prov/m", costUsd: 0.5,
+      usage: { inputTokens: 10, outputTokens: 5 }, usageBasis: "per_run",
+      sessionParams: { acpSessionId: "s", sessionKey: "sk" },
+    });
+    const events: Array<{ level?: string; message?: string }> = [];
+    const out = await createOmpAcpExecutor()(baseCtx({
+      config: { command: "omp", model: "prov/m", fallbackChain: "prov/backup" },
+      onEvent: async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); },
+    }));
+    expect((out as { usageByModel?: unknown }).usageByModel).toBeUndefined();
+    expect(events.some((e) => /cannot be attributed/.test(e.message ?? ""))).toBe(true);
+  });
+
 });
 describe("resolveOmpAgentCommand", () => {
   it("defaults to 'omp acp'", () => {
