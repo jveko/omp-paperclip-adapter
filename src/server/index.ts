@@ -46,7 +46,21 @@ async function detectOmpModelProbe() {
   };
 }
 
-export function createServerAdapter(): ServerAdapterModule {
+/**
+ * Delivery channel for Paperclip's run-scoped control tools.
+ *
+ * Paperclip contract HEAD declares `runtimeToolDelivery` on
+ * `ServerAdapterModule` (adapter-utils types.ts:519) and the heartbeat path
+ * reads it untyped (`adapter.runtimeToolDelivery ?? "invocation_context"`,
+ * runtime-execution.ts:775-777), but the pinned 2026.824.1 declaration does not
+ * carry the member. Re-declaring it here keeps the value checked without
+ * bumping the dependency; this type is the one place the skew is recorded.
+ */
+export type OmpRuntimeToolDelivery = "native_mcp" | "environment" | "invocation_context";
+export type OmpServerAdapterModule =
+  ServerAdapterModule & { runtimeToolDelivery?: OmpRuntimeToolDelivery };
+
+export function createServerAdapter(): OmpServerAdapterModule {
   return {
     type,
     models: [],
@@ -56,6 +70,24 @@ export function createServerAdapter(): ServerAdapterModule {
     // Governance surface for the board's per-agent config form; every field is
     // a next-run directive (the adapter owns no live connection).
     getConfigSchema: () => getSessionConfigSchema(),
+    // Run identity: Paperclip mints the per-run JWT only for adapters that
+    // declare this (runtime-execution.ts:249-260), and the engine turns the
+    // token into PAPERCLIP_API_KEY in the run child (acpx-engine
+    // execute.js:2098). That key is the single source for the session-snapshot
+    // and usage work products and for the bridge's approval round-trip; a
+    // missing token keeps failing closed with the existing explicit errors.
+    // Blast radius (company-scoped API access for the run) is stated in
+    // agentConfigurationDoc.
+    supportsLocalAgentJwt: true,
+    // omp consumes ACP `mcpServers` on session/new|load|resume|fork, so the
+    // Paperclip connections/project servers must be delivered there.
+    // `invocation_context` would hand this adapter a token it cannot serve.
+    runtimeToolDelivery: "native_mcp",
+    // Managed AGENTS.md bundle: the engine renders instructionsFilePath into the
+    // run prompt, and the ephemeral skills file merges the same path, so the
+    // bundle composes with skills-as-tools instead of replacing it.
+    supportsInstructionsBundle: true,
+    instructionsPathKey: "instructionsFilePath",
     // Static capability declaration consumed by the Paperclip control plane.
     // Without it omp_local resolves to a compaction-DISABLED default. Threshold
     // enforcement server-side is not relied upon — the adapter rotates via its

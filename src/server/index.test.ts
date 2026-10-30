@@ -25,6 +25,21 @@ describe("createServerAdapter", () => {
     expect(schema.fields.map((f) => f.key)).toContain("sessionForkToken");
   });
 
+  it("declares the run identity and control-plane capabilities", () => {
+    // Without these Paperclip mints no run token (so PAPERCLIP_API_KEY never
+    // reaches the child, killing work products and the approval round-trip),
+    // delivers connection tools through a channel the adapter cannot serve, and
+    // never resolves a managed instructions bundle.
+    expect(mod.supportsLocalAgentJwt).toBe(true);
+    // Ahead of the installed adapter-utils declaration (see the type comment in
+    // ./index.ts); the server reads the member untyped.
+    expect(mod.runtimeToolDelivery).toBe("native_mcp");
+    expect(mod.supportsInstructionsBundle).toBe(true);
+    // The engine renders this key into the run prompt (execute.js:3118-3139),
+    // and the ephemeral skills file merges the same path.
+    expect(mod.instructionsPathKey).toBe("instructionsFilePath");
+  });
+
   it("declares session management capability with compaction defaults", () => {
     expect(mod.sessionManagement).toEqual({
       supportsSessionResume: true,
