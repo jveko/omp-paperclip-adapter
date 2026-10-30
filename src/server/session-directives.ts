@@ -2,6 +2,8 @@ import type { AdapterConfigSchema } from "@paperclipai/adapter-utils";
 
 export interface SessionIntelConfig {
   browser: boolean;
+  /** Ask omp for the host-wide `_omp/*` listing and report counts only. */
+  diagnostic: boolean;
   forkSourceId: string;
   forkToken: string;
   forceFreshToken: string;
@@ -24,6 +26,7 @@ function num(config: Record<string, unknown>, key: string): number {
 export function readSessionIntelConfig(config: Record<string, unknown>): SessionIntelConfig {
   return {
     browser: config.sessionBrowser !== false && config.sessionBrowser !== "false",
+    diagnostic: config.sessionSnapshotDiagnostic === true || config.sessionSnapshotDiagnostic === "true",
     forkSourceId: str(config, "sessionForkSourceId"),
     forkToken: str(config, "sessionForkToken"),
     forceFreshToken: str(config, "sessionForceFreshToken"),
@@ -31,6 +34,46 @@ export function readSessionIntelConfig(config: Record<string, unknown>): Session
     maxAgeHours: num(config, "sessionMaxAgeHours"),
     usageReport: config.usageReport !== false && config.usageReport !== "false",
   };
+}
+
+/**
+ * Where a run's omp state lives.
+ *
+ * `shared` is the historical behavior: the run resolves the host's single omp
+ * agent dir (`~/.omp/agent`), so every employee on the host shares sessions,
+ * titles, caches, config and credentials, and omp's global listing can see
+ * them all.
+ *
+ * `isolated` resolves `PI_CODING_AGENT_DIR` to this agent's own dir, which is
+ * the only knob that scopes omp's reads — `_omp/sessions/listAll`,
+ * `_omp/projects/list`, ACP `session/list` and the load-by-id fallback all
+ * resolve through `getSessionsDir()` under the agent dir
+ * (acp-agent.ts:1421,1429,2644-2647,2664; session-manager.ts:4525;
+ * session-listing.ts:660), while `--session-dir` scopes writes only. That dir
+ * also holds `agent.db` (credential store) and `config.yml`, so an isolated run
+ * must get credentials out of band: it requires `credentialMode: broker`.
+ */
+export type SessionScope = "shared" | "isolated";
+
+export function resolveSessionScope(config: Record<string, unknown>): SessionScope {
+  return config.sessionScope === "isolated" ? "isolated" : "shared";
+}
+
+/**
+ * Actionable message when `sessionScope` is invalid or cannot work, else null.
+ * Mirrors validateCredentialMode: the caller returns before any engine work, so
+ * a misconfigured fence can never silently fall back to the shared agent dir.
+ */
+export function validateSessionScope(config: Record<string, unknown>): string | null {
+  const raw = config.sessionScope;
+  if (raw !== undefined && raw !== null && raw !== "" && raw !== "shared" && raw !== "isolated") {
+    // A typo would otherwise mean "shared", silently disabling containment.
+    return `sessionScope is '${String(raw)}' but expected 'shared' or 'isolated'.`;
+  }
+  if (raw === "isolated" && config.credentialMode !== "broker") {
+    return "sessionScope is 'isolated' but credentialMode is not 'broker': the isolated scope points omp at this agent's own agent dir, which holds no credential store (agent.db) and no operator config, so a local-login run would start with no credentials. Set credentialMode to 'broker' with OMP_AUTH_BROKER_URL and OMP_AUTH_BROKER_TOKEN, or keep sessionScope 'shared'.";
+  }
+  return null;
 }
 
 export type RunDirective =
@@ -93,8 +136,16 @@ const NEXT_RUN = "Takes effect on the next run (the adapter has no live connecti
 export function getSessionConfigSchema(): AdapterConfigSchema {
   return {
     fields: [
+      { key: "sessionScope", label: "Session data scope", type: "select", default: "shared",
+        options: [
+          { label: "Shared with every omp agent on this host", value: "shared" },
+          { label: "Isolated per employee (requires broker credentials)", value: "isolated" },
+        ],
+        hint: `shared = the host's one omp agent dir (~/.omp/agent): every employee shares sessions, titles, caches and credentials. isolated = this agent's own omp agent dir under the Paperclip instance, so sessions, titles and caches are private to it; it requires credentialMode 'broker' because the private dir has no credential store. Switching shared→isolated starts an empty dir and the employee's previous session is not resumed (the run warns once; the old transcript stays where it was). ${NEXT_RUN}` },
       { key: "sessionBrowser", label: "Session browser", type: "toggle", default: true,
         hint: `Emit a session-snapshot work product when the session landscape changes. ${NEXT_RUN}` },
+      { key: "sessionSnapshotDiagnostic", label: "Host-wide session listing (diagnostic)", type: "toggle", default: false,
+        hint: `Also query omp's host-wide _omp/* listing and log how many sessions and projects it sees. Counts only: ids, cwds and titles never leave the host, but the count itself is host-wide information about every omp employee. ${NEXT_RUN}` },
       { key: "sessionForceFreshToken", label: "Force fresh session (token)", type: "text",
         hint: `Set/change to start a brand-new ACP session. ${NEXT_RUN}` },
       { key: "sessionForkSourceId", label: "Fork source session id", type: "text",
@@ -178,16 +229,22 @@ export function buildSessionSnapshotWorkProduct(
       return `${shortId(s.sessionId)} — ${s.title ?? "untitled"} — ${s.messageCount ?? "?"} msgs — ${age}`;
     }),
   ];
+  const count = snapshot.total === null
+    ? `${snapshot.sessions.length}+`
+    : String(snapshot.sessions.length);
   return {
     type: "artifact",
     provider: "omp-session",
-    title: `Session snapshot — ${snapshot.sessions.length} sessions, current ${context.currentSessionId ? shortId(context.currentSessionId) : "none"}`,
+    // Scope is part of the title: a reader must never mistake this card for a
+    // host-wide listing (only the operator diagnostic can look host-wide, and
+    // it publishes counts only).
+    title: `Session snapshot — ${count} sessions in this workspace, current ${context.currentSessionId ? shortId(context.currentSessionId) : "none"}`,
     summary: lines.join("\n"),
     metadata: {
       projects: snapshot.projects,
       sessions: snapshot.sessions,
       total: snapshot.total,
-      byCwd: snapshot.byCwd,
+      truncated: snapshot.truncated,
       // Omitted, not empty, when omp's ACP mode has no subagent surface, so a
       // card from an older/newer omp is byte-identical to one from before the
       // field existed.
@@ -223,7 +280,6 @@ export function sessionSnapshotDigestInput(
     ]),
   };
 }
-
 export function paperclipApiBase(env: NodeJS.ProcessEnv = process.env): string {
   const explicit = env.PAPERCLIP_API_URL ?? env.PAPERCLIP_RUNTIME_API_URL;
   if (explicit) return explicit.replace(/\/+$/, "").replace(/\/api$/, "");

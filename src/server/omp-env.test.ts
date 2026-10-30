@@ -28,4 +28,12 @@ describe("ompEnv", () => {
     expect(ompEnv({ config: { env: { PI_CONFIG_FILES: "/op/x.yml" } }, overlayPath: "/ov/y.yml" }))
       .toEqual({ PI_CONFIG_FILES: "/op/x.yml:/ov/y.yml" });
   });
+  // A side channel must resolve the same agent dir as the run child, whether the
+  // value came from the session fence or from the operator: sessions, titles,
+  // config.yml and the credential store all live there (dirs.ts:952-1000).
+  it("forwards PI_CODING_AGENT_DIR and drops an empty value", () => {
+    expect(ompEnv({ config: { env: { PI_CODING_AGENT_DIR: "/state/omp-agent" } } }))
+      .toEqual({ PI_CODING_AGENT_DIR: "/state/omp-agent" });
+    expect(ompEnv({ config: { env: { PI_CODING_AGENT_DIR: "" } } })).toEqual({});
+  });
 });

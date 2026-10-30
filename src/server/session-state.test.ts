@@ -10,7 +10,7 @@ import {
 const emptyState = (): SessionIntelState => ({
   forkConsumed: [], forceFreshConsumed: [], runCounters: {},
   pendingRotate: null, lastSnapshotDigest: null, lastRotation: null,
-  recentRuns: [], lastUsageDigest: null,
+  recentRuns: [], lastUsageDigest: null, lastScope: null,
 });
 
 describe("session state", () => {
@@ -36,6 +36,23 @@ describe("session state", () => {
     await writeFile(path.join(dir, "state.json"), "{not json", "utf8");
     const loaded = await loadState(dir);
     expect(loaded).toEqual(emptyState());
+  });
+
+  it("round-trips the last session scope", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "omp-intel-"));
+    dirs.push(dir);
+    const state = emptyState();
+    state.lastScope = "isolated";
+    await saveState(dir, state);
+    expect((await loadState(dir)).lastScope).toBe("isolated");
+  });
+
+  it("ignores an unknown persisted scope", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "omp-intel-"));
+    dirs.push(dir);
+    await saveState(dir, emptyState());
+    await writeFile(path.join(dir, "state.json"), JSON.stringify({ lastScope: "everything" }), "utf8");
+    expect((await loadState(dir)).lastScope).toBe(null);
   });
 
   it("round-trips recentRuns including cachedInputTokens", async () => {

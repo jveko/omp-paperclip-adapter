@@ -1,4 +1,4 @@
-import { driveAcpSession } from "./acp.js";
+import { driveAcpSession, type AcpFrameRequest } from "./acp.js";
 
 export interface OmpSessionInfo {
   sessionId: string;
@@ -23,21 +23,39 @@ export interface OmpSubagentInfo {
   parentToolCallId: string | null;
   lastUpdate: number | null;
 }
+/**
+ * The session landscape for ONE workspace. Every read that produced it is
+ * scoped to the run's cwd, so this type can never carry another tenant's
+ * sessions: `sessions` is the cwd bucket omp resolved for this run, and
+ * `projects` is that same bucket summarized (one entry in practice).
+ */
 export interface OmpSessionsSnapshot {
   projects: OmpProjectInfo[];
   sessions: OmpSessionInfo[];
+  /** Session count for the cwd, or null when the first page was truncated. */
   total: number | null;
-  byCwd: OmpSessionInfo[];
+  /** omp paged the listing (session/list page size 50): more sessions exist. */
+  truncated: boolean;
   /**
-   * Subagents spawned by this run's session, present only when omp answers
-   * `_omp/subagents`. omp's ACP mode has no subagent bridge today (see
+   * Subagents spawned by this run's session, present only under the operator
+   * diagnostic switch. omp's ACP mode has no subagent bridge today (see
    * docs/upstream/omp-acp-subagent-bridge.md), so in practice this is absent;
    * an empty array means the method answered and the tree is empty.
    */
   subagents?: OmpSubagentInfo[];
 }
+/**
+ * What the operator-gated diagnostic is allowed to publish: counts, never ids,
+ * cwds or titles. A host-wide listing exists to show the blast radius of
+ * `_omp/*`, not to render other companies' sessions.
+ */
+export interface OmpHostDiagnostic {
+  sessionCount: number | null;
+  projectCount: number | null;
+  error?: string;
+}
 export type OmpQueryResult =
-  | { ok: true; snapshot: OmpSessionsSnapshot }
+  | { ok: true; snapshot: OmpSessionsSnapshot; hostDiagnostic?: OmpHostDiagnostic }
   | { ok: false; error: string };
 
 function parseSession(raw: unknown): OmpSessionInfo | null {
@@ -60,6 +78,39 @@ function parseSessions(value: unknown): OmpSessionInfo[] {
   return Array.isArray(value)
     ? value.map(parseSession).filter((s): s is OmpSessionInfo => s !== null)
     : [];
+}
+
+/**
+ * Mirror of omp's `_omp/projects/list` bucketing (acp-agent.ts:1428-1455),
+ * computed from the cwd-scoped listing instead of a host-wide scan: group by
+ * cwd, keep the newest activity, newest first.
+ */
+function projectBuckets(sessions: OmpSessionInfo[]): OmpProjectInfo[] {
+  const buckets = new Map<string, OmpProjectInfo & { lastMs: number }>();
+  for (const session of sessions) {
+    if (!session.cwd) continue;
+    const ms = session.updatedAt ? Date.parse(session.updatedAt) : NaN;
+    const previous = buckets.get(session.cwd);
+    if (previous) {
+      previous.sessionCount = (previous.sessionCount ?? 0) + 1;
+      if (Number.isFinite(ms) && ms > previous.lastMs) {
+        previous.lastMs = ms;
+        previous.lastActivityAt = session.updatedAt;
+        previous.lastTitle = session.title;
+      }
+    } else {
+      buckets.set(session.cwd, {
+        cwd: session.cwd,
+        sessionCount: 1,
+        lastActivityAt: session.updatedAt,
+        lastTitle: session.title,
+        lastMs: Number.isFinite(ms) ? ms : 0,
+      });
+    }
+  }
+  return [...buckets.values()]
+    .sort((a, b) => b.lastMs - a.lastMs)
+    .map(({ lastMs: _lastMs, ...rest }) => rest);
 }
 
 /**
@@ -91,66 +142,94 @@ function parseSubagents(value: unknown): OmpSubagentInfo[] {
 }
 
 /**
- * Frames whose failure means the snapshot has no trustworthy content. The
- * subagent frame is deliberately excluded: it is a capability probe, not a
- * requirement (see `queryOmpSessions`).
- */
-const REQUIRED_READ_COUNT = 3;
-
-/**
- * Read omp's persisted session landscape over an initialize-only ACP side
- * channel. Never sends session/new: omp's extMethod handlers read session
- * files from disk and need no session, and session/new would persist a new
- * record that pollutes the listings this function reads. Any failure degrades
- * to a typed error — callers log and skip, never fail the run.
+ * Read the run's own session landscape over an initialize-only ACP side
+ * channel. Never sends session/new: session/list reads persisted state and
+ * needs no session, while session/new always persists a new record that would
+ * pollute the listings this function reads. Any failure degrades to a typed
+ * error — callers log and skip, never fail the run.
  *
- * The `_omp/subagents` frame is optional by design: omp answers it on the
- * versions that implement it and errors on those that do not, in which case the
- * snapshot is returned exactly as it was before subagents were ever asked about.
+ * The single required frame is ACP `session/list` with the run's cwd
+ * (acp-agent.ts:897-911). Its cwd filter resolves the sessions bucket for THIS
+ * workspace under the agent dir the child resolved, so it is the tenant-scoped
+ * replacement for `_omp/sessions/listAll` (a host-wide scan) and
+ * `_omp/projects/list` (same scan, bucketed). There is deliberately no
+ * `_omp/*` fallback: on an omp that cannot list sessions the snapshot is
+ * skipped with a warning rather than widened to every tenant on the host.
+ *
+ * `diagnostic` adds the host-wide `_omp/*` reads for an operator who explicitly
+ * turned the switch on. They contribute counts only (`OmpHostDiagnostic`) —
+ * ids, cwds and titles stay off the work product — and their failure degrades
+ * to `hostDiagnostic.error` instead of failing the snapshot.
  */
 export async function queryOmpSessions(
   omp: { command: string; args?: string[]; env?: Record<string, string> },
-  opts: { timeoutMs?: number; cwd?: string } = {},
+  opts: { cwd: string; diagnostic?: boolean; timeoutMs?: number },
 ): Promise<OmpQueryResult> {
-  const drive = await driveAcpSession(omp, [
-    { method: "_omp/projects/list", params: {} },
-    { method: "_omp/sessions/listAll", params: {} },
-    { method: "_omp/chats/byCwd", params: { cwd: opts.cwd ?? process.cwd() } },
-    // Capability-gated and ordered last: omp's ACP mode bridges no subagent
-    // events (RPC mode alone subscribes task:subagent:* — see
-    // docs/upstream/omp-acp-subagent-bridge.md), and an unimplemented `_omp/*`
-    // method is answered with an immediate JSON-RPC error rather than a hang,
-    // so this costs one round-trip and cannot starve the required reads.
+  const requests: AcpFrameRequest[] = [
+    { method: "session/list", params: { cwd: opts.cwd } },
+    // A capability probe for THIS run's own session, not a listing: it is what
+    // the snapshot card reports as the subagent tree, so it stays on the default
+    // path. omp answers it only on versions that implement it (an unimplemented
+    // `_omp/*` method is an immediate JSON-RPC error, never a hang), which
+    // costs one round-trip and cannot starve the required read.
     { method: "_omp/subagents", params: {} },
-  ], opts.timeoutMs ?? 10_000);
+  ];
+  if (opts.diagnostic) {
+    // Host-wide reads, gated behind the operator switch. Their results are
+    // reduced to counts (see OmpHostDiagnostic) before anything leaves this
+    // function.
+    requests.push(
+      { method: "_omp/sessions/listAll", params: {} },
+      { method: "_omp/projects/list", params: {} },
+    );
+  }
+  const drive = await driveAcpSession(omp, requests, opts.timeoutMs ?? 10_000);
   if (!drive.ok) return { ok: false, error: drive.error ?? "ACP drive failed" };
-  const failed = drive.responses.slice(0, REQUIRED_READ_COUNT).find((r) => r.error);
-  if (failed) return { ok: false, error: failed.error?.message ?? "extMethod error" };
-  const projectsRaw = drive.responses[0]?.result;
-  const listAllRaw = drive.responses[1]?.result;
-  const byCwdRaw = drive.responses[2]?.result;
-  const projects = Array.isArray(projectsRaw?.projects)
-    ? (projectsRaw.projects as Array<Record<string, unknown>>).map((p) => ({
-        cwd: typeof p.cwd === "string" ? p.cwd : "",
-        sessionCount: typeof p.sessionCount === "number" ? p.sessionCount : null,
-        lastActivityAt: typeof p.lastActivityAt === "string" ? p.lastActivityAt : null,
-        lastTitle: typeof p.lastTitle === "string" ? p.lastTitle : null,
-      }))
-    : [];
-  const sessions = parseSessions(listAllRaw?.sessions);
-  const subagentsResponse = drive.responses[REQUIRED_READ_COUNT];
-  const subagentsPayload = subagentsResponse?.error
-    ? undefined
-    : subagentsResponse?.result?.subagents;
-  const subagents = Array.isArray(subagentsPayload) ? parseSubagents(subagentsPayload) : null;
+  const byMethod = new Map(
+    requests.map((request, index) => [request.method, drive.responses[index]]),
+  );
+  const listing = byMethod.get("session/list");
+  if (!listing) return { ok: false, error: "session/list returned no response" };
+  if (listing.error) return { ok: false, error: listing.error.message };
+  const sessions = parseSessions(listing.result?.sessions);
+  const truncated = typeof listing.result?.nextCursor === "string"
+    && listing.result.nextCursor.length > 0;
   const snapshot: OmpSessionsSnapshot = {
-    projects,
+    projects: projectBuckets(sessions),
     sessions,
-    total: typeof listAllRaw?.total === "number" ? listAllRaw.total : null,
-    byCwd: parseSessions(byCwdRaw?.sessions),
+    // A paged listing cannot claim a complete count.
+    total: truncated ? null : sessions.length,
+    truncated,
   };
-  if (subagents) snapshot.subagents = subagents;
-  return { ok: true, snapshot };
+  // The subagent frame is a capability probe, never a requirement: an omp that
+  // does not implement it leaves the snapshot exactly as it was.
+  const subagentsResponse = byMethod.get("_omp/subagents");
+  if (!subagentsResponse?.error && Array.isArray(subagentsResponse?.result?.subagents)) {
+    snapshot.subagents = parseSubagents(subagentsResponse.result.subagents);
+  }
+  if (!opts.diagnostic) return { ok: true, snapshot };
+  const listAll = byMethod.get("_omp/sessions/listAll");
+  const projects = byMethod.get("_omp/projects/list");
+  const diagnosticFailed = [listAll, projects].find((r) => r?.error);
+  if (diagnosticFailed?.error) {
+    return {
+      ok: true,
+      snapshot,
+      hostDiagnostic: {
+        sessionCount: null,
+        projectCount: null,
+        error: diagnosticFailed.error.message,
+      },
+    };
+  }
+  return {
+    ok: true,
+    snapshot,
+    hostDiagnostic: {
+      sessionCount: typeof listAll?.result?.total === "number" ? listAll.result.total : null,
+      projectCount: Array.isArray(projects?.result?.projects) ? projects.result.projects.length : null,
+    },
+  };
 }
 
 export type OmpForkResult =

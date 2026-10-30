@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
+import type { SessionScope } from "./session-directives.js";
 
 export interface RunCounter { count: number; firstRunAt: string }
 export interface RunUsage { at: string; inputTokens: number; outputTokens: number; cachedInputTokens: number }
@@ -14,6 +15,13 @@ export interface SessionIntelState {
   lastRotation: { reason: string; at: string; sessionKey: string } | null;
   recentRuns: RunUsage[];
   lastUsageDigest: string | null;
+  /**
+   * The session scope the previous run executed under. Null on a state written
+   * before the scope existed (or never written). A `shared` -> `isolated` flip
+   * is the moment the employee's resumable session is left behind, so it is the
+   * once-only trigger for the cold-start warning.
+   */
+  lastScope: SessionScope | null;
 }
 
 const MAX_TOKENS = 64;
@@ -25,12 +33,29 @@ export function sessionIntelDir(companyId: string, agentId: string): string {
   );
 }
 
+/**
+ * The omp agent dir a `sessionScope: "isolated"` run resolves
+ * `PI_CODING_AGENT_DIR` to. Per company AND per agent, so two employees on one
+ * host can never see each other's sessions, titles, caches or config.yml. omp
+ * creates its own subdirectories (sessions/, agent.db, ...) inside it.
+ */
+export function ompAgentDir(companyId: string, agentId: string): string {
+  return path.join(
+    resolvePaperclipInstanceRootForAdapter(),
+    "companies", companyId, "acp-engine", "agents", agentId, "omp-agent",
+  );
+}
+
 function emptyState(): SessionIntelState {
   return {
     forkConsumed: [], forceFreshConsumed: [], runCounters: {},
     pendingRotate: null, lastSnapshotDigest: null, lastRotation: null,
-    recentRuns: [], lastUsageDigest: null,
+    recentRuns: [], lastUsageDigest: null, lastScope: null,
   };
+}
+
+function isScope(value: unknown): value is SessionScope {
+  return value === "shared" || value === "isolated";
 }
 
 export async function loadState(dir: string): Promise<SessionIntelState> {
@@ -47,6 +72,7 @@ export async function loadState(dir: string): Promise<SessionIntelState> {
       lastRotation: isLastRotation(parsed.lastRotation) ? parsed.lastRotation : base.lastRotation,
       recentRuns: Array.isArray(parsed.recentRuns) ? parsed.recentRuns.filter(isRunUsage).slice(-20) : base.recentRuns,
       lastUsageDigest: typeof parsed.lastUsageDigest === "string" ? parsed.lastUsageDigest : base.lastUsageDigest,
+      lastScope: isScope(parsed.lastScope) ? parsed.lastScope : base.lastScope,
     };
   } catch {
     return emptyState();

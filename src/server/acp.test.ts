@@ -23,7 +23,7 @@ import {
 } from "./acp.js";
 import { runWithFreshSessionRetry, withRetryChain } from "./retry.js";
 import * as sessionState from "./session-state.js";
-import { loadState, saveState, sessionIntelDir } from "./session-state.js";
+import { loadState, ompAgentDir, saveState, sessionIntelDir } from "./session-state.js";
 import { FAILOVER_CONFIG_FILE } from "./failover-config.js";
 import { GOVERNANCE_MANIFEST_FILE } from "./governance-manifest.js";
 import { GOVERNANCE_CONFIG_FILE } from "./governance-overlay.js";
@@ -855,14 +855,14 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
       });
       ctx.context.taskId = "issue-1";
       vi.stubEnv("PAPERCLIP_API_URL", `http://127.0.0.1:${port}`);
-      // fake-acp answers _omp/* with JSON-RPC errors -> queryOmpSessions fails.
-      vi.stubEnv("FAKE_ACP_MODE", "exterror");
+      // fake-acp fails session/list -> queryOmpSessions fails.
+      vi.stubEnv("FAKE_ACP_MODE", "listerror");
       await run(ctx);
       // Degradation contract: a failed snapshot query never fails the run.
       expect(executorFn).toHaveBeenCalledOnce();
       const queryWarn = events.find((e) => e.message.includes("snapshot query failed"));
       expect(queryWarn).toBeTruthy();
-      expect(queryWarn!.message).toContain("ext boom");
+      expect(queryWarn!.message).toContain("session/list boom");
       expect(posts).toHaveLength(0);
     } finally {
       server.close();
@@ -1630,3 +1630,4 @@ describe("omp-local executor retry composition", () => {
     expect(withRetryChain(normal.result, normal.chain).resultJson).toBeUndefined();
   });
 });
+

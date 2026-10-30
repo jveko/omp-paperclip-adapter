@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
 import {
   getSessionConfigSchema, paperclipApiBase, readSessionIntelConfig, resolveRunDirective,
-  sessionSnapshotDigestInput, validateCredentialMode, validThinkingLevel, validateThinkingLevel,
+  resolveSessionScope, sessionSnapshotDigestInput, validateCredentialMode, validateSessionScope,
+  validThinkingLevel, validateThinkingLevel,
 } from "./session-directives.js";
 import { snapshotDigest } from "./session-state.js";
 
@@ -10,7 +11,7 @@ describe("readSessionIntelConfig", () => {
   it("defaults browser on, usage report on, everything else off", () => {
     const cfg = readSessionIntelConfig({});
     expect(cfg).toEqual({
-      browser: true, forkSourceId: "", forkToken: "",
+      browser: true, diagnostic: false, forkSourceId: "", forkToken: "",
       forceFreshToken: "", maxRuns: 0, maxAgeHours: 0, usageReport: true,
     });
   });
@@ -74,7 +75,8 @@ describe("getSessionConfigSchema", () => {
     const schema = getSessionConfigSchema();
     const keys = schema.fields.map((f) => f.key);
     expect(keys).toEqual([
-      "sessionBrowser", "sessionForceFreshToken", "sessionForkSourceId",
+      "sessionScope", "sessionBrowser", "sessionSnapshotDiagnostic",
+      "sessionForceFreshToken", "sessionForkSourceId",
       "sessionForkToken", "sessionMaxRuns", "sessionMaxAgeHours",
       "credentialMode", "thinking", "fallbackChain", "usageReport",
       "skillsAsTools", "governancePolicy",
@@ -348,5 +350,39 @@ describe("sessionSnapshotDigestInput", () => {
       }],
     }, "s1");
     expect(snapshotDigest(a)).toBe(snapshotDigest(b));
+  });
+});
+
+describe("sessionScope", () => {
+  it("defaults to shared and reports isolated when set", () => {
+    expect(resolveSessionScope({})).toBe("shared");
+    expect(resolveSessionScope({ sessionScope: "" })).toBe("shared");
+    expect(resolveSessionScope({ sessionScope: "isolated" })).toBe("isolated");
+  });
+  it("reports an unknown value instead of silently downgrading to shared", () => {
+    // A typo must not quietly disable a containment control.
+    expect(resolveSessionScope({ sessionScope: "Isolated" })).toBe("shared");
+    expect(validateSessionScope({ sessionScope: "Isolated" }))
+      .toContain("expected 'shared' or 'isolated'");
+  });
+  it("fails isolated without broker credentials, naming both knobs and the reason", () => {
+    const msg = validateSessionScope({ sessionScope: "isolated" });
+    expect(msg).toContain("sessionScope is 'isolated'");
+    expect(msg).toContain("credentialMode");
+    expect(msg).toContain("agent.db");
+  });
+  it("accepts isolated with broker credentials and shared with anything", () => {
+    expect(validateSessionScope({ sessionScope: "isolated", credentialMode: "broker" })).toBe(null);
+    expect(validateSessionScope({ sessionScope: "shared", credentialMode: "local" })).toBe(null);
+    expect(validateSessionScope({})).toBe(null);
+  });
+  it("exposes both knobs on the config schema with shared as the default", () => {
+    const fields = getSessionConfigSchema().fields;
+    expect(fields.find((f) => f.key === "sessionScope")).toMatchObject({
+      type: "select", default: "shared",
+    });
+    expect(fields.find((f) => f.key === "sessionSnapshotDiagnostic")).toMatchObject({
+      type: "toggle", default: false,
+    });
   });
 });

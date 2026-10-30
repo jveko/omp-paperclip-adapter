@@ -22,6 +22,13 @@ export function ompEnv(
     if (url) env.OMP_AUTH_BROKER_URL = url;
     if (token) env.OMP_AUTH_BROKER_TOKEN = token;
   }
+  // The agent dir decides which sessions, titles, config.yml and credential
+  // store omp resolves (dirs.ts:952-1000). A side channel that resolved a
+  // different dir than the run child would list, fork or fetch the wrong
+  // tenant's state, so forward it whenever the run carries one — the session
+  // fence sets it, and an operator-set value must ride along unchanged.
+  const agentDir = str("PI_CODING_AGENT_DIR");
+  if (agentDir) env.PI_CODING_AGENT_DIR = agentDir;
   for (const [k, v] of Object.entries(src)) {
     if (k.startsWith("OTEL_EXPORTER_OTLP_") && typeof v === "string") env[k] = v;
   }

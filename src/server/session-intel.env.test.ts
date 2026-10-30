@@ -7,7 +7,7 @@ import { forkOmpSession, queryOmpSessions } from "./session-intel.js";
 const mocks = vi.hoisted(() => ({
   driveAcpSession: vi.fn(async () => ({
     ok: true,
-    responses: [{ id: 2, result: { sessionId: "fork-1" } }],
+    responses: [{ id: 2, result: { sessions: [] } }],
   })),
 }));
 
@@ -32,6 +32,7 @@ describe("side-channel env forwarding", () => {
     mocks.driveAcpSession.mockClear();
     await queryOmpSessions(
       { command: "omp", args: [], env: { OMP_AUTH_BROKER_URL: "http://b" } },
+      { cwd: "/w" },
     );
     expect(mocks.driveAcpSession).toHaveBeenCalledWith(
       expect.objectContaining({ env: { OMP_AUTH_BROKER_URL: "http://b" } }),
