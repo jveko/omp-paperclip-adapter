@@ -155,6 +155,66 @@ describe("acquireSessionLease", () => {
     }
   });
 
+  it("lets exactly one of two racing acquires win a stale lease", async () => {
+    const now = Date.now();
+    await writeLeaseRecord(dir, "lease-race", {
+      owner: "crashed-owner",
+      pid: 999999,
+      startedAt: new Date(now - 60_000).toISOString(),
+      expiresAt: new Date(now + 3_600_000).toISOString(),
+      sessionKey: "lease-race",
+    });
+
+    const [a, b] = await Promise.all([
+      acquireSessionLease({ dir, key: "lease-race" }),
+      acquireSessionLease({ dir, key: "lease-race" }),
+    ]);
+
+    expect([a.ok, b.ok].filter(Boolean)).toHaveLength(1);
+
+    const loser = a.ok ? b : a;
+    expect(loser.ok).toBe(false);
+    if (loser.ok) throw new Error("expected exactly one acquire to be refused");
+    expect(loser.error).toContain(String(process.pid));
+
+    const winner = a.ok ? a : b;
+    expect(winner.ok).toBe(true);
+
+    const third = await acquireSessionLease({ dir, key: "lease-race" });
+    expect(third.ok).toBe(false);
+    if (third.ok) throw new Error("expected the racing winner to still hold the lease");
+
+    if (winner.ok) await winner.release();
+    const afterRelease = await acquireSessionLease({ dir, key: "lease-race" });
+    expectAcquired(afterRelease);
+    await afterRelease.release();
+  });
+
+  it("leaves no temp files behind after a claim or a lost race", async () => {
+    const now = Date.now();
+    await writeLeaseRecord(dir, "lease-race-tmp", {
+      owner: "crashed-owner",
+      pid: 999999,
+      startedAt: new Date(now - 60_000).toISOString(),
+      expiresAt: new Date(now + 3_600_000).toISOString(),
+      sessionKey: "lease-race-tmp",
+    });
+
+    const [a, b] = await Promise.all([
+      acquireSessionLease({ dir, key: "lease-race-tmp" }),
+      acquireSessionLease({ dir, key: "lease-race-tmp" }),
+    ]);
+    if (!a.ok && !b.ok) throw new Error(`expected one racing acquire to win: ${a.error} / ${b.error}`);
+
+    const entries = await readdir(path.join(dir, SESSION_LEASE_DIR));
+    expect(entries.length).toBeGreaterThan(0);
+    expect(entries.filter((entry) => !entry.endsWith(".json"))).toEqual([]);
+
+    for (const lease of [a, b]) {
+      if (lease.ok) await lease.release();
+    }
+  });
+
   it("reclaims a record whose pid is dead", async () => {
     const now = Date.now();
     await writeLeaseRecord(dir, "lease-dead", {
