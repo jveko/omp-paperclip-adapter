@@ -17,6 +17,25 @@ v0.9 repaired the features that could not execute (no run token, wrong SQL) and 
 could cross tenant lines (shared `~/.omp`). v0.10 is next, limited to work whose lever exists in the
 current engine.
 
+## Architecture direction — decided 2026-10-30 (supersedes the v1.0 framing)
+
+The product is an **employee runtime**, not an adapter: a thin Paperclip adapter over a per-instance
+**host supervisor** that owns omp processes, sessions, leases, credential placement and a run ledger.
+The run lane moves to `omp --mode rpc` (warm workers, `set_host_tools`, explicit settlement,
+`get_session_stats`); ACP stays as the probe lane for `session/list`, `_omp/*`, `session/fork` and
+model discovery. The engine lane is demoted and then removed inside the v0.x line — **there is no
+v1.0 cut**.
+
+| Release | Lands | Gate |
+|---|---|---|
+| v0.11 | four behaviour-preserving cuts (ACP client extraction, side-channel port, one overlay writer, executor split) + `omp-host` skeleton behind `executionMode: "engine"` | identical behaviour, cycles 0, largest file ≤300 |
+| v0.12 | managed default for new agents: RPC worker with warm reuse, host-tool delivery, run ledger + run lease | two heartbeats → one worker, one `open_session`; `kill -9` leaves no orphan |
+| v0.13 | steering, subagent surface, engine lane demoted (deprecation event), compensations deleted | `acpx-engine` confined to one file |
+| v0.14 | adapter-utils reduced to `server-utils` + types, conformance harness in CI, capability probes replace the version pin | `grep acpx-engine src/` empty on the default path |
+
+Non-negotiables: `executionMode: "engine"` reproduces v0.10 byte-for-byte and is the rollback; the
+bridge stays one self-contained bundle; no credential ever enters a warm worker's environment.
+
 ---
 
 ## Where this revision stands (assessed 2026-10-30)
@@ -207,26 +226,28 @@ remotely; any fleet plan that assumes a sandbox boundary is fiction.
 
 ---
 
-## P2 — v1.0 "Org runtime"
+## P2 — "Org runtime" (v0.13+; no v1.0 cut)
 
-### 12. The RPC lane
-One employee, two transports. RPC is the only place these exist:
+### 12. The RPC lane — **v0.12 run lane, v0.13 subagent surface**
+One employee, one run transport. `omp --mode rpc` becomes the run lane (warm worker per
+`(company, agent, cwd, sessionKey)`); ACP stays the probe lane for `session/list`, `_omp/*`,
+`session/fork` and model discovery.
 
-- **12a executor** — spawn `omp --mode rpc`, map frames to the adapter's event stream, keep
-  ACP as the governed work lane and RPC as the control lane.
+- **12a executor** — the supervisor spawns the worker and maps frames onto `ctx.onEvent`/`onLog`/
+  `onUsage`; settlement is the worker's `prompt_result.sessionSettled` / `session_settled`, never a
+  timeout.
 - **12b subagents** — `set_subagent_subscription` (`off|progress|events`), `get_subagents`,
   `get_subagent_messages` (byte-incremental), `cancel_subagent`, `steer_subagent`.
-- **12c host tools** — `set_host_tools` / `set_host_uri_schemes`: Paperclip registers tools
-  and `paperclip://` URIs natively instead of through an extension, plus `goal.token_budget`
-  as a per-task spend budget.
+- **12c host tools** — `set_host_tools` / `set_host_uri_schemes`: the supervisor answers
+  `host_tool_call` frames as the MCP client behind Paperclip's connection tools, so the bearer never
+  enters the worker.
 
-Acceptance: an employee's heartbeat shows a subagent tree with per-subagent transcripts and
-cost, and can cancel one without stopping the parent turn.
+Acceptance: an employee's heartbeat shows a subagent tree with per-subagent transcripts and cost, and
+can cancel one without stopping the parent turn.
 
-### 26. Live steering — **blocked upstream (paperclip)**
-`_session/steering` injects a message into a running turn and reports `promptRequired` when
-it cannot. The adapter side is trivial; the engine has no steering path. Until then, a board
-comment costs a new heartbeat.
+### 26. Live steering — **unblocked on the RPC lane (v0.12, default off)**
+`steer` / `follow_up` reach a running turn on the worker; gated behind `steering: "on"` until
+Paperclip has a UI contract. The ACP `_session/steering` extension stays unused.
 
 ### 5 / 13 — done
 Skills-as-tools and the extension bridge shipped in v0.7/v0.8. Nothing to build; keep them
