@@ -137,9 +137,11 @@ ACP stdio transport.
   stores its level at creation, so a resumed session keeps the level it
   started with. Editing \`thinking\` therefore rotates the session once — the
   adapter records the level each session was started with and restarts only
-  when the operator asks for a different one — and the run says why. An agent
-  whose level is unchanged never rotates, and neither does a run that merely
-  re-lists or re-reads that session. \`off\` stays a CLI flag because omp's
+  when the operator asks for a different one — and the run says why. A level it
+  cannot name is re-established the same way: a fork of a session this adapter
+  never ran restarts once, on its next run, so its inherited level is known
+  instead of silently frozen. An agent whose level is unchanged never rotates,
+  and neither does a run that merely re-lists or re-reads that session. \`off\` stays a CLI flag because omp's
   setting has no \`off\` value (it discards one and reads \`high\`).
 - Live switching mid-session is not available on this lane: omp's ACP accepts
   \`session/set_config_option {configId:"thinking"}\`, but the Paperclip engine
