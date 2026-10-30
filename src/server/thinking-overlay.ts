@@ -1,6 +1,5 @@
-import { promises as fs } from "node:fs";
-import path from "node:path";
 import { validThinkingLevel } from "./thinking-levels.js";
+import { writeOverlay } from "./run/overlays.js";
 
 /**
  * Run-child-only settings overlay that carries the operator's thinking level.
@@ -20,7 +19,7 @@ import { validThinkingLevel } from "./thinking-levels.js";
  * it stored; the adapter rotates when the operator asks for a different one
  * (see `thinkingLevelChanged`).
  */
-export const THINKING_CONFIG_FILE = "omp-thinking-config.yml";
+export { THINKING_CONFIG_FILE } from "./run/overlays.js";
 
 /**
  * The level this run asks omp for, canonicalized; `""` means "ask for nothing"
@@ -58,12 +57,5 @@ export async function materializeThinkingOverlay(
 ): Promise<ThinkingOverlayResult> {
   const level = settingsThinkingLevel(config);
   if (level === null) return { status: "none" };
-  const file = path.join(dir, THINKING_CONFIG_FILE);
-  try {
-    await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(file, `defaultThinkingLevel: ${level}\n`, "utf8");
-    return { status: "ok", path: file };
-  } catch (err) {
-    return { status: "error", error: err instanceof Error ? err.message : String(err) };
-  }
+  return writeOverlay("thinking", `defaultThinkingLevel: ${level}\n`, dir);
 }

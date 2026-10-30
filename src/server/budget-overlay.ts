@@ -1,5 +1,4 @@
-import { promises as fs } from "node:fs";
-import path from "node:path";
+import { writeOverlay } from "./run/overlays.js";
 
 /**
  * Run-child-only settings overlay that turns the adapter's soft budget into
@@ -13,7 +12,7 @@ import path from "node:path";
  * notice. The adapter does not re-implement either; it only forwards the
  * operator's number.
  */
-export const BUDGET_CONFIG_FILE = "omp-budget-config.yml";
+export { BUDGET_CONFIG_FILE } from "./run/overlays.js";
 
 /**
  * The warning threshold the adapter derives from the one configured number:
@@ -62,12 +61,5 @@ export async function materializeBudgetOverlay(
     `  maxCost: ${plainDecimal(capUsd)}`,
     ...(warn === null ? [] : [`  warnCost: ${plainDecimal(warn)}`]),
   ];
-  const file = path.join(dir, BUDGET_CONFIG_FILE);
-  try {
-    await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(file, `${lines.join("\n")}\n`, "utf8");
-    return { status: "ok", path: file };
-  } catch (err) {
-    return { status: "error", error: err instanceof Error ? err.message : String(err) };
-  }
+  return writeOverlay("budget", `${lines.join("\n")}\n`, dir);
 }

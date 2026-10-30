@@ -1,6 +1,5 @@
-import { promises as fs } from "node:fs";
-import path from "node:path";
 import { resolveProviderQualifiedSelector, type OmpModelInfo } from "./models.js";
+import { writeOverlay } from "./run/overlays.js";
 
 /**
  * Fixed filename for this run's failover overlay, overwritten in place whenever
@@ -9,7 +8,7 @@ import { resolveProviderQualifiedSelector, type OmpModelInfo } from "./models.js
  * (governance-overlay.ts) because they must reach the run child without ever
  * reaching the side channels that read this one.
  */
-export const FAILOVER_CONFIG_FILE = "omp-failover-config.yml";
+export { FAILOVER_CONFIG_FILE } from "./run/overlays.js";
 
 /**
  * One selector per line, blank lines ignored. Exported because endpoint routing
@@ -192,12 +191,5 @@ export async function materializeFailoverOverlay(
     ...knobs,
   ];
   const yaml = `${lines.join("\n")}\n`;
-  const file = path.join(dir, FAILOVER_CONFIG_FILE);
-  try {
-    await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(file, yaml, "utf8");
-    return { status: "ok", path: file };
-  } catch (err) {
-    return { status: "error", error: err instanceof Error ? err.message : String(err) };
-  }
+  return writeOverlay("failover", yaml, dir);
 }

@@ -1,8 +1,7 @@
-import { promises as fs } from "node:fs";
-import path from "node:path";
 import { parseFallbackChain } from "./failover-config.js";
 import { parseGovernancePolicy } from "./governance-manifest.js";
 import type { OmpModelInfo } from "./models.js";
+import { writeOverlay } from "./run/overlays.js";
 
 /**
  * Endpoint routing overlay (v0.8 T4).
@@ -26,7 +25,7 @@ import type { OmpModelInfo } from "./models.js";
  */
 
 /** Fixed overlay filename (overwritten in place per run, like the failover one). */
-export const GOVERNANCE_CONFIG_FILE = "omp-governance-config.yml";
+export { GOVERNANCE_CONFIG_FILE } from "./run/overlays.js";
 
 /** `provider/id` -> `provider`; "" when the selector carries no provider half. */
 export function providerFacet(selector: string): string {
@@ -234,12 +233,9 @@ export async function materializeGovernanceOverlay(
   // Nothing to say, so nothing to read: an unarmed overlay with no routing must
   // not become a PI_CONFIG_FILES entry that could still influence the run.
   if (lines.length === 0) return { status: "none" };
-  const file = path.join(dir, GOVERNANCE_CONFIG_FILE);
-  try {
-    await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(file, `${lines.join("\n")}\n`, "utf8");
-  } catch (err) {
-    return { status: "error", error: err instanceof Error ? err.message : String(err) };
-  }
-  return { status: "ok", path: file, disabled: plan.disabled, kept: plan.kept, skipped: plan.skipped };
+  const written = await writeOverlay("governance", `${lines.join("\n")}\n`, dir);
+  if (written.status !== "ok") return written;
+  return {
+    status: "ok", path: written.path, disabled: plan.disabled, kept: plan.kept, skipped: plan.skipped,
+  };
 }

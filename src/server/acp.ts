@@ -42,6 +42,7 @@ import { governancePolicyActive, materializeGovernanceManifest, parseGovernanceP
 import { materializeGovernanceOverlay } from "./governance-overlay.js";
 import { materializeBudgetOverlay } from "./budget-overlay.js";
 import { materializeThinkingOverlay, requestedThinkingLevel } from "./thinking-overlay.js";
+import { mergePiConfigFiles, type OverlayEntry } from "./run/overlays.js";
 import {
   bumpRunCounter, consumeToken, loadState, rotateIfTripped, saveState,
   sessionIntelDir, snapshotDigest,
@@ -520,16 +521,22 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     // skipped when no model is configured AND no chain leg is
     // provider-qualified — a broken/missing `omp` would otherwise add up to
     // 20s of uncached failure latency per run.
+    // Every run-child overlay this run lands, in PI_CONFIG_FILES precedence
+    // order. One writer (run/overlays.ts) owns the fixed filenames; this list
+    // is the only place the paths are merged.
+    const overlays: OverlayEntry[] = [];
     const failoverOverlay = await materializeFailoverOverlay(ctx.config, intelDir);
-    const failoverOverlayPath =
-      failoverOverlay.status === "ok" ? failoverOverlay.path : null;
+    if (failoverOverlay.status === "ok") overlays.push({ kind: "failover", path: failoverOverlay.path });
     if (failoverOverlay.status === "error") {
       await ctx.onEvent?.({
         eventType: "run.system", stream: "system", level: "warn",
         message: `omp failover overlay write failed: ${failoverOverlay.error}; continuing without PI_CONFIG_FILES`,
       });
     }
-    const sideChannelEnv = ompEnv({ config: ctx.config, overlayPath: failoverOverlayPath });
+    const sideChannelEnv = ompEnv({
+      config: ctx.config,
+      overlayPath: failoverOverlay.status === "ok" ? failoverOverlay.path : null,
+    });
     const ompTokens = resolveOmpAgentCommand(ctx.config, bridge).split(/\s+/);
     // The resolved agent command may carry trailing flags (`--extension <path>`,
     // the `off` thinking flag, or an operator's own). Locate `acp` by index so
@@ -671,8 +678,7 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
         eventType: "run.system", stream: "system", level: "warn", message,
       }),
     );
-    const governanceOverlayPath =
-      governanceOverlay.status === "ok" ? governanceOverlay.path : null;
+    if (governanceOverlay.status === "ok") overlays.push({ kind: "governance", path: governanceOverlay.path });
     if (governanceOverlay.status === "error") {
       // Ungoverned routing, not a failed run: the gate key is lost with the
       // file, so say which halves of governance did not land.
@@ -697,7 +703,7 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
       parsedGovernance.kind === "ok" ? parsedGovernance.policy.budgetCapUsd : undefined,
       intelDir,
     );
-    const budgetOverlayPath = budgetOverlay.status === "ok" ? budgetOverlay.path : null;
+    if (budgetOverlay.status === "ok") overlays.push({ kind: "budget", path: budgetOverlay.path });
     if (budgetOverlay.status === "error") {
       await ctx.onEvent?.({
         eventType: "run.system", stream: "system", level: "warn",
@@ -708,7 +714,7 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     // The thinking level rides its own overlay (fixed path, so an edit never
     // rotates the session). Run-child only: no side channel reads a level.
     const thinkingOverlay = await materializeThinkingOverlay(ctx.config, intelDir);
-    const thinkingOverlayPath = thinkingOverlay.status === "ok" ? thinkingOverlay.path : null;
+    if (thinkingOverlay.status === "ok") overlays.push({ kind: "thinking", path: thinkingOverlay.path });
     if (thinkingOverlay.status === "error") {
       await ctx.onEvent?.({
         eventType: "run.system", stream: "system", level: "warn",
@@ -726,9 +732,7 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
       typeof (ctx.config.env as Record<string, unknown> | undefined)?.PI_CONFIG_FILES === "string"
         ? (ctx.config.env as Record<string, unknown>).PI_CONFIG_FILES as string
         : "";
-    const mergedPi = [operatorPi, failoverOverlayPath, governanceOverlayPath, budgetOverlayPath, thinkingOverlayPath]
-      .filter(Boolean)
-      .join(path.delimiter);
+    const mergedPi = mergePiConfigFiles(operatorPi, overlays);
     if (mergedPi) config.env = { ...(config.env ?? {}), PI_CONFIG_FILES: mergedPi };
     // Ephemeral skills: when the bridge is active, skill content is delivered
     // on demand via the registered native tools, so prose injection is skipped
