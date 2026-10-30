@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.10.0 — 2026-10-30
+
+Model control and failover. Both are config-seam work: the levers existed in omp, the adapter was
+driving them the expensive way or not at all.
+
+- **Thinking without rotation** — the level now rides a run-child settings overlay
+  (`defaultThinkingLevel`) instead of `--thinking` on `agentCommand`, so editing it no longer
+  rotates the session or loses the prompt cache. Because omp keeps a resumed transcript's stored
+  level, the adapter records the level each session started with and rotates **once** when the
+  operator asks for a different one (with a `run.system` event naming both); an unknown or forked
+  source is adopted rather than reset, so an upgrade never cold-starts a running employee. `off` is
+  the one value the setting cannot express and still uses the flag. Live mid-session switching stays
+  engine-blocked: omp accepts `set_config_option {configId:"thinking"}`, the engine sends only
+  `model`/`effort`/`service_tier`.
+- **Failover knobs** — `fallbackOn`, `fallbackRevertPolicy`, `waitForUsageReset` and `maxDelayMs`
+  are validated and forwarded in the retry overlay; enum garbage is a typed config error instead of
+  a file omp silently discards. `retry.fallbackChains.default` remains the chat-session chain.
+- **Snapshot paging** — the session listing reads up to five `session/list` pages through
+  `nextCursor` and reports `truncated`/`total` honestly instead of claiming a one-page world.
+
+Honest limits: no live thinking switch (engine); no compaction alignment (the engine exposes no
+context pressure); items 3 (MCP second half), 7b (gateway grants), 24 (cold-start) and 25 (sandbox)
+are parked in `ROADMAP.md` with the missing upstream lever named.
+
 ## 0.9.0 — 2026-10-30
 
 Correctness & containment. The features v0.4–v0.8 shipped but could not execute now do, and the

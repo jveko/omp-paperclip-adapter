@@ -163,9 +163,11 @@ refresh; no 404 work-product POSTs in a chat-wake run.
 
 ---
 
-## P1 — v0.10 "Fleet, honestly"
+## P1 — v0.10 "Model control & failover" — **shipped in 0.10.0 (2026-10-30)**
 
-Only work whose lever exists in the current engine.
+Items 2, 10 and the paging half of 9 shipped (release notes and limits in `CHANGELOG.md`). Items 3,
+7b, 24 and 25 were re-scoped out of this release after the evidence review; each now sits in
+**Parked** with the missing upstream lever named.
 
 ### 2. Thinking and model control without rotation
 Move `--thinking` into a `--config` overlay (`defaultThinkingLevel`), add live
@@ -178,25 +180,25 @@ Write `retry.fallbackOn: usage-limit`, `retry.waitForUsageReset`, `retry.fallbac
 and per-role chains — `default` never applies to model-kind roles. Report which model served
 the turn (needs item 19's `usageByModel`).
 
-### 3. MCP, second half
+### 3. MCP, second half — **parked (upstream)**
 Managed company gateways need an adapter-declarable allowlist upstream (today hardcoded to
 `codex_local`); stdio servers need a command discriminator on `AdapterRuntimeMcpServer`.
 Per-server allow/deny and failure surfacing stay adapter-side.
 
-### 9. Session intelligence, second half
-ACP `session/list` with cursors instead of the unpaged `_omp/*` scan; align rotation with
-omp's per-model compaction thresholds instead of adapter-owned run counters; keep the shipped
-browser as the board surface.
+### 9. Sessions — paging shipped; compaction half blocked
+ACP `session/list` now pages through cursors up to a cap and reports truncation honestly (0.10.0).
+Compaction alignment stays out: the engine does not expose context pressure to the adapter, so
+adapter-owned rotation remains the only lever.
 
-### 7b. Credential grants per employee
-`auth-gateway serve --clients` (model allowlist + broker account per client, hot-reloaded, no
-fallback) — the per-employee enforcement the v0.6 descope called redundant.
+### 7b. Credential grants per employee — **parked (operator-side)**
+`auth-gateway serve --clients` (model allowlist + broker account per client) is real, but the
+gateway has no dedicated env contract: the child inherits `OMP_AUTH_BROKER_*` and provider base
+URLs are configured, not injected. Nothing adapter-local to build; it belongs in the operator guide.
 
-### 24. Cold-start economics (replaces item 1)
-`omp --restore <session>` (resumes the interrupted turn **and its subagents**),
-`omp -p --wait-async` for maintenance heartbeats, `omp session pack|unpack` for host
-migration, `/compact`/`/handoff` as CLI actions. Target: a maintenance heartbeat costs a
-fraction of a full run.
+### 24. Cold-start economics — **parked (needs an engine seam)**
+`omp --restore`, `-p --wait-async`, `session pack|unpack` are CLI-launch features; this adapter
+drives `omp acp`, and the engine exposes no launch-flag passthrough for them. Revisit when the
+engine can carry a maintenance or restore mode.
 
 ### 25. Sandbox / remote execution — **blocked upstream**
 Two hardcoded sets exclude `omp_local`: `REMOTE_MANAGED_ADAPTERS` (local only) and the Rust
@@ -242,6 +244,10 @@ covered by tests.
 | 14 headless collab | `CollabHost` depends on the TUI context; `omp join` refuses non-TTY | Upstream extraction of a headless host |
 | 15 omp worktrees | Paperclip already owns `git_worktree` per run | Nothing — this is the correct division |
 | 16 in-process SDK | Bun-only public surface | Not expected; the process boundary (ACP + RPC) is sufficient |
+| 3 MCP second half | Managed-gateway allowlist hardcoded to `codex_local`; `AdapterRuntimeMcpServer` has no stdio/command discriminator | An adapter-declarable managed-MCP allowlist and a stdio server shape upstream |
+| 7b gateway client grants | No dedicated env contract for the gateway; provider base URLs are operator config | An upstream gateway URL/token contract the adapter can inject |
+| 24 cold-start economics | `--restore` / `-p --wait-async` / `session pack` are CLI-launch flags; the engine exposes no passthrough | A launch-flag seam in the ACPX engine |
+| 25 sandbox / remote | `REMOTE_MANAGED_ADAPTERS` is local-only and the runner's ACPX profiles are closed | An allowlist change that admits external adapters |
 
 ---
 
@@ -279,6 +285,13 @@ covered by tests.
 *Historical entries are preserved as written. Where an entry states a blocker that the
 2026-10-30 assessment resolved (for example the "resume fingerprint instability"), the
 assessment above supersedes it.*
+
+- **2026-10-30 — v0.10.0 (Model control & failover).** Thinking level moved into a settings overlay
+  (no fingerprint rotation) with a one-time rotation when it changes on an existing session and a
+  fork-aware record of what each session started with; validated `fallbackOn`,
+  `fallbackRevertPolicy`, `waitForUsageReset` and `maxDelayMs` in the retry overlay; honest cursor
+  paging for the session snapshot (623 tests). Items 3, 7b, 24 and 25 re-scoped into Parked with the
+  missing upstream lever named; v1.0 remains out of scope.
 
 - **2026-10-30 — v0.9.0 (Correctness & containment).** Items 17–23 shipped in four sequential lanes
   (26 commits, 588 tests): run identity (`supportsLocalAgentJwt`, `native_mcp` delivery, instructions
