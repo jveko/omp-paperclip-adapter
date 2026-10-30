@@ -27,6 +27,7 @@ import { loadState, ompAgentDir, saveState, sessionIntelDir } from "./session-st
 import { FAILOVER_CONFIG_FILE } from "./failover-config.js";
 import { GOVERNANCE_MANIFEST_FILE } from "./governance-manifest.js";
 import { GOVERNANCE_CONFIG_FILE } from "./governance-overlay.js";
+import { BUDGET_CONFIG_FILE } from "./budget-overlay.js";
 const engineMocks = vi.hoisted(() => ({
   createAcpxEngineExecutor: vi.fn(),
 }));
@@ -259,9 +260,12 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     // Governance alone arms the bridge even with skillsAsTools off — once.
     expect(merged.config.agentCommand).toContain(`--extension ${bridgePath}`);
     expect(merged.config.agentCommand.match(/--extension/g)).toHaveLength(1);
-    // The single-gate key now rides in the governance overlay (run-child only),
-    // which is the sole PI_CONFIG_FILES entry this run owns.
-    expect(merged.config.env?.PI_CONFIG_FILES).toBe(path.join(intel, GOVERNANCE_CONFIG_FILE));
+    // The single-gate key rides in the governance overlay (run-child only) and
+    // the budget thresholds in their own; both are joined in precedence order.
+    expect(merged.config.env?.PI_CONFIG_FILES).toBe([
+      path.join(intel, GOVERNANCE_CONFIG_FILE),
+      path.join(intel, BUDGET_CONFIG_FILE),
+    ].join(path.delimiter));
     expect(await readFile(path.join(intel, GOVERNANCE_CONFIG_FILE), "utf8"))
       .toContain("approvalMode: yolo");
   });
@@ -357,6 +361,47 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     expect(merged.config.env?.PAPERCLIP_SKILLS_MANIFEST).toBe("/tmp/skills-manifest.json");
     expect(merged.config.env?.PAPERCLIP_GOVERNANCE_MANIFEST).toContain(GOVERNANCE_MANIFEST_FILE);
     expect(merged.config.agentCommand.match(/--extension/g)).toHaveLength(1);
+  });
+
+  it("forwards budgetCapUsd as omp's session cost cap in its own run-child overlay", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    await createOmpAcpExecutor()(baseCtx({
+      config: {
+        command: `${process.execPath} ${fakeAcp}`,
+        governancePolicy: "budgetCapUsd: 2",
+      },
+    }));
+    const intel = sessionIntelDir("co-1", "agent-1");
+    const merged = executorFn.mock.calls[0][0];
+    // budgetCapUsd also arms the bridge (it is an enforceable rule), so the
+    // single-gate overlay and the budget overlay both ride the run child.
+    expect(merged.config.env?.PI_CONFIG_FILES).toBe([
+      path.join(intel, GOVERNANCE_CONFIG_FILE),
+      path.join(intel, BUDGET_CONFIG_FILE),
+    ].join(path.delimiter));
+    expect(await readFile(path.join(intel, BUDGET_CONFIG_FILE), "utf8"))
+      .toBe("session:\n  maxCost: 2\n  warnCost: 1.6\n");
+  });
+
+  it("keeps the overlay path stable when only the cap changes (no session rotation)", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const run = createOmpAcpExecutor();
+    await run(baseCtx({ config: { command: `${process.execPath} ${fakeAcp}`, governancePolicy: "budgetCapUsd: 2" } }));
+    await run(baseCtx({ config: { command: `${process.execPath} ${fakeAcp}`, governancePolicy: "budgetCapUsd: 3" } }));
+    const first = executorFn.mock.calls[0][0].config.env?.PI_CONFIG_FILES;
+    const second = executorFn.mock.calls[1][0].config.env?.PI_CONFIG_FILES;
+    expect(second).toBe(first);
+    expect(await readFile(path.join(sessionIntelDir("co-1", "agent-1"), BUDGET_CONFIG_FILE), "utf8"))
+      .toBe("session:\n  maxCost: 3\n  warnCost: 2.4\n");
+  });
+
+  it("writes no budget overlay without a usable cap", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    await createOmpAcpExecutor()(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, governancePolicy: "approvedEndpoints:\n  - prov" },
+    }));
+    const merged = executorFn.mock.calls[0][0];
+    expect(merged.config.env?.PI_CONFIG_FILES).toBeUndefined();
   });
 
   it("malformed governancePolicy warns and runs ungoverned instead of crashing", async () => {

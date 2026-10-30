@@ -112,10 +112,29 @@ ACP stdio transport.
   \`nonInteractivePermissions\`. The adapter never passes \`--auto-approve\` on the
   command line; unattended employees keep the default approve posture only as a
   conscious operator choice at hire time.
-- Custom providers without rate cards report $0 cost even when tokens burn.
-  Check \`omp models ls --json\` rate cards before assuming a model is free.
-- \`refreshModels\`/\`detectModel\` use the default omp on PATH, not any agent's
-  \`command\` override.
+- Spend control has two layers, and the operator sets one number:
+  \`governancePolicy.budgetCapUsd\`. The omp child receives it as its own session
+  cost cap (\`session.maxCost\`) through a run-child-only config overlay, so omp
+  refuses the next model request once the session tree — subagents included —
+  reaches it; a request already in flight can finish past the cap. The same
+  overlay carries an early-warning threshold at 80 % of the cap, rounded to
+  cents (the adapter's own heuristic, omitted when it would round to zero or to
+  the cap itself). The bridge's \`budgetCapUsd\` remains the soft, earlier signal:
+  it can only refuse a tool call, and each session (subagents included) keeps
+  its own copy. Adding or clearing the key changes \`PI_CONFIG_FILES\` and so
+  rotates the session once; changing only the number does not.
+- Cost truth follows omp's own pricing status rather than a zero rate card: a
+  model with a declared rate card is reported as an estimate, a declared-free
+  or subscription-included model as a known zero, and a model omp cannot price
+  as \`unpriced\` — never as free. Unpriced runs are what the board's
+  \`unpricedUsagePolicy\` blocks, so a custom provider with no rate card stalls
+  the employee at the budget gate instead of spending silently.
+- \`refreshModels\` runs \`omp models refresh\` (online, single-flight, at most once
+  a minute) and then lists the catalog, so a retired model disappears on the
+  first refresh; it returns each model's rate card and context window.
+  \`detectModel\` reads the configured \`modelRoles.default\` instead of opening a
+  throwaway ACP session, and returns the same \`provider/id\` shape the catalog
+  uses. Both use the default omp on PATH, not any agent's \`command\` override.
 - systemd may strip mise shims from PATH; prefer an absolute \`command\`.
 `.trim();
 

@@ -36,8 +36,9 @@ import { ompEnv } from "./omp-env.js";
 import { prepareSessionScope } from "./session-scope.js";
 import { forkOmpSession, queryOmpSessions } from "./session-intel.js";
 import { materializeSkillManifest } from "./skill-manifest.js";
-import { governancePolicyActive, materializeGovernanceManifest } from "./governance-manifest.js";
+import { governancePolicyActive, materializeGovernanceManifest, parseGovernancePolicy } from "./governance-manifest.js";
 import { materializeGovernanceOverlay } from "./governance-overlay.js";
+import { materializeBudgetOverlay } from "./budget-overlay.js";
 import {
   bumpRunCounter, consumeToken, loadState, rotateIfTripped, saveState,
   sessionIntelDir, snapshotDigest,
@@ -750,18 +751,37 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
         message: `omp governance routing disabled ${governanceOverlay.disabled.length} provider(s) for this run: ${governanceOverlay.disabled.join(", ")}`,
       });
     }
+    // Spend that can stop: forward the operator's soft per-session budget as
+    // omp's own session cost cap. The bridge cap only refuses tool calls, so a
+    // turn that never reaches it (or a subagent with its own copy) can spend
+    // past it; omp's CostGate refuses the next model request for the whole
+    // session tree. Its own overlay file keeps the path stable across cap
+    // changes, so editing the number does not rotate the session.
+    const parsedGovernance = parseGovernancePolicy(ctx.config.governancePolicy);
+    const budgetOverlay = await materializeBudgetOverlay(
+      parsedGovernance.kind === "ok" ? parsedGovernance.policy.budgetCapUsd : undefined,
+      intelDir,
+    );
+    const budgetOverlayPath = budgetOverlay.status === "ok" ? budgetOverlay.path : null;
+    if (budgetOverlay.status === "error") {
+      await ctx.onEvent?.({
+        eventType: "run.system", stream: "system", level: "warn",
+        message: `omp budget overlay write failed: ${budgetOverlay.error}; the run continues without omp's hard cost cap (the bridge's soft cap still applies)`,
+      });
+    }
     const config = buildOmpAcpConfig(ctx.config, resolveModel, resolveCost);
     // Fold every overlay this run owns into config BEFORE engineConfig is
     // derived: the fork branch rebuilds engineConfig as
     // { ...config, warmHandleIdleMs: 50 }, so an overlay added only to
     // engineConfig would be silently dropped by the fork spread — PI_CONFIG_FILES
     // must ride on `config` to survive it. The order is the precedence order:
-    // operator file, then the failover chain, then governance routing.
+    // operator file, then the failover chain, then governance routing, then the
+    // budget thresholds.
     const operatorPi =
       typeof (ctx.config.env as Record<string, unknown> | undefined)?.PI_CONFIG_FILES === "string"
         ? (ctx.config.env as Record<string, unknown>).PI_CONFIG_FILES as string
         : "";
-    const mergedPi = [operatorPi, failoverOverlayPath, governanceOverlayPath]
+    const mergedPi = [operatorPi, failoverOverlayPath, governanceOverlayPath, budgetOverlayPath]
       .filter(Boolean)
       .join(path.delimiter);
     if (mergedPi) config.env = { ...(config.env ?? {}), PI_CONFIG_FILES: mergedPi };
