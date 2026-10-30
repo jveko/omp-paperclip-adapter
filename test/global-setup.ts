@@ -27,6 +27,12 @@ export default async function setup(): Promise<void> {
   // it in production), so build the shipped target here rather than a stand-in.
   // Rebuilt unconditionally: a stale local bundle would silently test old host
   // code, which is exactly the failure these tests exist to catch.
+  //
+  // The options mirror `npm run build:host` exactly, including the external
+  // `@paperclipai/adapter-utils`: a package dependency is resolved at runtime,
+  // and bundling it would inline zod and the shared validators (a ~1.7 MB
+  // CLI instead of ~110 KB). A divergence here would go unnoticed until
+  // someone measured the shipped artifact.
   const host = path.join(root, "dist", "omp-host.js");
   {
     await build({
@@ -34,6 +40,7 @@ export default async function setup(): Promise<void> {
       bundle: true,
       platform: "node",
       format: "esm",
+      external: ["@paperclipai/adapter-utils"],
       banner: { js: "#!/usr/bin/env node" },
       outfile: host,
       logLevel: "silent",

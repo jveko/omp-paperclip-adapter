@@ -1,11 +1,12 @@
-import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { sessionCodec } from "@paperclipai/adapter-utils/acpx-engine/session-codec";
 import { createOmpAcpExecutor } from "../src/server/acp.js";
 import { execute as executeRun } from "../src/server/execute.js";
+import { sessionIntelDir } from "../src/server/session-state.js";
 import { capabilityChecks, clearCapabilityCache, loadCapabilities } from "../src/server/capabilities.js";
 import { parseOmpVersion } from "../src/server/adapters/acp/launch.js";
 import { checkGolden, normalizeGolden, runReplacements } from "./golden.js";
@@ -271,10 +272,17 @@ describe("engine-lane conformance", () => {
     const config = { command: build.script, model: "prov/model-a" };
     const leaseCtx = ctx({ config });
 
-    // Both calls start before either finishes: the second must lose the
-    // file-based lease, not queue behind the first (a queued heartbeat reports
-    // late, which is the failure the lease exists to avoid).
+    // Both calls are in flight together: the second must lose the file lease,
+    // not queue behind the first (a queued heartbeat reports late, which is
+    // the failure the lease exists to avoid). Wait for the first claim to land
+    // first — otherwise the two claims race and either could win, which tests
+    // the primitive rather than the refusal.
     const first = executeRun(leaseCtx);
+    const leases = path.join(sessionIntelDir("co-1", "agent-1"), "leases");
+    await vi.waitFor(async () => {
+      const held = await readdir(leases).catch(() => [] as string[]);
+      expect(held.filter((name) => name.endsWith(".json"))).toHaveLength(1);
+    }, { timeout: 5_000, interval: 10 });
     const second = await executeRun({ ...leaseCtx, runId: "run-2" });
     expect(second.errorCode).toBe("omp_session_lease_held");
     expect(await first).toMatchObject({ exitCode: 0 });
