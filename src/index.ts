@@ -29,7 +29,45 @@ ACP stdio transport.
 | \`timeoutSec\` / \`graceSec\` | 0 / 20 | unlimited run; SIGTERM grace |
 | \`env\` | \`{}\` | incl. \`OMP_PAPERCLIP_BILLING_TYPE\` (\`api\` or \`subscription\`) |
 | \`stateDir\`, \`instructionsFilePath\`, \`cwd\` | unset | passed through to engine |
+| \`sessionScope\` | \`shared\` | \`shared\` = the host's one omp agent dir; \`isolated\` = this agent's own (requires \`credentialMode: broker\`) |
+| \`sessionSnapshotDiagnostic\` | \`false\` | log counts from omp's host-wide \`_omp/*\` listing (never ids, cwds or titles) |
 | \`warmHandleIdleMs\` | \`0\` | pinned to \`0\` on every run (see below). The engine sets \`PAPERCLIP_API_KEY\` only when it spawns the child, so a reused process would keep an earlier run's token |
+
+### Session scope and the data fence
+- \`sessionScope\` decides where omp keeps this employee's state. \`shared\`
+  (default) is the historical behavior: every omp process on the host resolves
+  the same agent dir (\`~/.omp/agent\`), so sessions, titles, caches, config and
+  credentials are shared and omp's \`_omp/*\` listing can see them all.
+  \`isolated\` sets \`PI_CODING_AGENT_DIR\` to
+  \`<paperclip instance>/companies/<company>/acp-engine/agents/<agent>/omp-agent\`
+  for the run child and every side channel, which is the only knob that scopes
+  omp's session *reads* — \`--session-dir\` scopes writes only, and omp's
+  \`session/list\`, \`_omp/sessions/listAll\`, \`_omp/projects/list\` and the
+  load-by-id fallback all resolve under the agent dir regardless.
+- \`isolated\` requires \`credentialMode: broker\`. The private dir holds no
+  \`agent.db\`, so a local-login run would have no credentials; enabling
+  \`isolated\` without the broker fails the run and the environment test with
+  \`omp_config_error\`. The adapter never copies, links or moves a credential
+  store.
+- The operator's \`config.yml\` from the shared agent dir is folded back in via
+  \`PI_CONFIG_FILES\` at the lowest precedence, so providers and model roles keep
+  working after the switch. \`models.yml\` and \`secrets.yml\` cannot be carried
+  that way: define those providers in \`config.yml\` (or via env) before
+  switching, and re-login inside the fenced dir if you need per-employee
+  credentials there.
+- Switching scope starts an empty dir, so the employee's previous session is
+  not resumed: the run warns once, naming the previous session's short id, and
+  leaves the old transcript where it was. Reverting to \`shared\` returns to the
+  untouched legacy session.
+- The session-snapshot work product is always scoped to the run's own cwd
+  (ACP \`session/list\`); it never lists another tenant's sessions. The toggle
+  \`sessionSnapshotDiagnostic\` additionally queries omp's host-wide \`_omp/*\`
+  listing and logs **counts only**.
+- Retention is an operator action, never a heartbeat side effect. To trim one
+  agent's state: \`omp gc --agent-dir <paperclip instance>/companies/<company>/acp-engine/agents/<agent>/omp-agent --apply --json\`
+  (dry-run without \`--apply\`). \`/dump anon\` remains the way to redact a
+  transcript before sharing it; the adapter itself never exports transcript
+  content, only session titles and ids of the run's own workspace.
 
 ### Run identity and control plane
 - Paperclip mints a per-run token for this adapter (\`supportsLocalAgentJwt\`)
