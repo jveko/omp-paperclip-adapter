@@ -39,6 +39,7 @@ import { materializeSkillManifest } from "./skill-manifest.js";
 import { governancePolicyActive, materializeGovernanceManifest, parseGovernancePolicy, validateGovernanceGate } from "./governance-manifest.js";
 import { materializeGovernanceOverlay } from "./governance-overlay.js";
 import { materializeBudgetOverlay } from "./budget-overlay.js";
+import { materializeThinkingOverlay } from "./thinking-overlay.js";
 import {
   bumpRunCounter, consumeToken, loadState, rotateIfTripped, saveState,
   sessionIntelDir, snapshotDigest,
@@ -172,12 +173,15 @@ export function resolveOmpAgentCommand(
   const extension = shouldAppendBridgeExtension(config, bridge)
     ? ` --extension ${bridge}`
     : "";
-  // --thinking flag rides agentCommand because the engine's set_config_option
-  // uses the wrong key (effort). Changing the level rotates the session via the
-  // fingerprint (buildOmpAcpConfig puts this in agentCommand, which is hashed).
-  // Applies to the explicit agentCommand too (skipped only when it already
-  // carries --thinking, including a dangling flag with no value).
-  const level = validThinkingLevel(config.thinking);
+  // Every thinking level except `off` rides the run's settings overlay
+  // (thinking-overlay.ts) as omp's `defaultThinkingLevel`. The flag is part of
+  // agentCommand, which the engine hashes into the session key, so a level
+  // there rotated the session on every edit. `off` is the exception: omp's
+  // setting has no `off` value (it discards one and reads `high`), and the CLI
+  // flag's `off` is the only way to ask for no thinking. Applies to the
+  // explicit agentCommand too (skipped only when it already carries
+  // --thinking, including a dangling flag with no value).
+  const level = validThinkingLevel(config.thinking) === "off" ? "off" : null;
   if (level && !/--thinking(\s|=|$)/.test(base)) return `${base}${extension} --thinking ${level}`;
   return `${base}${extension}`;
 }
@@ -842,18 +846,28 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
       });
     }
     const config = buildOmpAcpConfig(ctx.config, resolveModel, resolveCost, bridge);
+    // The thinking level rides its own overlay (fixed path, so an edit never
+    // rotates the session). Run-child only: no side channel reads a level.
+    const thinkingOverlay = await materializeThinkingOverlay(ctx.config, intelDir);
+    const thinkingOverlayPath = thinkingOverlay.status === "ok" ? thinkingOverlay.path : null;
+    if (thinkingOverlay.status === "error") {
+      await ctx.onEvent?.({
+        eventType: "run.system", stream: "system", level: "warn",
+        message: `omp thinking overlay write failed: ${thinkingOverlay.error}; the run continues at whatever level omp resolves on its own`,
+      });
+    }
     // Fold every overlay this run owns into config BEFORE engineConfig is
     // derived: the fork branch rebuilds engineConfig as
     // { ...config, warmHandleIdleMs: 50 }, so an overlay added only to
     // engineConfig would be silently dropped by the fork spread — PI_CONFIG_FILES
     // must ride on `config` to survive it. The order is the precedence order:
     // operator file, then the failover chain, then governance routing, then the
-    // budget thresholds.
+    // budget thresholds, then the thinking level.
     const operatorPi =
       typeof (ctx.config.env as Record<string, unknown> | undefined)?.PI_CONFIG_FILES === "string"
         ? (ctx.config.env as Record<string, unknown>).PI_CONFIG_FILES as string
         : "";
-    const mergedPi = [operatorPi, failoverOverlayPath, governanceOverlayPath, budgetOverlayPath]
+    const mergedPi = [operatorPi, failoverOverlayPath, governanceOverlayPath, budgetOverlayPath, thinkingOverlayPath]
       .filter(Boolean)
       .join(path.delimiter);
     if (mergedPi) config.env = { ...(config.env ?? {}), PI_CONFIG_FILES: mergedPi };
