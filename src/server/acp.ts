@@ -21,7 +21,6 @@ import {
   DEFAULT_ACP_ENGINE_MODE,
   DEFAULT_ACP_ENGINE_NON_INTERACTIVE_PERMISSIONS,
   DEFAULT_ACP_ENGINE_PERMISSION_MODE,
-  DEFAULT_ACP_ENGINE_WARM_HANDLE_IDLE_MS,
 } from "@paperclipai/adapter-utils/acpx-engine/constants";
 import {
   isFreeCost,
@@ -177,6 +176,25 @@ export function deriveDefaultTimeoutSec(cost: OmpModelCost | null | undefined): 
 }
 
 /**
+ * This adapter declares `supportsLocalAgentJwt: true` (./index.ts), so every
+ * run carries a run-scoped Paperclip token, injected as `PAPERCLIP_API_KEY`.
+ *
+ * That makes engine warm-handle reuse unsafe. The engine writes the token into
+ * the child environment only when it SPAWNS the child (pinned acpx-engine
+ * `execute.js:1014-1015`), a warm hit reuses the running process without
+ * re-spawning it (`execute.js:2608-2612, 2739`; `sessionOptions.env` is passed
+ * only when a session has to be established, `2696,2726`), and the pinned
+ * engine drops a warm handle for neither a run token nor run-scoped MCP servers
+ * (contract HEAD does: `execute.ts:4448-4453`). A reused child would therefore
+ * authenticate this run's work products and approval requests as an EARLIER
+ * run — an audit-attribution error, not a slowdown. So `buildOmpAcpConfig`
+ * pins `warmHandleIdleMs` to 0 for every run, and the executor reports a
+ * dropped operator opt-in. The one exception is the fork run's own 50 ms pin,
+ * which exists so the fork's resume can save and immediately close its handle.
+ */
+export const RUN_IDENTITY_ENABLED = true;
+
+/**
  * Build the ACP engine config for a run. `resolveModel` normalizes the raw
  * model ref (the raw value passes through when it returns null).
  * `resolveCost` receives the NORMALIZED model id and returns its cost card
@@ -200,8 +218,10 @@ export function buildOmpAcpConfig(
     nonInteractivePermissions:
       firstNonEmptyString(config.nonInteractivePermissions, config.acpNonInteractivePermissions) ??
       DEFAULT_ACP_ENGINE_NON_INTERACTIVE_PERMISSIONS,
-    warmHandleIdleMs:
-      config.warmHandleIdleMs ?? config.acpWarmHandleIdleMs ?? DEFAULT_ACP_ENGINE_WARM_HANDLE_IDLE_MS,
+    // Run identity pins warm reuse off for every run; the operator's value is
+    // dropped, never merged (see RUN_IDENTITY_ENABLED). The fork branch below
+    // re-pins 50 for its own single run, which is exempt by design.
+    warmHandleIdleMs: 0,
   };
   if (model) next.model = model;
   // timeoutSec is numeric — firstNonEmptyString would drop it. Coerce once:
@@ -760,6 +780,20 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     } else if (directive.kind === "rotate") {
       forceFreshOverride = true;
       intelState.pendingRotate = null; // applied this run
+    }
+
+    // The warm pin in buildOmpAcpConfig is silent in the engine, so report a
+    // dropped operator opt-in once per run — a dead knob must never look live.
+    // A fork run is exempt: its engineConfig carries the per-run 50 ms pin.
+    const requestedWarmIdleMs = Number(
+      ctx.config.warmHandleIdleMs ?? ctx.config.acpWarmHandleIdleMs ?? 0,
+    );
+    if (Number(engineConfig.warmHandleIdleMs ?? 0) === 0
+      && Number.isFinite(requestedWarmIdleMs) && requestedWarmIdleMs > 0) {
+      await ctx.onEvent?.({
+        eventType: "run.system", stream: "system", level: "warn",
+        message: `omp warm-handle reuse pinned to 0 for this run: run identity is enabled and the engine keeps the spawning run's PAPERCLIP_API_KEY in a reused child, so a warm hit would authenticate this run's work as an earlier run; remove warmHandleIdleMs to stop this warning`,
+      });
     }
 
     // Fork resume override: identity fields stay untouched (no env bust), so

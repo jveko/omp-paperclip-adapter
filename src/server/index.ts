@@ -3,7 +3,7 @@ import { sessionCodec } from "@paperclipai/adapter-utils/acpx-engine/session-cod
 import { execute } from "./execute.js";
 import { listOmpModels } from "./models.js";
 import { listOmpSkillsSnapshot, syncOmpSkills } from "./skills.js";
-import { probeOmpAcpSession, resolveOmpAgentCommand } from "./acp.js";
+import { probeOmpAcpSession, resolveOmpAgentCommand, RUN_IDENTITY_ENABLED } from "./acp.js";
 import { testEnvironment } from "./test.js";
 import { agentConfigurationDoc, type } from "../index.js";
 import { getSessionConfigSchema } from "./session-directives.js";
@@ -77,8 +77,9 @@ export function createServerAdapter(): OmpServerAdapterModule {
     // and usage work products and for the bridge's approval round-trip; a
     // missing token keeps failing closed with the existing explicit errors.
     // Blast radius (company-scoped API access for the run) is stated in
-    // agentConfigurationDoc.
-    supportsLocalAgentJwt: true,
+    // agentConfigurationDoc. The same constant pins engine warm-handle reuse
+    // off, because a reused child would keep an earlier run's token.
+    supportsLocalAgentJwt: RUN_IDENTITY_ENABLED,
     // omp consumes ACP `mcpServers` on session/new|load|resume|fork, so the
     // Paperclip connections/project servers must be delivered there.
     // `invocation_context` would hand this adapter a token it cannot serve.

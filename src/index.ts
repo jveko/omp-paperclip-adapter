@@ -29,7 +29,7 @@ ACP stdio transport.
 | \`timeoutSec\` / \`graceSec\` | 0 / 20 | unlimited run; SIGTERM grace |
 | \`env\` | \`{}\` | incl. \`OMP_PAPERCLIP_BILLING_TYPE\` (\`api\` or \`subscription\`) |
 | \`stateDir\`, \`instructionsFilePath\`, \`cwd\` | unset | passed through to engine |
-| \`warmHandleIdleMs\` | \`0\` | ms a persistent ACP process is kept warm between runs. Default 0 = closed after each turn. > 0 is NOT safe with run identity: the engine sets \`PAPERCLIP_API_KEY\` only when it spawns the child, so a reused process keeps the spawning run's token (see below) |
+| \`warmHandleIdleMs\` | \`0\` | pinned to \`0\` on every run (see below). The engine sets \`PAPERCLIP_API_KEY\` only when it spawns the child, so a reused process would keep an earlier run's token |
 
 ### Run identity and control plane
 - Paperclip mints a per-run token for this adapter (\`supportsLocalAgentJwt\`)
@@ -47,17 +47,21 @@ ACP stdio transport.
 - A managed AGENTS.md bundle is supported through \`instructionsFilePath\`: the
   engine renders that file into the run prompt and the ephemeral skills file
   merges the same path, so the bundle and \`skillsAsTools\` compose.
-- Warm reuse cannot carry run identity. The engine injects
-  \`PAPERCLIP_API_KEY\` in the child environment only when it spawns that child,
-  and a warm-hit run reuses the process without re-spawning it. With the pinned
-  engine (\`@paperclipai/adapter-utils\` 2026.824.x) nothing drops a warm handle
-  for run-scoped credentials, so a \`warmHandleIdleMs > 0\` employee keeps the
-  FIRST run's token in every later heartbeat: its bridge requests authenticate
-  as that earlier run, so approvals stall fail-closed and work products are
-  refused. Keep \`warmHandleIdleMs\` at its default \`0\` until an engine that
-  discards run-scoped credentials on reuse ships (contract HEAD does; see
-  ROADMAP items 1/8). Default installs are unaffected: 0 closes the process
-  after each turn.
+- Warm reuse is pinned off, deliberately. The engine injects
+  \`PAPERCLIP_API_KEY\` into the child environment only when it spawns that
+  child, and a warm-hit run reuses the process without re-spawning it. The
+  installed engine (\`@paperclipai/adapter-utils\` 2026.824.x) drops a warm
+  handle for neither a run token nor run-scoped MCP servers, so reuse would make
+  later heartbeats speak with the FIRST run's token: their work products and
+  approval requests would authenticate as that earlier run (wrong attribution,
+  not just a failure). Because that is an audit-integrity defect, the adapter
+  forces \`warmHandleIdleMs: 0\` on every run, whatever the config says, and logs
+  one \`warm-handle reuse pinned to 0\` warning when a configured value was
+  ignored. The only exception is the fork run's own single-run 50 ms pin, which
+  exists so the fork resume can save and immediately close its handle. Lift the
+  pin in \`buildOmpAcpConfig\` only when the dependency's engine discards
+  run-scoped credentials on reuse (contract HEAD already does; see ROADMAP items
+  1/8).
 - No provider quota windows are reported. \`getQuotaWindows\` receives no adapter
   config, so it could only report the Paperclip host's omp login rather than the
   employee's; the subscription-quota card stays empty for this adapter.

@@ -164,6 +164,35 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     expect(merged.config.env?.OMP_PAPERCLIP_RETRY).toBeUndefined();
   });
 
+  it("pins warm-handle reuse to 0 under run identity and reports the dropped opt-in", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const events: Array<{ level?: string; message?: string }> = [];
+    const run = createOmpAcpExecutor();
+    await run(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, warmHandleIdleMs: 300_000 },
+      authToken: "run-jwt-SENTINEL",
+      onEvent: async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); },
+    }));
+    // A reused child keeps the spawning run's PAPERCLIP_API_KEY (the engine sets
+    // it only at spawn), so a warm hit would authenticate this run's work as an
+    // earlier run. The adapter pins the knob off regardless of operator input.
+    expect(executorFn.mock.calls[0][0].config.warmHandleIdleMs).toBe(0);
+    const warnings = events.filter((e) => e.level === "warn" && /warm-handle/i.test(e.message ?? ""));
+    expect(warnings).toHaveLength(1);
+    expect(JSON.stringify(events)).not.toContain("SENTINEL");
+
+    // Default config (never opted in) is already 0: no warning noise per heartbeat.
+    const quiet: Array<{ level?: string; message?: string }> = [];
+    const run2 = createOmpAcpExecutor();
+    await run2(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}` },
+      authToken: "run-jwt-SENTINEL",
+      onEvent: async (ev: unknown) => { quiet.push(ev as { level?: string; message?: string }); },
+    }));
+    expect(quiet.some((e) => /warm-handle/i.test(e.message ?? ""))).toBe(false);
+    expect(JSON.stringify(quiet)).not.toContain("SENTINEL");
+  });
+
   it("fork still applies with broker env threaded to the side channel", async () => {
     const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
