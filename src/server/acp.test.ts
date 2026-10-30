@@ -834,6 +834,39 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     expect((await loadState(dir)).lastThinking).toEqual({ sessionId: "fresh-2", level: "high" });
   });
 
+  it("does not lose a level change that coincides with a fork of the running session", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
+    const dir = sessionIntelDir("co-1", "agent-1");
+    const seeded = await loadState(dir);
+    // The level edit is detected against the RUNNING session (old) and a fork of
+    // that same session is armed: the fork outranks the rotation this run.
+    seeded.lastThinking = { sessionId: "old", level: "low" };
+    await saveState(dir, seeded);
+    await createOmpAcpExecutor()(baseCtx({
+      config: {
+        command: `${process.execPath} ${fakeAcp}`,
+        sessionForkSourceId: "old", sessionForkToken: "t1", thinking: "high",
+      },
+    }));
+    // The fork wins and keeps the source's level, so the pending rotation is
+    // consumed — but the mismatch survives in the record instead of vanishing.
+    expect((await loadState(dir)).lastThinking).toEqual({ sessionId: "fork-1", level: "low" });
+    const next = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fresh-5", sessionKey: "sk" } });
+    const events: Array<{ level?: string; message?: string }> = [];
+    await createOmpAcpExecutor()(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, thinking: "high" },
+      runtime: {
+        sessionId: "fork-1", sessionDisplayId: "fork-1", taskKey: "t",
+        sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" },
+      } as AdapterExecutionContext["runtime"],
+      onEvent: async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); },
+    }));
+    // Next heartbeat applies it, and says so.
+    expect(next.mock.calls[0][0].runtime.sessionParams).toEqual({});
+    expect(events.some((e) => /thinking level changed/.test(e.message ?? ""))).toBe(true);
+    expect((await loadState(dir)).lastThinking).toEqual({ sessionId: "fresh-5", level: "high" });
+  });
+
   it("leaves a fork's level unknown when the record names another session", async () => {
     const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
     const dir = sessionIntelDir("co-1", "agent-1");
