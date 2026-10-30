@@ -2,7 +2,9 @@ import os from "node:os";
 import path from "node:path";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
-import { FAILOVER_CONFIG_FILE, materializeFailoverOverlay } from "./failover-config.js";
+import {
+  FAILOVER_CONFIG_FILE, materializeFailoverOverlay, validateRetryFallbackConfig,
+} from "./failover-config.js";
 
 describe("materializeFailoverOverlay", () => {
   it("returns none when there is no fallback chain", async () => {
@@ -97,5 +99,103 @@ describe("materializeFailoverOverlay", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("quota-aware retry knobs", () => {
+  it("writes every configured knob under retry, next to the chat chain", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "fov-"));
+    try {
+      const res = await materializeFailoverOverlay({
+        fallbackChain: "brokerco/main",
+        fallbackOn: "usage-limit",
+        fallbackRevertPolicy: "never",
+        waitForUsageReset: true,
+        maxDelayMs: 60000,
+      }, dir);
+      expect(res.status).toBe("ok");
+      const yaml = await readFile(res.status === "ok" ? res.path : "", "utf8");
+      // One `retry:` block: omp merges a second one over the first, so the
+      // chain and the knobs must not be written as two.
+      expect(yaml.match(/^retry:$/gm)).toHaveLength(1);
+      expect(yaml).toContain("  fallbackOn: usage-limit");
+      expect(yaml).toContain("  fallbackRevertPolicy: never");
+      expect(yaml).toContain("  waitForUsageReset: true");
+      expect(yaml).toContain("  maxDelayMs: 60000");
+      // The chat-session chain survives alongside them.
+      expect(yaml).toContain('      - "brokerco/main"');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("writes the knobs on their own, without inventing a chain", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "fov-"));
+    try {
+      const res = await materializeFailoverOverlay({ waitForUsageReset: "true" }, dir);
+      expect(res.status).toBe("ok");
+      const yaml = await readFile(res.status === "ok" ? res.path : "", "utf8");
+      expect(yaml).toContain("  waitForUsageReset: true");
+      expect(yaml).not.toContain("fallbackChains");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("omits knobs the operator did not set", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "fov-"));
+    try {
+      const res = await materializeFailoverOverlay({ fallbackChain: "brokerco/main" }, dir);
+      expect(res.status).toBe("ok");
+      const yaml = await readFile(res.status === "ok" ? res.path : "", "utf8");
+      expect(yaml).not.toContain("fallbackOn");
+      expect(yaml).not.toContain("fallbackRevertPolicy");
+      expect(yaml).not.toContain("waitForUsageReset");
+      expect(yaml).not.toContain("maxDelayMs");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses to write a value omp would silently discard", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "fov-"));
+    try {
+      const res = await materializeFailoverOverlay({ fallbackChain: "brokerco/main", fallbackOn: "sometimes" }, dir);
+      expect(res.status).toBe("error");
+      expect(res.status === "error" && res.error).toContain("fallbackOn");
+      // Nothing was written: a file omp would drop is worse than no file.
+      await expect(readFile(path.join(dir, FAILOVER_CONFIG_FILE), "utf8")).rejects.toThrow();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("validateRetryFallbackConfig", () => {
+  it("accepts unset knobs and the documented enum values", () => {
+    expect(validateRetryFallbackConfig({})).toBeNull();
+    for (const fallbackOn of ["any", "usage-limit", "except-usage-limit"]) {
+      expect(validateRetryFallbackConfig({ fallbackOn })).toBeNull();
+    }
+    for (const fallbackRevertPolicy of ["cooldown-expiry", "never"]) {
+      expect(validateRetryFallbackConfig({ fallbackRevertPolicy })).toBeNull();
+    }
+    // Typed config may arrive as strings from the board.
+    expect(validateRetryFallbackConfig({ waitForUsageReset: "false", maxDelayMs: "300000" })).toBeNull();
+  });
+
+  it("names the key and the allowed values for an unknown enum", () => {
+    const on = validateRetryFallbackConfig({ fallbackOn: "sometimes" });
+    expect(on).toContain("fallbackOn");
+    expect(on).toContain("usage-limit");
+    const revert = validateRetryFallbackConfig({ fallbackRevertPolicy: "eventually" });
+    expect(revert).toContain("fallbackRevertPolicy");
+    expect(revert).toContain("cooldown-expiry");
+  });
+
+  it("rejects a non-boolean wait and a negative or non-numeric delay", () => {
+    expect(validateRetryFallbackConfig({ waitForUsageReset: "yes" })).toContain("waitForUsageReset");
+    expect(validateRetryFallbackConfig({ maxDelayMs: -1 })).toContain("maxDelayMs");
+    expect(validateRetryFallbackConfig({ maxDelayMs: "soon" })).toContain("maxDelayMs");
   });
 });

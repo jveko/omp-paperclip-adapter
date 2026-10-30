@@ -31,7 +31,7 @@ import {
 import { attributeRunCost, type RunCostFields } from "./cost-truth.js";
 import { buildSkillsInstructions, skillsDir, type SkillMarkdownSource } from "./skills.js";
 import { readRetryConfig, runWithFreshSessionRetry, withRetryChain } from "./retry.js";
-import { materializeFailoverOverlay, parseFallbackChain } from "./failover-config.js";
+import { materializeFailoverOverlay, parseFallbackChain, validateRetryFallbackConfig } from "./failover-config.js";
 import { ompEnv } from "./omp-env.js";
 import { prepareSessionScope } from "./session-scope.js";
 import { forkOmpSession, findOmpSessionCwd, queryOmpSessions } from "./session-intel.js";
@@ -647,6 +647,13 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     const gateErr = validateGovernanceGate(ctx.config);
     if (gateErr) {
       return { exitCode: 1, signal: null, timedOut: false, errorCode: "omp_config_error", errorMessage: gateErr };
+    }
+    // Retry knobs are an enum omp validates by DISCARDING: an unknown
+    // `fallbackOn` reads back as `any` with only a startup warning nobody on
+    // this lane sees. Refuse the run instead of writing a file that does nothing.
+    const retryKnobErr = validateRetryFallbackConfig(ctx.config);
+    if (retryKnobErr) {
+      return { exitCode: 1, signal: null, timedOut: false, errorCode: "omp_config_error", errorMessage: retryKnobErr };
     }
     const preparedScope = await prepareSessionScope(ctx.config, {
       companyId: ctx.agent.companyId, agentId: ctx.agent.id,

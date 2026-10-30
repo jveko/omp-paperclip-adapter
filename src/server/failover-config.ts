@@ -4,9 +4,9 @@ import path from "node:path";
 /**
  * Fixed filename for this run's failover overlay, overwritten in place whenever
  * there is something to say about model availability. From v0.8 this file
- * carries ONLY `retry.fallbackChains`: the governance keys live in their own
- * overlay (governance-overlay.ts) because they must reach the run child without
- * ever reaching the side channels that read this one.
+ * carries NO governance keys: they live in their own overlay
+ * (governance-overlay.ts) because they must reach the run child without ever
+ * reaching the side channels that read this one.
  */
 export const FAILOVER_CONFIG_FILE = "omp-failover-config.yml";
 
@@ -22,27 +22,131 @@ export function parseFallbackChain(config: Record<string, unknown>): string[] {
     .filter((s) => s.length > 0);
 }
 
+/** `retry.fallbackOn`: which failures walk the chain (`docs/settings.md`). */
+export const FALLBACK_ON = ["any", "usage-limit", "except-usage-limit"] as const;
+/** `retry.fallbackRevertPolicy`: whether the primary model comes back. */
+export const FALLBACK_REVERT_POLICY = ["cooldown-expiry", "never"] as const;
+
+export interface RetryFallbackSettings {
+  fallbackOn?: (typeof FALLBACK_ON)[number];
+  fallbackRevertPolicy?: (typeof FALLBACK_REVERT_POLICY)[number];
+  waitForUsageReset?: boolean;
+  maxDelayMs?: number;
+}
+
+export type RetryFallbackRead =
+  | { ok: true; settings: RetryFallbackSettings }
+  | { ok: false; error: string };
+
+/** `true`/`false` as a board field may deliver them, else null. */
+function boolish(value: unknown): boolean | null {
+  if (typeof value === "boolean") return value;
+  if (value === "true") return true;
+  if (value === "false") return false;
+  return null;
+}
+
+function numberish(value: unknown): number | null {
+  const n = typeof value === "number" ? value : typeof value === "string" && value.trim() !== "" ? Number(value) : NaN;
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Read and validate the quota-aware retry knobs. omp validates these at config
+ * load and, for a value outside an enum, DISCARDS the key and reads its default
+ * (`fallbackOn: sometimes` reads back `any`) — a knob that would silently do
+ * nothing, so the adapter refuses it instead of writing the file.
+ */
+export function readRetryFallbackSettings(config: Record<string, unknown>): RetryFallbackRead {
+  const settings: RetryFallbackSettings = {};
+  const on = config.fallbackOn;
+  if (on !== undefined && on !== null && on !== "") {
+    const match = FALLBACK_ON.find((value) => value === on);
+    if (!match) {
+      return {
+        ok: false,
+        error: `fallbackOn is '${String(on)}' but expected one of ${FALLBACK_ON.join(", ")}.`,
+      };
+    }
+    settings.fallbackOn = match;
+  }
+  const revert = config.fallbackRevertPolicy;
+  if (revert !== undefined && revert !== null && revert !== "") {
+    const match = FALLBACK_REVERT_POLICY.find((value) => value === revert);
+    if (!match) {
+      return {
+        ok: false,
+        error: `fallbackRevertPolicy is '${String(revert)}' but expected one of ${FALLBACK_REVERT_POLICY.join(", ")}.`,
+      };
+    }
+    settings.fallbackRevertPolicy = match;
+  }
+  const wait = config.waitForUsageReset;
+  if (wait !== undefined && wait !== null && wait !== "") {
+    const parsed = boolish(wait);
+    if (parsed === null) {
+      return {
+        ok: false,
+        error: `waitForUsageReset is '${String(wait)}' but expected true or false.`,
+      };
+    }
+    settings.waitForUsageReset = parsed;
+  }
+  const delay = config.maxDelayMs;
+  if (delay !== undefined && delay !== null && delay !== "") {
+    const parsed = numberish(delay);
+    if (parsed === null || parsed < 0) {
+      return {
+        ok: false,
+        error: `maxDelayMs is '${String(delay)}' but expected a non-negative number of milliseconds (0 disables the cap).`,
+      };
+    }
+    settings.maxDelayMs = parsed;
+  }
+  return { ok: true, settings };
+}
+
+/** Actionable message when a retry knob is outside its documented values, else null. */
+export function validateRetryFallbackConfig(config: Record<string, unknown>): string | null {
+  const read = readRetryFallbackSettings(config);
+  return read.ok ? null : read.error;
+}
+
 /**
  * Materialize this run's failover overlay: the per-agent model fallback chain
- * (one selector per line in config.fallbackChain), injected through
- * `PI_CONFIG_FILES`. Writes the FIXED filename in <dir>, overwriting in place,
- * so one path carries the chain (PI_CONFIG_FILES is appended once by the
- * caller). Returns a discriminated result: "none" when there is nothing to
- * overlay, "ok" with the overlay path on success, or "error" with the message
- * when the write fails. A failed write never throws: the run proceeds without
- * the overlay.
+ * (one selector per line in config.fallbackChain) plus the quota-aware retry
+ * knobs, all under one `retry:` block. `fallbackChains.default` is the
+ * CHAT-session chain (omp's `default` role); model-kind roles never inherit it,
+ * so it must not be rewritten as a role-specific chain.
+ *
+ * Injected through `PI_CONFIG_FILES`. Writes the FIXED filename in <dir>,
+ * overwriting in place, so one path carries the settings (PI_CONFIG_FILES is
+ * appended once by the caller) and an edit never rotates the session. Returns a
+ * discriminated result: "none" when there is nothing to overlay, "ok" with the
+ * overlay path on success, or "error" with the message when the write fails or
+ * a knob is invalid. Never throws: the run proceeds without the overlay.
  */
 export async function materializeFailoverOverlay(
   config: Record<string, unknown>,
   dir: string,
 ): Promise<{ status: "none" } | { status: "ok"; path: string } | { status: "error"; error: string }> {
   const chain = parseFallbackChain(config);
-  if (chain.length === 0) return { status: "none" };
+  const read = readRetryFallbackSettings(config);
+  if (!read.ok) return { status: "error", error: read.error };
+  const { settings } = read;
+  const knobs = [
+    settings.fallbackOn === undefined ? null : `  fallbackOn: ${settings.fallbackOn}`,
+    settings.fallbackRevertPolicy === undefined ? null : `  fallbackRevertPolicy: ${settings.fallbackRevertPolicy}`,
+    settings.waitForUsageReset === undefined ? null : `  waitForUsageReset: ${String(settings.waitForUsageReset)}`,
+    settings.maxDelayMs === undefined ? null : `  maxDelayMs: ${settings.maxDelayMs}`,
+  ].filter((line): line is string => line !== null);
+  if (chain.length === 0 && knobs.length === 0) return { status: "none" };
   const lines: string[] = [
     "retry:",
-    "  fallbackChains:",
-    "    default:",
-    ...chain.map((sel) => `      - ${JSON.stringify(sel)}`),
+    ...(chain.length === 0
+      ? []
+      : ["  fallbackChains:", "    default:", ...chain.map((sel) => `      - ${JSON.stringify(sel)}`)]),
+    ...knobs,
   ];
   const yaml = `${lines.join("\n")}\n`;
   const file = path.join(dir, FAILOVER_CONFIG_FILE);

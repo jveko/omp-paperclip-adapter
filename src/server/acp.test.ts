@@ -629,6 +629,19 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     expect(merged.config.agentCommand).not.toContain("--extension");
   });
 
+  it("fails the run before the engine when a retry knob is outside its enum", async () => {
+    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "x", sessionKey: "sk" } });
+    const run = createOmpAcpExecutor();
+    const res = await run(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, fallbackOn: "sometimes" },
+    }));
+    expect(res.errorCode).toBe("omp_config_error");
+    expect(res.errorMessage).toContain("fallbackOn");
+    // omp discards an unknown enum and reads the default, so a warn would be a
+    // knob that silently does nothing: refuse before any engine work instead.
+    expect(engineMocks.createAcpxEngineExecutor.mock.calls.length).toBe(0);
+  });
+
   it("fails the run early when broker mode lacks env", async () => {
     fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "x", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
