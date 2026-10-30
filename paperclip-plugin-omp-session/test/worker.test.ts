@@ -87,7 +87,7 @@ describe("omp-session-overview data handler", () => {
     stubDb(harness, [RUN_1, RUN_2], [
       { heartbeat_run_id: "run-1", model: "gpt-4", cost_cents: 500 },
       { heartbeat_run_id: "run-1", model: "gpt-4", cost_cents: 200 },
-      { heartbeat_run_id: "run-1", model: null, cost_cents: 0 },
+      { heartbeat_run_id: "run-1", model: "gpt-4", cost_cents: 0 },
       { heartbeat_run_id: "run-2", model: "claude-3", cost_cents: 300 },
     ]);
 
@@ -110,7 +110,7 @@ describe("omp-session-overview data handler", () => {
       mcpServerCount: 2,
     });
     expect(r1.usage).toEqual({ prompt_tokens: 1500, completion_tokens: 800 });
-    // 500 + 200 + 0 cents (one NULL-model event) = 700 -> 7.00 USD
+    // 500 + 200 + 0 cents = 700 -> 7.00 USD
     expect(r1.costUsd).toBe(7);
     expect(r1.model).toBe("gpt-4");
 
@@ -183,9 +183,9 @@ describe("omp-session-overview data handler", () => {
     expect(overview.runs[0].model).toBe("gpt-4, claude-3");
   });
 
-  it("leaves model null when every cost event has a null model", async () => {
+  it("reports no model when the run has no cost events", async () => {
     const harness = await makeHarness();
-    stubDb(harness, [RUN_1], [{ heartbeat_run_id: "run-1", model: null, cost_cents: 42 }]);
+    stubDb(harness, [RUN_1], []);
 
     const overview = await harness.getData<OmpSessionOverview>(
       "omp-session-overview",
@@ -193,8 +193,7 @@ describe("omp-session-overview data handler", () => {
     );
 
     expect(overview.runs[0].model).toBeNull();
-    // cost summing must survive a missing model
-    expect(overview.runs[0].costUsd).toBeCloseTo(0.42);
+    expect(overview.runs[0].costUsd).toBe(0);
   });
 
   it("degrades gracefully on malformed usage_json", async () => {

@@ -24,7 +24,7 @@ interface RunOverview {
   sessionRuntime: SessionRuntime | null;
   usage: Record<string, number> | null;
   costUsd: number;
-  // Nullable: cost_events.model is NULL when the provider reported none.
+  // Null when the run has no cost events; cost_events.model is NOT NULL.
   model: string | null;
 }
 

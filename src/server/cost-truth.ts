@@ -4,7 +4,9 @@ import type { OmpPricingStatus } from "./models.js";
 /**
  * The installed adapter-utils result type predates the accounting fields, so
  * the adapter declares the subset it emits here (see the skew note in
- * ./index.ts). Paperclip's run-completion reads these off the result verbatim.
+ * ./index.ts). Paperclip's run-completion whitelist-copies these names into the
+ * run's usage receipt; an unknown name would be dropped, and `usageByModel`
+ * whose sums do not match the run totals is discarded by the ledger.
  */
 export interface RunCostFields {
   /** Billed cost when omp's pricing status itself fixes the amount at zero. */
@@ -39,6 +41,8 @@ export function attributeRunCost(input: {
   pricingStatus: OmpPricingStatus | null;
   costUsd?: number | null;
   usage?: UsageSummary | null;
+  /** `session_cumulative` totals cannot back a run-scoped receipt. */
+  usageBasis?: "per_run" | "session_cumulative" | null;
   model?: string | null;
   failoverConfigured: boolean;
 }): RunCostAttribution {
@@ -76,7 +80,8 @@ export function attributeRunCost(input: {
 
   const model = typeof input.model === "string" && input.model.length > 0 ? input.model : null;
   if (input.usage != null && costUsd != null && model !== null
-    && fields.costStatus !== "unpriced" && !input.failoverConfigured) {
+    && fields.costStatus !== "unpriced" && !input.failoverConfigured
+    && input.usageBasis !== "session_cumulative") {
     fields.usageByModel = [{ model, usage: input.usage, costUsd }];
   } else if (input.failoverConfigured && input.usage != null && costUsd != null) {
     warnings.push(

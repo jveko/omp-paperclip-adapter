@@ -32,6 +32,17 @@ export type BudgetOverlayResult =
   | { status: "error"; error: string };
 
 /**
+ * `String(1e-7)` is `"1e-7"`, which a YAML 1.1 reader returns as a string and
+ * omp's cost validation then rejects (dropping the whole overlay). Write plain
+ * decimals; ordinary caps are already plain and pass through unchanged.
+ */
+function plainDecimal(value: number): string {
+  const text = String(value);
+  if (!/[eE]/.test(text)) return text;
+  return value.toFixed(20).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+/**
  * Write this run's budget overlay, overwriting the fixed filename in place so
  * PI_CONFIG_FILES carries a stable path (a changing path would rotate the
  * session via the fingerprint; changing the content does not). Never throws:
@@ -48,8 +59,8 @@ export async function materializeBudgetOverlay(
   const warn = budgetWarnUsd(capUsd);
   const lines = [
     "session:",
-    `  maxCost: ${capUsd}`,
-    ...(warn === null ? [] : [`  warnCost: ${warn}`]),
+    `  maxCost: ${plainDecimal(capUsd)}`,
+    ...(warn === null ? [] : [`  warnCost: ${plainDecimal(warn)}`]),
   ];
   const file = path.join(dir, BUDGET_CONFIG_FILE);
   try {

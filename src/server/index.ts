@@ -17,11 +17,12 @@ interface DetectedOmpModel {
 }
 
 /**
- * The installed adapter-utils `AdapterModel` declares only id/label; contract
- * HEAD's model consumers read the rate card and context window, and the
- * registry hands this array to the board verbatim. Re-declaring the extras here
- * is the one place the dependency skew is recorded (same pattern as
- * `runtimeToolDelivery` below).
+ * The installed adapter-utils `AdapterModel` (and contract HEAD's) declares only
+ * id/label. The registry hands the array to the route verbatim
+ * (`registry.ts` refreshAdapterModels → `res.json`), so the extra fields reach
+ * the board JSON without a type change on either side; a consumer that does not
+ * know them ignores them. Re-declaring them here is the one place the skew is
+ * recorded (same pattern as `runtimeToolDelivery` below).
  */
 interface OmpAdapterModel {
   id: string;

@@ -15,7 +15,8 @@ interface HeartbeatRunRow {
 interface CostEventRow {
   /** `cost_events.heartbeat_run_id` (there is no `run_id` column). */
   heartbeat_run_id: string;
-  model: string | null;
+  /** `cost_events.model` is `text NOT NULL`. */
+  model: string;
   /**
    * `numeric(24,7)`: postgres.js leaves numerics as strings (no type parser),
    * so this is a string at runtime even when it looks like a number.
@@ -37,9 +38,9 @@ interface RunOverview {
   sessionRuntime: SessionRuntime | null;
   usage: Record<string, number> | null;
   costUsd: number;
-  // Distinct non-null cost_events.model values for the run, first-seen order,
-  // joined with ", " (a failover run can span models); null when every event
-  // has a NULL model or the run has no cost events.
+  // Distinct cost_events.model values for the run, first-seen order, joined
+  // with ", " (a failover run can span models); null when the run has no
+  // cost events.
   model: string | null;
 }
 
@@ -141,9 +142,9 @@ const plugin = definePlugin({
       );
 
       // Build cost map: heartbeat_run_id -> totalCents, and model map:
-      // heartbeat_run_id -> distinct non-null models in row order.
-      // cost_events.model is nullable. `cost_cents` arrives as a string, so a
-      // `typeof === "number"` check would silently total $0.00.
+      // heartbeat_run_id -> distinct models in row order. `cost_cents` arrives
+      // as a string, so a `typeof === "number"` check would silently total
+      // $0.00.
       const costByRun = new Map<string, number>();
       const modelsByRun = new Map<string, Set<string>>();
       for (const row of costRows) {
@@ -152,11 +153,9 @@ const plugin = definePlugin({
           row.heartbeat_run_id,
           (costByRun.get(row.heartbeat_run_id) ?? 0) + (Number.isFinite(cents) ? cents : 0),
         );
-        if (row.model) {
-          const models = modelsByRun.get(row.heartbeat_run_id) ?? new Set<string>();
-          models.add(row.model);
-          modelsByRun.set(row.heartbeat_run_id, models);
-        }
+        const models = modelsByRun.get(row.heartbeat_run_id) ?? new Set<string>();
+        models.add(row.model);
+        modelsByRun.set(row.heartbeat_run_id, models);
       }
 
       // Summary cost is scoped to the SAME recent-runs window as Runs/Duration

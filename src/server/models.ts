@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { validThinkingLevel } from "./thinking-levels.js";
+import { validThinkingSuffix } from "./thinking-levels.js";
 
 export interface OmpModelCost {
   input: number;
@@ -233,6 +233,6 @@ function resolveConfiguredSelector(selector: string, listing: OmpModelInfo[]): s
   if (direct) return direct;
   const colon = selector.lastIndexOf(":");
   if (colon <= 0) return null;
-  if (!validThinkingLevel(selector.slice(colon + 1))) return null;
+  if (!validThinkingSuffix(selector.slice(colon + 1))) return null;
   return normalizeOmpModelId(selector.slice(0, colon).trim(), listing);
 }

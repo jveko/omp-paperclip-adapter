@@ -1088,6 +1088,7 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
       pricingStatus: models.find((m) => m.id === attributedModel)?.pricingStatus ?? null,
       costUsd: result.costUsd,
       usage: result.usage,
+      usageBasis: result.usageBasis,
       model: attributedModel,
       failoverConfigured: parseFallbackChain(ctx.config).length > 0,
     });

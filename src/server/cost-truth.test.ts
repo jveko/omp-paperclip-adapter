@@ -81,6 +81,14 @@ describe("attributeRunCost usageByModel", () => {
     expect(attribute({ pricingStatus: "unknown" }).fields.usageByModel).toBeUndefined();
   });
 
+  it("omits the receipt when the usage totals are session-cumulative, not run-scoped", () => {
+    expect(attribute({ usageBasis: "session_cumulative" }).fields.usageByModel).toBeUndefined();
+  });
+
+  it("keeps the receipt for a per-run usage basis", () => {
+    expect(attribute({ usageBasis: "per_run" }).fields.usageByModel).toHaveLength(1);
+  });
+
   it("omits the receipt when the run's usage is unknown", () => {
     expect(attribute({ usage: undefined }).fields.usageByModel).toBeUndefined();
   });

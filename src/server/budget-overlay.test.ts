@@ -50,6 +50,14 @@ describe("materializeBudgetOverlay", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  it("writes a sub-cent cap in plain decimal, which omp's YAML reader parses as a number", async () => {
+    await materializeBudgetOverlay(0.0000001, dir);
+    const text = await readFile(path.join(dir, BUDGET_CONFIG_FILE), "utf8");
+    expect(text).toBe("session:\n  maxCost: 0.0000001\n");
+    expect(text).not.toMatch(/e-/i);
+    await rm(dir, { recursive: true, force: true });
+  });
+
   it("reports a write failure instead of throwing", async () => {
     const blocker = path.join(dir, BUDGET_CONFIG_FILE);
     await writeFile(blocker, "x", "utf8");
