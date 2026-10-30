@@ -187,6 +187,49 @@ describe("detectOmpConfiguredModel", () => {
     expect(await models.detectOmpConfiguredModel()).toBeNull();
   });
 
+  it("resolves the configured selector when it carries a thinking suffix", async () => {
+    const models = await freshModels();
+    // Real omp config: `modelRoles.default` is `provider/id:<effort>`, which is
+    // not a catalog id. The effort must not leak into `model`.
+    execFileMock.mockImplementation((_c: string, args: string[], _o: unknown, cb: (e: null, out: string) => void) =>
+      cb(null, args[0] === "config"
+        ? JSON.stringify({ key: "modelRoles", value: { default: "openrouter/glm-5.2:high" } })
+        : SAMPLE));
+    expect(await models.detectOmpConfiguredModel()).toEqual({
+      model: "openrouter/glm-5.2", provider: "openrouter", source: "config:modelRoles.default",
+    });
+  });
+
+  it("accepts omp's unambiguous thinking abbreviations in the suffix", async () => {
+    const models = await freshModels();
+    execFileMock.mockImplementation((_c: string, args: string[], _o: unknown, cb: (e: null, out: string) => void) =>
+      cb(null, args[0] === "config"
+        ? JSON.stringify({ key: "modelRoles", value: { default: "openrouter/glm-5.2:xhi" } })
+        : SAMPLE));
+    expect((await models.detectOmpConfiguredModel())?.model).toBe("openrouter/glm-5.2");
+  });
+
+  it("does not split a colon that is part of a catalog id", async () => {
+    const models = await freshModels();
+    const withColon = JSON.stringify({
+      models: [{ provider: "openrouter", id: "glm-5.2:exacto", name: "Exacto" }],
+    });
+    execFileMock.mockImplementation((_c: string, args: string[], _o: unknown, cb: (e: null, out: string) => void) =>
+      cb(null, args[0] === "config"
+        ? JSON.stringify({ key: "modelRoles", value: { default: "openrouter/glm-5.2:exacto" } })
+        : withColon));
+    expect((await models.detectOmpConfiguredModel())?.model).toBe("openrouter/glm-5.2:exacto");
+  });
+
+  it("returns null when the selector's suffix is not a thinking level", async () => {
+    const models = await freshModels();
+    execFileMock.mockImplementation((_c: string, args: string[], _o: unknown, cb: (e: null, out: string) => void) =>
+      cb(null, args[0] === "config"
+        ? JSON.stringify({ key: "modelRoles", value: { default: "openrouter/glm-5.2:bogus" } })
+        : SAMPLE));
+    expect(await models.detectOmpConfiguredModel()).toBeNull();
+  });
+
   it("returns null when omp is missing or config output is unreadable", async () => {
     const models = await freshModels();
     execFileMock.mockImplementation((_c: string, _a: string[], _o: unknown, cb: (e: Error, out: string) => void) =>

@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { validThinkingLevel } from "./thinking-levels.js";
 
 export interface OmpModelCost {
   input: number;
@@ -213,8 +214,25 @@ export async function detectOmpConfiguredModel(
   if (typeof value !== "object" || value === null || !("default" in value)) return null;
   const raw = value.default;
   if (typeof raw !== "string" || raw.trim() === "") return null;
-  const resolved = normalizeOmpModelId(raw, await listOmpModels({ command }));
+  const resolved = resolveConfiguredSelector(raw.trim(), await listOmpModels({ command }));
   if (!resolved) return null;
   const provider = resolved.slice(0, resolved.indexOf("/"));
   return { model: resolved, provider, source: "config:modelRoles.default" };
+}
+
+/**
+ * Resolve a role value to a catalog id. omp writes roles as
+ * `provider/id[:<thinking>]` (`modelRoles.default: "prov/m:high"` on a real
+ * install), so a full-pattern match wins first — an id may itself contain a
+ * colon (OpenRouter `:exacto`) — and only a suffix that parses as a thinking
+ * selector is stripped, exactly like omp's own resolver. The effort never
+ * becomes part of the returned model.
+ */
+function resolveConfiguredSelector(selector: string, listing: OmpModelInfo[]): string | null {
+  const direct = normalizeOmpModelId(selector, listing);
+  if (direct) return direct;
+  const colon = selector.lastIndexOf(":");
+  if (colon <= 0) return null;
+  if (!validThinkingLevel(selector.slice(colon + 1))) return null;
+  return normalizeOmpModelId(selector.slice(0, colon).trim(), listing);
 }

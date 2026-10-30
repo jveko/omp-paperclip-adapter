@@ -1,4 +1,7 @@
 import type { AdapterConfigSchema } from "@paperclipai/adapter-utils";
+import { validThinkingLevel } from "./thinking-levels.js";
+
+export { validThinkingLevel } from "./thinking-levels.js";
 
 export interface SessionIntelConfig {
   browser: boolean;
@@ -106,19 +109,6 @@ export function resolveRunDirective(
   }
   if (state.pendingRotate) return { kind: "rotate", reason: state.pendingRotate.reason };
   return { kind: "none" };
-}
-
-/** omp's CLI thinking levels (parseCliThinkingLevel). `inherit` is intentionally
- * excluded (omp rejects it) and `default` is a sentinel meaning "emit no flag". */
-const THINKING_LEVELS = ["off", "auto", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
-
-export function validThinkingLevel(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  // Trim so padded values from the API (" medium ") still match: a padded value
-  // that failed matching would silently drop the directive AND raise a
-  // misleading warn. validateThinkingLevel delegates here, so both paths are fixed.
-  const trimmed = value.trim();
-  return (THINKING_LEVELS as readonly string[]).includes(trimmed) ? trimmed : null;
 }
 
 /** Actionable message when config.thinking holds an out-of-enum value, else null.
