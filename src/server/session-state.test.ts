@@ -10,7 +10,7 @@ import {
 const emptyState = (): SessionIntelState => ({
   forkConsumed: [], forceFreshConsumed: [], runCounters: {},
   pendingRotate: null, lastSnapshotDigest: null, lastRotation: null,
-  recentRuns: [], lastUsageDigest: null, lastScope: null,
+  recentRuns: [], lastUsageDigest: null, lastScope: null, lastThinking: null,
 });
 
 describe("session state", () => {
@@ -95,6 +95,26 @@ describe("session state", () => {
     const loaded = await loadState(dir);
     expect(loaded.recentRuns).toEqual([{ at: "t", inputTokens: 1, outputTokens: 2 }]);
     expect(loaded.lastUsageDigest).toBeNull();
+  });
+
+  it("round-trips the level the current session was started with", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "omp-intel-"));
+    dirs.push(dir);
+    const state = emptyState();
+    state.lastThinking = { sessionId: "sess-a", level: "high" };
+    await saveState(dir, state);
+    expect((await loadState(dir)).lastThinking).toEqual({ sessionId: "sess-a", level: "high" });
+  });
+
+  it("drops a malformed lastThinking", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "omp-intel-"));
+    dirs.push(dir);
+    await writeFile(
+      path.join(dir, "state.json"),
+      JSON.stringify({ lastThinking: { sessionId: "sess-a", level: 3 } }),
+      "utf8",
+    );
+    expect((await loadState(dir)).lastThinking).toBeNull();
   });
 
   it("resets each field to its default when state.json parses but is wrong-typed", async () => {

@@ -22,6 +22,13 @@ export interface SessionIntelState {
    * once-only trigger for the cold-start warning.
    */
   lastScope: SessionScope | null;
+  /**
+   * The thinking level the adapter asked for when the CURRENT session was
+   * created, with that session's id. omp stores the level inside the transcript
+   * (`thinking_level_change`) and prefers it on resume, so this is the only way
+   * to notice that the operator now asks for a different one.
+   */
+  lastThinking: { sessionId: string; level: string } | null;
 }
 
 const MAX_TOKENS = 64;
@@ -50,7 +57,7 @@ function emptyState(): SessionIntelState {
   return {
     forkConsumed: [], forceFreshConsumed: [], runCounters: {},
     pendingRotate: null, lastSnapshotDigest: null, lastRotation: null,
-    recentRuns: [], lastUsageDigest: null, lastScope: null,
+    recentRuns: [], lastUsageDigest: null, lastScope: null, lastThinking: null,
   };
 }
 
@@ -73,6 +80,7 @@ export async function loadState(dir: string): Promise<SessionIntelState> {
       recentRuns: Array.isArray(parsed.recentRuns) ? parsed.recentRuns.filter(isRunUsage).slice(-20) : base.recentRuns,
       lastUsageDigest: typeof parsed.lastUsageDigest === "string" ? parsed.lastUsageDigest : base.lastUsageDigest,
       lastScope: isScope(parsed.lastScope) ? parsed.lastScope : base.lastScope,
+      lastThinking: isThinkingRecord(parsed.lastThinking) ? parsed.lastThinking : base.lastThinking,
     };
   } catch {
     return emptyState();
@@ -89,6 +97,14 @@ function isRunCounters(value: unknown): value is Record<string, RunCounter> {
       && "firstRunAt" in entry
       && typeof entry.firstRunAt === "string",
   );
+}
+
+function isThinkingRecord(value: unknown): value is { sessionId: string; level: string } {
+  return typeof value === "object" && value !== null
+    && "sessionId" in value
+    && typeof value.sessionId === "string"
+    && "level" in value
+    && typeof value.level === "string";
 }
 
 function isRotateInfo(value: unknown): value is { reason: string; at: string } {

@@ -39,7 +39,7 @@ import { materializeSkillManifest } from "./skill-manifest.js";
 import { governancePolicyActive, materializeGovernanceManifest, parseGovernancePolicy, validateGovernanceGate } from "./governance-manifest.js";
 import { materializeGovernanceOverlay } from "./governance-overlay.js";
 import { materializeBudgetOverlay } from "./budget-overlay.js";
-import { materializeThinkingOverlay } from "./thinking-overlay.js";
+import { materializeThinkingOverlay, requestedThinkingLevel } from "./thinking-overlay.js";
 import {
   bumpRunCounter, consumeToken, loadState, rotateIfTripped, saveState,
   sessionIntelDir, snapshotDigest,
@@ -49,7 +49,8 @@ import {
 } from "./usage-report.js";
 import {
   buildSessionSnapshotWorkProduct, postWorkProduct, readSessionIntelConfig,
-  resolveRunDirective, resolveWorkProductIssueId, sessionSnapshotDigestInput, validateCredentialMode,
+  resolveRunDirective, resolveWorkProductIssueId, sessionSnapshotDigestInput, thinkingLevelChanged,
+  validateCredentialMode,
   validatePlanMode, validateSessionScope, validThinkingLevel, validateThinkingLevel,
 } from "./session-directives.js";
 
@@ -884,8 +885,24 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     // --- v0.4 session runtime: directives, fork resume, rotation, snapshot ---
     const intel = readSessionIntelConfig(ctx.config);
     const intelState = await loadState(intelDir);
-    const directive = resolveRunDirective(intel, intelState);
     const storedParams = (ctx.runtime.sessionParams ?? {}) as Record<string, unknown>;
+    const storedSessionId = typeof storedParams.acpSessionId === "string" ? storedParams.acpSessionId : "";
+    // omp keeps the level a session started with inside its transcript and
+    // prefers it on resume (sdk.ts:2139-2146, agent-session.ts:12811-12835), so
+    // a new level can only reach an existing session by starting a new one.
+    // Arm the same rotation the thresholds use instead of leaving the edit
+    // silently inert.
+    const requestedThinking = requestedThinkingLevel(ctx.config);
+    let thinkingRotateArmed = false;
+    if (thinkingLevelChanged(intelState.lastThinking, storedSessionId, requestedThinking)) {
+      const from = intelState.lastThinking?.level ?? "";
+      intelState.pendingRotate = {
+        reason: `thinking level changed from '${from === "" ? "omp default" : from}' to '${requestedThinking === "" ? "omp default" : requestedThinking}'`,
+        at: new Date().toISOString(),
+      };
+      thinkingRotateArmed = true;
+    }
+    const directive = resolveRunDirective(intel, intelState);
     const sessionCwd = resolveSessionCwd(ctx, storedParams);
     // A scope flip is the one moment a resumable session is left behind: the
     // previous transcript sits in the other agent dir and this run's fingerprint
@@ -970,6 +987,12 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     } else if (directive.kind === "rotate") {
       forceFreshOverride = true;
       intelState.pendingRotate = null; // applied this run
+      if (thinkingRotateArmed) {
+        await ctx.onEvent?.({
+          eventType: "run.system", stream: "system", level: "info",
+          message: `omp ${directive.reason}: a resumed session keeps the level it stored, so this run starts a fresh session to apply the new one`,
+        });
+      }
     }
 
     // The warm pin in buildOmpAcpConfig is silent in the engine, so report a
@@ -1069,6 +1092,12 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
       // the old counter: start the run count over and clear any armed rotation.
       intelState.runCounters = {};
       intelState.pendingRotate = null;
+    }
+    // Record the level this session was started with. Adopted whenever the
+    // session id changed under us (a rotation, a fork, or an engine-side fresh
+    // start): whatever created it requested the level in force right now.
+    if (usedSessionId && intelState.lastThinking?.sessionId !== usedSessionId) {
+      intelState.lastThinking = { sessionId: usedSessionId, level: requestedThinking };
     }
     if (typeof resultParams.sessionKey === "string") {
       bumpRunCounter(intelState, resultParams.sessionKey, nowIso);

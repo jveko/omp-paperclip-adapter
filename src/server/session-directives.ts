@@ -170,6 +170,27 @@ export function validateThinkingLevel(config: Record<string, unknown>): string |
 
 const NEXT_RUN = "Takes effect on the next run (the adapter has no live connection between runs).";
 
+/**
+ * Whether the operator now asks for a level the running session cannot hold.
+ *
+ * omp resolves a resumed session's level from the transcript's
+ * `thinking_level_change` entry, ahead of `defaultThinkingLevel`
+ * (sdk.ts:2139-2146; agent-session.ts:12811-12835), so a level change on an
+ * existing session needs a fresh session to take effect. The record is the
+ * level the adapter asked for when the session started; with no record (a state
+ * written before this field, or a fork carrying its source's level) the level is
+ * unknown and is adopted rather than rotated on — an upgrade must never reset a
+ * running employee.
+ */
+export function thinkingLevelChanged(
+  record: { sessionId: string; level: string } | null,
+  sessionId: string,
+  requested: string,
+): boolean {
+  if (record === null || record.sessionId !== sessionId) return false;
+  return record.level !== requested;
+}
+
 export function getSessionConfigSchema(): AdapterConfigSchema {
   return {
     fields: [

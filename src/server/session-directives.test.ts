@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
 import {
   getSessionConfigSchema, paperclipApiBase, readSessionIntelConfig, resolveRunDirective,
-  resolveSessionScope, sessionSnapshotDigestInput, validateCredentialMode, validateSessionScope,
-  validThinkingLevel, validatePlanMode, validateThinkingLevel,
+  resolveSessionScope, sessionSnapshotDigestInput, thinkingLevelChanged, validateCredentialMode,
+  validateSessionScope, validThinkingLevel, validatePlanMode, validateThinkingLevel,
 } from "./session-directives.js";
 import { snapshotDigest } from "./session-state.js";
 
@@ -147,6 +147,23 @@ describe("validateThinkingLevel", () => {
     const msg = validateThinkingLevel({ thinking: "bogus" });
     expect(msg).toMatch(/bogus/);
     expect(msg).toMatch(/off, auto, minimal, low, medium, high, xhigh, max/);
+  });
+});
+
+describe("thinkingLevelChanged", () => {
+  const record = { sessionId: "sess-a", level: "low" };
+  it("flags a level the running session cannot hold", () => {
+    expect(thinkingLevelChanged(record, "sess-a", "high")).toBe(true);
+    // Unsetting the level is a change too: the session keeps its stored level.
+    expect(thinkingLevelChanged(record, "sess-a", "")).toBe(true);
+  });
+  it("stays quiet when the level matches, or when the session's level is unknown", () => {
+    expect(thinkingLevelChanged(record, "sess-a", "low")).toBe(false);
+    // No record: a state written before the record existed, or a fork whose
+    // source carried its own level. Adopt instead of rotating, so an upgrade
+    // never resets a running employee.
+    expect(thinkingLevelChanged(null, "sess-a", "high")).toBe(false);
+    expect(thinkingLevelChanged(record, "sess-b", "high")).toBe(false);
   });
 });
 

@@ -737,6 +737,55 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     expect(state.pendingRotate).toBeNull();
   });
 
+  it("rotates once when the operator's thinking level differs from the running session's", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "brand-new", sessionKey: "sk" } });
+    const dir = sessionIntelDir("co-1", "agent-1");
+    const seeded = await loadState(dir);
+    seeded.lastThinking = { sessionId: "old", level: "low" };
+    await saveState(dir, seeded);
+    const events: Array<{ level?: string; message?: string }> = [];
+    await createOmpAcpExecutor()(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, thinking: "high" },
+      onEvent: async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); },
+    }));
+    // A resumed session keeps the level it stored, so the new level needs a new
+    // session: sessionParams is cleared exactly like the other rotate paths.
+    expect(executorFn.mock.calls[0][0].runtime.sessionParams).toEqual({});
+    const notice = events.find((e) => e.level === "info" && /thinking level changed/.test(e.message ?? ""));
+    expect(notice?.message).toContain("low");
+    expect(notice?.message).toContain("high");
+    // The fresh session becomes the recorded one, at the requested level.
+    expect((await loadState(dir)).lastThinking).toEqual({ sessionId: "brand-new", level: "high" });
+  });
+
+  it("keeps the session when the operator's level matches the one it started with", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const dir = sessionIntelDir("co-1", "agent-1");
+    const seeded = await loadState(dir);
+    seeded.lastThinking = { sessionId: "old", level: "high" };
+    await saveState(dir, seeded);
+    const events: Array<{ level?: string; message?: string }> = [];
+    await createOmpAcpExecutor()(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, thinking: "high" },
+      onEvent: async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); },
+    }));
+    expect(executorFn.mock.calls[0][0].runtime.sessionParams).toMatchObject({ acpSessionId: "old" });
+    expect(events.some((e) => /thinking level changed/.test(e.message ?? ""))).toBe(false);
+    expect((await loadState(dir)).lastThinking).toEqual({ sessionId: "old", level: "high" });
+  });
+
+  it("adopts the level on the first run after upgrade instead of resetting the session", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const dir = sessionIntelDir("co-1", "agent-1");
+    await createOmpAcpExecutor()(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, thinking: "max" },
+    }));
+    // No record yet: the pre-v0.10 flag rotated on any level edit, so the
+    // running session already matches the config — adopting it resets nothing.
+    expect(executorFn.mock.calls[0][0].runtime.sessionParams).toMatchObject({ acpSessionId: "old" });
+    expect((await loadState(dir)).lastThinking).toEqual({ sessionId: "old", level: "max" });
+  });
+
   it("successful fork supersedes a pending rotation and restarts the run count", async () => {
     const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
