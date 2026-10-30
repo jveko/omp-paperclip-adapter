@@ -2312,7 +2312,7 @@ describe("managed lane (executionMode)", () => {
     expect(engineFn).not.toHaveBeenCalled();
     expect(result.exitCode).toBe(0);
     expect(result.sessionParams?.acpSessionId).toBe("sess-1");
-    expect(result.usage).toEqual({ inputTokens: 100, outputTokens: 20, cachedInputTokens: 40 });
+    expect(result.usage).toEqual({ inputTokens: 110, outputTokens: 20, cachedInputTokens: 40 });
     expect(result.usageBasis).toBe("per_run");
     expect(result.model).toBe("prov/m");
     expect(spawns).toHaveLength(1);
@@ -2327,6 +2327,22 @@ describe("managed lane (executionMode)", () => {
       "leased", "worker_ready", "session_open", "prompting", "settled", "closed",
     ]);
     expect(JSON.stringify(ledger)).not.toContain("run-jwt");
+  }, 30_000);
+
+  it("cancels an already-aborted run after the begin reaches the supervisor", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const result = await createOmpAcpExecutor()(baseCtx({
+      config: {
+        executionMode: "managed",
+        agentCommand: `${process.execPath} ${fakeRpc}`,
+        env: { FAKE_RPC_MODE: "hang" },
+      },
+      signal: controller.signal,
+    } as never));
+    expect(result.resultJson).toMatchObject({ status: "aborted" });
+    const ledger = await readLedgerRecords(path.join(tmpRoot, "instances", "test-managed", "omp-host"));
+    expect(ledger.some((record) => record.state === "settled" && record.cause === "cancel")).toBe(true);
   }, 30_000);
 
   it("refuses an unknown executionMode before any lane is constructed", async () => {

@@ -108,7 +108,7 @@ describe("phase 1 acceptance on dist/omp-host.js", () => {
       },
     }));
     expect(result.exitCode).toBe(0);
-    expect(result.usage).toEqual({ inputTokens: 100, outputTokens: 20, cachedInputTokens: 40 });
+    expect(result.usage).toEqual({ inputTokens: 110, outputTokens: 20, cachedInputTokens: 40 });
     expect(result.sessionParams).toMatchObject({
       acpSessionId: "sess-1",
       sessionKey: "paperclip:co-1:agent-1:task",
@@ -166,7 +166,11 @@ describe("phase 1 acceptance on dist/omp-host.js", () => {
       );
       expect(lost).toHaveLength(1);
       expect(lost[0].detail).toMatchObject({ orphan: "killed" });
-      expect(() => process.kill(workerPid, 0)).toThrow();
+      // SIGKILL is synchronous to deliver, not to reap: an orphan reparented to
+      // init stays a zombie for a moment, so poll for the pid to disappear.
+      await vi.waitFor(() => {
+        expect(() => process.kill(workerPid, 0)).toThrow();
+      }, { timeout: 5_000, interval: 25 });
     } finally {
       await host.close("test");
     }

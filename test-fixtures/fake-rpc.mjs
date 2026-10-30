@@ -26,7 +26,7 @@ let seq = 0;
 let pendingPrompt = null;
 let hostToolWaiter = null;
 
-let memoryStats = { input: 0, output: 0, cacheRead: 0, cost: 0 };
+let memoryStats = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
 const stats = () => {
   if (!statsFile) return memoryStats;
   try {
@@ -40,6 +40,7 @@ const addUsage = () => {
   current.input += 100;
   current.output += 20;
   current.cacheRead += 40;
+  current.cacheWrite += 10;
   current.cost += 0.5;
   memoryStats = current;
   if (statsFile) writeFileSync(statsFile, JSON.stringify(current));
@@ -111,12 +112,13 @@ rl.on("line", (line) => {
         sessionFile,
         tokens: {
           input: current.input, output: current.output, reasoning: 0,
-          cacheRead: current.cacheRead, cacheWrite: 0,
-          total: current.input + current.output + current.cacheRead,
+          cacheRead: current.cacheRead, cacheWrite: current.cacheWrite,
+          total: current.input + current.output + current.cacheRead + current.cacheWrite,
         },
         cost: current.cost,
         routedModels: { "prov/m": 1 },
-        contextUsage: { used: 4000, size: 200000 },
+        // The wire shape real omp sends (rpc-wire.generated.ts:413-417).
+        contextUsage: { tokens: 4000, contextWindow: 200000, percent: 2 },
       });
     }
     case "set_host_tools": {

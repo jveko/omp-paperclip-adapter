@@ -384,12 +384,13 @@ export function createHostTransport(options: HostTransportOptions): ManagedRun {
         }
       }, Math.max(250, Math.floor(RUN_LEASE_TTL_MS / 3)));
       heartbeat.unref();
+      client.send(begin);
+      // Send the begin first: a cancel that names an unknown run is dropped by
+      // the supervisor, so an already-aborted signal must arrive second.
       const signal = abortSignalOf(ctx);
       const onAbort = () => cancel();
       if (signal?.aborted === true) cancel();
       else signal?.addEventListener("abort", onAbort, { once: true });
-
-      client.send(begin);
       const result = await Promise.race([settled.promise, closed.promise]);
       signal?.removeEventListener("abort", onAbort);
       return result;

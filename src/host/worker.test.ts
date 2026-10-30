@@ -79,21 +79,25 @@ describe("rpc worker", () => {
     }
   });
 
-  it("derives the worker argv from the ACP command minus acp", () => {
+  it("derives the worker command from the ACP command minus acp, launched through a login shell", () => {
     expect(buildWorkerArgv({ command: "omp" }, "/bridge.js")).toEqual({
-      command: "omp", args: ["--mode", "rpc"],
+      command: "sh", args: ["-lc", "exec omp --mode rpc"],
     });
     expect(buildWorkerArgv({ command: "omp", thinking: "off" }, "/bridge.js")).toEqual({
-      command: "omp", args: ["--thinking", "off", "--mode", "rpc"],
+      command: "sh", args: ["-lc", "exec omp --thinking off --mode rpc"],
     });
     expect(buildWorkerArgv({ agentCommand: "node /x.mjs" }, "/bridge.js")).toEqual({
-      command: "node", args: ["/x.mjs", "--mode", "rpc"],
+      command: "sh", args: ["-lc", "exec node /x.mjs --mode rpc"],
     });
     expect(buildWorkerArgv({
       command: "omp",
       env: { PAPERCLIP_SKILLS_MANIFEST: "/m.json" },
     }, "/bridge.js")).toEqual({
-      command: "omp", args: ["--extension", "/bridge.js", "--mode", "rpc"],
+      command: "sh", args: ["-lc", "exec omp --extension /bridge.js --mode rpc"],
+    });
+    // The engine lane's shell form is preserved, including a quoted path.
+    expect(buildWorkerArgv({ agentCommand: "node \"/opt/my agent/omp.js\"" }, "/bridge.js")).toEqual({
+      command: "sh", args: ["-lc", "exec node \"/opt/my agent/omp.js\" --mode rpc"],
     });
   });
 

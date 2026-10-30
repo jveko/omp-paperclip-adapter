@@ -120,6 +120,8 @@ interface StatsSnapshot {
   input: number;
   output: number;
   cacheRead: number;
+  /** Provider-billed cache-creation tokens; UsageSummary counts them as input. */
+  cacheWrite: number;
   cost: number;
   routedModels: Record<string, number>;
   contextUsage: { used: number; size: number } | null;
@@ -175,25 +177,29 @@ function readStats(data: Record<string, unknown>): StatsSnapshot | null {
   const input = typeof record.input === "number" ? record.input : 0;
   const output = typeof record.output === "number" ? record.output : 0;
   const cacheRead = typeof record.cacheRead === "number" ? record.cacheRead : 0;
+  const cacheWrite = typeof record.cacheWrite === "number" ? record.cacheWrite : 0;
   const routed: Record<string, number> = {};
   if (typeof data.routedModels === "object" && data.routedModels !== null && !Array.isArray(data.routedModels)) {
     for (const [model, count] of Object.entries(data.routedModels as Record<string, unknown>)) {
       if (typeof count === "number") routed[model] = count;
     }
   }
+  // omp's wire shape is `{ tokens, contextWindow, percent }` (RPC
+  // rpc-wire.generated.ts:413-417); accept the `{used,size}` spelling too so a
+  // future rename does not silently drop the signal.
   const usage = data.contextUsage;
-  const contextUsage = typeof usage === "object" && usage !== null && !Array.isArray(usage)
-    && typeof (usage as Record<string, unknown>).used === "number"
-    && typeof (usage as Record<string, unknown>).size === "number"
-    ? {
-      used: (usage as Record<string, number>).used,
-      size: (usage as Record<string, number>).size,
-    }
-    : null;
+  let contextUsage: StatsSnapshot["contextUsage"] = null;
+  if (typeof usage === "object" && usage !== null && !Array.isArray(usage)) {
+    const record = usage as Record<string, unknown>;
+    const used = typeof record.tokens === "number" ? record.tokens : record.used;
+    const size = typeof record.contextWindow === "number" ? record.contextWindow : record.size;
+    if (typeof used === "number" && typeof size === "number") contextUsage = { used, size };
+  }
   return {
     input,
     output,
     cacheRead,
+    cacheWrite,
     cost: typeof data.cost === "number" ? data.cost : 0,
     routedModels: routed,
     contextUsage,
@@ -201,12 +207,15 @@ function readStats(data: Record<string, unknown>): StatsSnapshot | null {
 }
 
 function delta(before: StatsSnapshot | null, after: StatsSnapshot | null): StatsSnapshot {
-  const base = before ?? { input: 0, output: 0, cacheRead: 0, cost: 0, routedModels: {}, contextUsage: null };
+  const base = before ?? {
+    input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, routedModels: {}, contextUsage: null,
+  };
   const top = after ?? base;
   return {
     input: Math.max(0, top.input - base.input),
     output: Math.max(0, top.output - base.output),
     cacheRead: Math.max(0, top.cacheRead - base.cacheRead),
+    cacheWrite: Math.max(0, top.cacheWrite - base.cacheWrite),
     cost: Math.max(0, top.cost - base.cost),
     routedModels: top.routedModels,
     contextUsage: top.contextUsage,
@@ -242,6 +251,13 @@ class Supervisor {
   private readonly workers = new Map<string, WorkerEntry>();
   private readonly connections = new Set<Connection>();
   private readonly versionCache = new Map<string, string | null>();
+  /** Runs whose begin is still in setup; EOF here must not leave a ghost run. */
+  private readonly pendingRuns = new Map<string, Connection>();
+  private readonly abandonedBeforePrompt = new Set<string>();
+  /** A cancel that arrived while the run was still in setup. */
+  private readonly pendingCancels = new Map<string, "operator" | "timeout" | "shutdown">();
+  /** Worker slots claimed but not yet spawned, so interleaved begins respect maxWorkers. */
+  private reservedWorkers = 0;
   private ledger: RunLedger | null = null;
   private server: net.Server | null = null;
   private lock: { release: () => Promise<void> } | null = null;
@@ -367,7 +383,13 @@ class Supervisor {
       const runId = connection.runId;
       if (runId !== null) {
         const run = this.runs.get(runId);
-        if (run === undefined || run.terminal) return;
+        if (run === undefined) {
+          // Still in setup: remember it so beginRun stops before prompting
+          // instead of running a turn nobody is waiting for.
+          if (this.pendingRuns.get(runId) === connection) this.abandonedBeforePrompt.add(runId);
+          return;
+        }
+        if (run.terminal) return;
         run.connections.delete(connection);
         if (run.connections.size === 0) void this.adapterGone(run);
       }
@@ -415,7 +437,13 @@ class Supervisor {
       }
       case "run.cancel": {
         const run = this.runs.get(frame.runId);
-        if (run !== undefined && !run.terminal) void this.cancelRun(run, frame.reason);
+        if (run !== undefined) {
+          if (!run.terminal) void this.cancelRun(run, frame.reason);
+          return;
+        }
+        // A cancel can beat its own begin's setup (open_session is slow). Hold it
+        // so the run is aborted as soon as it starts, instead of being ignored.
+        if (this.pendingRuns.has(frame.runId)) this.pendingCancels.set(frame.runId, frame.reason);
         return;
       }
       case "run.status":
@@ -521,6 +549,16 @@ class Supervisor {
       });
     };
 
+    if (connection.runId !== null && connection.runId !== begin.runId) {
+      this.sendSettled(connection, begin.runId, {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorCode: "omp_host_connection_busy",
+        errorMessage: `this connection already carries run ${connection.runId}; one connection carries one run`,
+      });
+      return;
+    }
     const known = this.runs.get(begin.runId);
     if (known !== undefined) {
       // A retried begin after a transport hiccup joins the live run instead of
@@ -545,6 +583,8 @@ class Supervisor {
       await refuse("config_error", "omp_host_shutting_down", "the omp supervisor is draining and does not accept new runs");
       return;
     }
+    this.pendingRuns.set(begin.runId, connection);
+    connection.runId = begin.runId;
     const mismatch = this.sessionKeyMismatch(begin);
     if (mismatch !== null) {
       await refuse("config_error", "omp_config_error", mismatch);
@@ -632,6 +672,8 @@ class Supervisor {
       lastAssistantText: null,
     };
 
+    let promptAccepted = false;
+    let disconnected = false;
     try {
       await this.journal(this.runRecord(run, "worker_ready", {
         worker: this.ledgerWorker(worker),
@@ -668,6 +710,12 @@ class Supervisor {
 
       run.statsBefore = readStats(await worker.worker.getStats().catch(() => ({})));
 
+      // The setup awaits are where a caller can vanish (open_session is slow).
+      // Never prompt for a caller that is already gone.
+      if (this.abandonedBeforePrompt.delete(run.runId)) {
+        disconnected = true;
+        throw new Error("the adapter disconnected before the run started");
+      }
       run.runContextPath = await writeRunContext(
         this.root, worker.workerId, run.runId, begin.credentials, begin.manifests,
       );
@@ -684,6 +732,12 @@ class Supervisor {
       this.startLeaseWatch(run);
       this.sendAccepted(connection, run);
       await worker.worker.prompt(begin.prompt, begin.runId);
+      promptAccepted = true;
+      const earlyCancel = this.pendingCancels.get(run.runId);
+      if (earlyCancel !== undefined) {
+        this.pendingCancels.delete(run.runId);
+        void this.cancelRun(run, earlyCancel);
+      }
       if (begin.limits.timeoutMs !== null) {
         run.timeoutTimer = setTimeout(() => {
           void this.timeoutRun(run);
@@ -693,15 +747,26 @@ class Supervisor {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const unwritable = err instanceof LedgerWriteError;
+      const deadBeforeTurn = !promptAccepted && !worker.worker.alive;
       await this.settle(run, {
         kind: "lost",
-        cause: worker.worker.alive ? "config_error" : "worker_exit",
-        errorCode: unwritable ? "omp_host_unwritable" : "omp_host_run_failed",
+        cause: disconnected ? "adapter_gone" : (worker.worker.alive || deadBeforeTurn ? "config_error" : "worker_exit"),
+        errorCode: unwritable
+          ? "omp_host_unwritable"
+          : deadBeforeTurn
+            ? "omp_host_worker_failed"
+            : "omp_host_run_failed",
         errorMessage: message,
-        executionRecovery: worker.worker.alive
-          ? undefined
-          : { kind: "interrupted", providerStopped: true, sessionPreserved: true, actionOutcomes: "settled" },
+        // Only a turn that actually started can offer Paperclip's interrupted-
+        // run recovery; a worker that never accepted a prompt did no work.
+        executionRecovery: promptAccepted && !worker.worker.alive
+          ? { kind: "interrupted", providerStopped: true, sessionPreserved: true, actionOutcomes: "settled" }
+          : undefined,
       });
+    } finally {
+      if (this.pendingRuns.get(begin.runId) === connection) this.pendingRuns.delete(begin.runId);
+      this.abandonedBeforePrompt.delete(begin.runId);
+      this.pendingCancels.delete(begin.runId);
     }
   }
 
@@ -930,8 +995,11 @@ class Supervisor {
     const model = this.singleModel(used.routedModels) ?? run.begin.cell.model;
     const status = run.outcome?.status ?? (outcome.kind === "settled" ? "completed" : "error");
     const agentInvoked = run.outcome?.agentInvoked ?? false;
+    // Same convention as the engine lane: cache-write tokens are prompt tokens
+    // the provider billed to create cache entries, so they count as input.
+    const inputTokens = used.input + used.cacheWrite;
     const usage: LedgerUsage = {
-      inputTokens: used.input,
+      inputTokens,
       outputTokens: used.output,
       cachedInputTokens: used.cacheRead,
       costUsd: used.cost,
@@ -952,7 +1020,7 @@ class Supervisor {
         cwd: run.begin.cwd,
       },
       model,
-      usage: { inputTokens: used.input, outputTokens: used.output, cachedInputTokens: used.cacheRead },
+      usage: { inputTokens, outputTokens: used.output, cachedInputTokens: used.cacheRead },
       usageBasis: "per_run",
       costUsd: used.cost,
       resultJson: {
@@ -992,7 +1060,7 @@ class Supervisor {
     await clearRunContext(this.root, run.worker.workerId, run.runId).catch(() => {});
     if ([...run.connections].some((connection) => !connection.closed)) {
       const receipt = {
-        usage: { inputTokens: used.input, outputTokens: used.output, cachedInputTokens: used.cacheRead },
+        usage: { inputTokens, outputTokens: used.output, cachedInputTokens: used.cacheRead },
         usageBasis: "per_run" as const,
         model,
         costUsd: used.cost,
@@ -1058,7 +1126,19 @@ class Supervisor {
     if (existing !== undefined) {
       await this.retireWorker(existing);
     }
-    if (this.workers.size >= this.options.maxWorkers) {
+    // Reserve the slot BEFORE the first await: two interleaved begins would
+    // otherwise both read the same `workers.size` and overshoot the hard cap.
+    this.reserveWorkerSlot();
+    try {
+      return await this.spawnWorker(begin, key, fingerprint);
+    } finally {
+      this.reservedWorkers -= 1;
+    }
+  }
+
+  /** Synchronously free or take a worker slot, or refuse with `omp_host_capacity`. */
+  private reserveWorkerSlot(): void {
+    if (this.workers.size + this.reservedWorkers >= this.options.maxWorkers) {
       const idle = [...this.workers.values()]
         .filter((entry) => entry.currentRun === null)
         .sort((a, b) => a.lastUsedAt - b.lastUsedAt)[0];
@@ -1067,8 +1147,18 @@ class Supervisor {
           `omp_host_capacity: the supervisor already runs ${this.workers.size} workers (max ${this.options.maxWorkers}) and none is idle`,
         );
       }
-      await this.retireWorker(idle);
+      // retireWorker detaches the entry from the map before its first await, so
+      // the freed slot is visible to the next reservation immediately.
+      void this.retireWorker(idle);
     }
+    this.reservedWorkers += 1;
+  }
+
+  private async spawnWorker(
+    begin: RunBeginFrame,
+    key: string,
+    fingerprint: Fingerprint,
+  ): Promise<{ worker: WorkerEntry; reused: boolean }> {
     const sessionDir = this.sessionDirFor(begin);
     const workerId = hashText(key);
     const runContext = runContextPointer(this.root, workerId);
@@ -1103,8 +1193,10 @@ class Supervisor {
   }
 
   private async retireWorker(entry: WorkerEntry): Promise<void> {
-    if (entry.worker.alive) await entry.worker.stop(this.options.cancelGraceMs);
+    // Detach first: callers reserve slots synchronously and must observe the
+    // freed worker before this method's first await.
     if (this.workers.get(entry.key) === entry) this.workers.delete(entry.key);
+    if (entry.worker.alive) await entry.worker.stop(this.options.cancelGraceMs);
   }
 
   private ledgerWorker(entry: WorkerEntry): LedgerWorker {

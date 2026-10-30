@@ -137,9 +137,12 @@ describe("supervisor", () => {
         sessionParams: { acpSessionId: "sess-new-1", sessionKey: "paperclip:co-1:agent-1:task" },
         model: "prov/m",
       });
-      expect(settled.result.usage).toEqual({ inputTokens: 100, outputTokens: 20, cachedInputTokens: 40 });
+      expect(settled.result.usage).toEqual({ inputTokens: 110, outputTokens: 20, cachedInputTokens: 40 });
       expect(settled.result.costUsd).toBeCloseTo(0.5);
-      expect(settled.result.resultJson).toMatchObject({ transport: "host-rpc", status: "completed", agentInvoked: true });
+      expect(settled.result.resultJson).toMatchObject({
+        transport: "host-rpc", status: "completed", agentInvoked: true,
+        contextUsage: { used: 4000, size: 200000 },
+      });
       expect(client.frames.some((frame) => frame.type === "run.event" && frame.kind === "omp.usage")).toBe(true);
       await vi.waitFor(async () => {
         expect(await ledgerStates()).toEqual([
@@ -192,6 +195,66 @@ describe("supervisor", () => {
     } finally {
       first.close();
       second.close();
+    }
+  }, 20_000);
+
+  it("refuses a second run on one connection", async () => {
+    const running = await start();
+    const client = await connectClient(running.socketPath);
+    try {
+      client.send(beginFrame({ runId: "run-1", sessionKey: "sk-1" }));
+      await client.waitFor((frame) => frame.type === "run.settled");
+      client.send(beginFrame({ runId: "run-2", sessionKey: "sk-2" }));
+      const refused = await client.waitFor(
+        (frame) => frame.type === "run.settled" && frame.runId === "run-2",
+      );
+      if (refused.type !== "run.settled") throw new Error("unreachable");
+      expect(refused.result.errorCode).toBe("omp_host_connection_busy");
+    } finally {
+      client.close();
+    }
+  }, 20_000);
+
+  it("refuses interleaved begins past maxWorkers", async () => {
+    const running = await start({ maxWorkers: 1 });
+    const first = await connectClient(running.socketPath);
+    const second = await connectClient(running.socketPath);
+    try {
+      first.send(beginFrame({ runId: "run-a", mode: "hang", sessionKey: "sk-a" }));
+      second.send(beginFrame({ runId: "run-b", mode: "hang", sessionKey: "sk-b" }));
+      const outcomes = await Promise.all([
+        first.waitFor((frame) => frame.type === "run.accepted" || frame.type === "run.settled"),
+        second.waitFor((frame) => frame.type === "run.accepted" || frame.type === "run.settled"),
+      ]);
+      const accepted = outcomes.filter((frame) => frame.type === "run.accepted");
+      const refused = outcomes.filter((frame) => frame.type === "run.settled");
+      expect(accepted).toHaveLength(1);
+      expect(refused).toHaveLength(1);
+      if (refused[0].type !== "run.settled") throw new Error("unreachable");
+      expect(refused[0].result.errorCode).toBe("omp_host_capacity");
+      expect(running.workers).toBe(1);
+    } finally {
+      first.close();
+      second.close();
+    }
+  }, 20_000);
+
+  it("reports a worker that cannot start as a configuration failure, not a recoverable interruption", async () => {
+    const running = await start();
+    const client = await connectClient(running.socketPath);
+    try {
+      client.send(beginFrame({
+        runId: "run-1",
+        worker: { command: "sh", args: ["-lc", "exec omp-binary-that-does-not-exist"], env: {} },
+      }));
+      const settled = await client.waitFor((frame) => frame.type === "run.settled");
+      if (settled.type !== "run.settled") throw new Error("unreachable");
+      expect(settled.result.errorCode).toBe("omp_host_worker_failed");
+      expect(settled.result.executionRecovery).toBeUndefined();
+      const records = await readLedgerRecords(root);
+      expect(records.some((record) => record.state === "refused" && record.cause === "config_error")).toBe(true);
+    } finally {
+      client.close();
     }
   }, 20_000);
 

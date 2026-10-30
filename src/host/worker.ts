@@ -47,20 +47,30 @@ const FORBIDDEN_WORKER_ENV: Record<string, true> = { PAPERCLIP_API_KEY: true };
 const MAX_WORKER_BUFFER_CHARS = 64 * 1024 * 1024;
 
 /**
- * The worker argv: the existing `resolveOmpAgentCommand` (which already carries
- * `--extension` and `--thinking`) with the `acp` subcommand removed and
- * `--mode rpc` appended.
+ * The worker's command line: the existing `resolveOmpAgentCommand` (which
+ * already carries `--extension` and `--thinking`) with the standalone `acp`
+ * subcommand removed and `--mode rpc` appended.
+ *
+ * The text is kept intact — not tokenized — because the engine launches the
+ * same string through a login shell (`sh -lc "exec <command>"`,
+ * adapter-utils `execute.js:1436-1441`). Tokenizing would lose shell quoting
+ * (paths with spaces) and bypass the profile PATH an `omp` installed outside
+ * the server's own PATH depends on.
+ */
+export function buildWorkerCommand(config: Record<string, unknown>, bridge: string): string {
+  const command = resolveOmpAgentCommand(config, bridge).replace(/(^|\s)acp(?=\s|$)\s?/, "$1").trim();
+  return `${command} --mode rpc`;
+}
+
+/**
+ * The spawn spec: a login shell that `exec`s the command, so the shell is
+ * replaced by omp (same pid, same process group) exactly like the engine lane.
  */
 export function buildWorkerArgv(
   config: Record<string, unknown>,
   bridge: string,
 ): { command: string; args: string[] } {
-  const tokens = resolveOmpAgentCommand(config, bridge).split(/\s+/).filter((token) => token !== "");
-  const acpIndex = tokens.indexOf("acp");
-  const base = acpIndex >= 0
-    ? [...tokens.slice(0, acpIndex), ...tokens.slice(acpIndex + 1)]
-    : tokens;
-  return { command: base[0], args: [...base.slice(1), "--mode", "rpc"] };
+  return { command: "sh", args: ["-lc", `exec ${buildWorkerCommand(config, bridge)}`] };
 }
 
 /**
