@@ -5,162 +5,277 @@ CLI, but an employee population with shared credentials, subagent teams, governa
 planning, cost intelligence, and session continuity that survives restarts, models, and
 machines.
 
-Three architecture generations frame everything below:
+**Shape of the integration.** One employee, two lanes:
 
-- **G1 — today (v0.1.0).** Spawn `omp acp` through the ACPX custom lane. One agent, one
-  process, one session. Works; proven live.
-- **G2 — fleet.** Many omp employees sharing infrastructure: credential vault, warm process
-  pool, model routing, cost governance, session intelligence.
-- **G3 — org runtime.** omp's native multi-agent surfaces (subagent registry, collab,
-  extensions) exposed as Paperclip org structure — Paperclip manages the *company*, omp
-  manages the *teams inside each employee*.
+- **ACP lane (today)** — `omp acp` through Paperclip's ACPX engine. Governed, resumable,
+  permission-proxied. Everything v0.1–v0.8 built lives here.
+- **RPC lane (v1.0)** — `omp --mode rpc` for the surfaces ACP cannot carry: subagent
+  control, host tools, live steering, side questions. Same employee, second transport.
 
----
-
-## v0.2 — "Reliable employee" (G1 hardened)
-
-*Everything here is adapter-local; no upstream dependency.*
-
-### 1. Process economics
-Heartbeats currently pay full spawn + session-init every run (warmHandleIdleMs=0 default),
-and the free-tier model burned 28 min on one heartbeat. Ship the economics layer:
-- `warmHandleIdleMs` guidance + verification (sessionReused flag in usageJson).
-- `model` pinning per employee with rate-card awareness — `omp models ls --json` already
-  gives us `cost` + `contextWindow`; surface a "cost per heartbeat" estimate in the board
-  agent form (input tokens × rate card, from the run history of prior heartbeats).
-- `timeoutSec` presets tuned per model tier (we measured: free preview tier needs >20 min
-  for a 45k-token context; fast tiers don't).
-
-### 2. Thinking + model controls over ACP
-omp exposes `session/set_config_option` for `thinking` and per-session model switching.
-Verify engine control-key forwarding for custom agents, then wire Paperclip's thinking/model
-pickers to live session options instead of spawn-time-only flags. Fallback if the engine
-won't forward: upstream request (small).
-
-### 3. MCP passthrough
-`session/new` accepts `mcpServers[]` (stdio/http/sse). Wire company-configured MCP servers
-through so omp employees reach tool parity with claude/codex agents. Verify how much the
-ACPX engine forwards already; fill the gap in `buildOmpAcpConfig`.
-
-### 4. Plan-mode governance loop
-omp's plan mode (`session/set_mode plan`, gated on `plan.enabled`) is read-only drafting —
-a natural fit for Paperclip's approval-before-execution governance. Target flow: issue
-assigned → agent drafts plan in plan mode → plan lands as a work product → board approves →
-execution heartbeat runs with the plan as context. Requires verifying which side answers
-plan elicitation under acpx (auto-approves today when client lacks `elicitation.form` —
-we may want acpx to answer it properly).
-
-### 5. Skills without native sync
-Engine marks skills `custom_unsupported`; omp runs skills from prompt text. Inject desired
-Paperclip skills into the instructions file / run prompt so employees honor company skills.
-Acceptance: a company skill is invoked by an omp agent during a heartbeat.
-
-### 6. Cost truth end-to-end
-Today: `costStatus: "unpriced"`, `billingType: "metered_api"` — honest but opaque. Combine
-`omp models ls --json` rate cards (we parse them, incl. `priced` flag) with per-run usage to
-compute and display real USD per heartbeat, and mark declared-free models distinctly from
-unpriced ones. Stretch: `_omp/usage` aggregate reports for account-level budget views.
+**Priority order is now correctness → containment → spend truth → fleet → org runtime.**
+v0.4–v0.8 shipped several features that cannot execute (no run token, wrong SQL) and one
+that can leak between tenants (shared `~/.omp`). Those outrank every new capability.
 
 ---
 
-## v0.3 — "Fleet" (G2)
+## Where this revision stands (assessed 2026-10-30)
 
-*The employee population becomes the unit of engineering.*
+Verified against **omp v18.13.1** (`0838d2a`) and **paperclip HEAD** (`3edba11`,
+2026-10-26). Item numbers are stable because the changelog references them; this table says
+where each one moved and why.
 
-### 7. Credential fleet via auth-broker
-One `omp auth-broker serve` vault backing every omp employee, instead of each agent resolving
-its own credentials. `auth-gateway serve` as the metering proxy: all provider traffic flows
-through one observable, budget-enforceable choke point. Adapter ships a `credentialMode:
-local | broker` config; Paperclip secrets bind to broker tokens, never raw keys.
-
-### 8. Warm process pool
-Beyond per-agent warm handles: a shared supervisor keeping N omp ACP processes hot across
-the fleet, with session-affinity routing. Cuts per-heartbeat latency fleet-wide; needs care
-with the hot-restart classifier (pipied-stdio runs are server-stdio bound — see upstream
-#11607) and process-group cleanup on service restart.
-
-### 9. Session intelligence
-omp's ACP advertises `loadSession / resume / fork / close` and `_omp/sessions/listAll` —
-none of which we exploit beyond linear resume:
-- **Fork for retries:** a failed heartbeat forks the session instead of resuming a possibly
-  poisoned context; poisoned-session detection (the gemini_local class of bugs) becomes
-  cheap.
-- **Compaction policy:** long-lived employees hit context walls; adopt the engine's
-  session-rotation triggers with omp's compaction semantics.
-- **Session browser:** `_omp/projects/list` + `_omp/chats/byCwd` rendered as a Paperclip
-  work-product — every employee's full history inspectable from the board.
-
-### 10. Model failover chains
-Provider-quota exhaustion is the classic unattended-fleet failure (upstream #12123 added it
-for Claude subscriptions). Implement adapter-level failover: on provider-4xx/quota error
-classification, re-invoke the turn against the next model in a configured chain
-(e.g. `axon-compat/glm-5.2 → openrouter/... → ...`), with the chain stored per agent.
-
-### 11. Observability export
-omp ships OTLP export (`OTEL_EXPORTER_OTLP_*`). Wire it into Paperclip's telemetry pipeline:
-per-employee traces, token/cost metrics, turn latency histograms. Fleet dashboards without
-scraping transcripts.
-
----
-
-## v1.0 — "Org runtime" (G3)
-
-*The ambitious tier. Each item needs upstream omp surface (all verified to exist in source).*
-
-### 12. Subagent teams inside one employee
-omp has a full subagent subsystem: `AgentRegistry`, `task`/`hub` tools, persisted subagents
-that revive cold from disk. A Paperclip employee becomes a *manager*: its heartbeat spawns
-omp subagents for parallel work, aggregates results. Paperclip's org chart stays
-human-facing; omp runs the team internally. RPC mode's `set_subagent_subscription` /
-`get_subagent_messages` (the ~50-method internal surface) is the likely lane — richer than
-ACP, and the fork boundary is contained inside our adapter.
-
-### 13. ExtensionAPI bridge — skills become native tools
-omp's `ExtensionAPI` (`registerTool`, event bus, custom commands) via `--extension`. Build a
-`paperclip-bridge` omp extension: Paperclip company skills surface as *native omp tools*
-(not prompt-injected text), and omp tool events stream back into Paperclip's activity log.
-This is the bidirectional integration prompt-injection can never be.
-
-### 14. Headless collab — shared sessions between employees
-omp's collab subsystem (`collab/host.ts`, E2E-encrypted framed protocol) is TTY-only today
-(`omp join`), but the host side is a protocol server. A headless collab host would let two
-Paperclip employees share one live omp session — pair-programming agents. Long-shot; needs
-upstream blessing for non-TTY host operation.
-
-### 15. Worktree-aware execution
-`omp worktree list/clear` + the worktree.base config integrate with Paperclip's project
-execution workspaces: each assigned issue runs in an omp-managed worktree, PRs reference the
-worktree, `worktree clear` rides cleanup. Removes workspace collisions between concurrent
-employees on one repo.
-
-### 16. Embeddable runtime (the C option, revisited)
-If oh-my-pi ever ships a runtime-neutral SDK (no `Bun.*` in the public surface, compiled
-ESM), the adapter's ACP boundary is the seam — swap spawn for in-process without touching
-Paperclip config. Track upstream; don't build.
-
----
-
-## Upstream contributions (Paperclip)
-
-| Item | Size | Unlocks |
+| Old item | Verdict | Reason |
 |---|---|---|
-| Mobile/web-worker fallback in `sandboxed-parser-worker.ts` | S | Rendered transcripts on every device (live pain today) |
-| Custom-lane control-key forwarding (thinking/effort) | S–M | Item 2 without omp-side changes |
-| Per-agent config on `refreshModels`/`detectModel` hooks | M | Discovery honors `command` overrides |
-| `supportsAcp`-style capability for engine-backed externals | S | Honest board capability display |
+| 1 process economics | **split** | Warm-process reuse is discarded by the engine whenever a live run-scoped credential is present (`settlement-sequence.ts`, `execute.ts`), so the pool is upstream-blocked. Cold-start economics move to item 24 (`--restore`, `-p --wait-async`). |
+| 2 thinking/model controls | **v0.10, re-scoped** | The engine forwards `model` for custom agents but the thinking key as `effort`, which omp rejects (omp accepts `mode`/`model`/`thinking`). Fix belongs in a config overlay, not `agentCommand` (no fingerprint rotation). |
+| 3 MCP passthrough | **v0.10, split** | HTTP forwarding already works for the custom lane; the adapter contributes only a count. Managed gateways and stdio servers are upstream allowlist/type gaps. Delivery mode (`runtimeToolDelivery`) is P0, item 17. |
+| 4 plan-mode governance | **parked: do not enable** | With no `elicitation/form` client, omp auto-approves the plan (`acp-agent.ts`: `if (!supportsForm) return true`). Enabling plan mode today deletes the approval step; the extension escape hatch (`plan_review_requested`) is TUI-only. |
+| 5 skills without native sync | **shipped (v0.7)** | Replaced by the lazy skill bridge; residual is per-company directory isolation (item 18). |
+| 6 cost truth | **v0.9, promoted** | `unpricedUsagePolicy` defaults to `block`, and the engine never emits `costStatus`/`pricingProvenance`, so an unpriced model stalls the employee at the budget gate. Now item 20. |
+| 7 credential fleet | **shipped (v0.5)** | Broker mode done. Remaining lever is `auth-gateway serve --clients` for per-employee model/account grants (v0.10). |
+| 8 warm process pool | **parked: upstream** | Same credential-rebind gate as item 1. Not an adapter backlog item. |
+| 9 session intelligence | **v0.9 + v0.10** | Fork/browser shipped. Correctness (fork cwd precondition, lease, context pressure) is item 21; ACP `session/list`, compaction alignment stay in v0.10. |
+| 10 failover chains | **v0.10, re-scoped** | Chain writing works but only `default` is written, which never applies to model-kind roles; the useful knobs are `fallbackOn`, `waitForUsageReset`, `fallbackRevertPolicy`. |
+| 11 OTLP export | **parked: upstream** | Paperclip's launch builder is hardcoded to claude/codex; any other harness resolves `unsupported_harness` with no launch. |
+| 12 subagent teams | **v1.0, unblocked** | ACP has no subagent surface, but RPC exposes `set_subagent_subscription`, `get_subagents`, `get_subagent_messages`, `cancel_subagent`, `steer_subagent`. Needs an executor, not a feature. |
+| 13 ExtensionAPI bridge | **shipped (v0.7/v0.8)** | Guardrails, budget, approvals, skill tools all live. |
+| 14 headless collab | **parked: upstream** | `CollabHost` is typed to the TUI context and touches eight UI-only members; `omp join` refuses non-TTY. |
+| 15 worktree-aware execution | **obsolete** | Paperclip owns per-run `git_worktree` execution and workspace finalize. The correct posture is the reverse: keep omp out of worktree management. |
+| 16 embeddable runtime | **re-scoped, parked** | The in-process SDK is Bun-only. The process boundary is the seam that matters: first-party RPC clients exist in Go, Python and Rust. |
+| — | **17–26 new** | Findings that were never on this roadmap; see below. |
 
-## Upstream requests (oh-my-pi)
+---
 
-| Item | Why |
-|---|---|
-| Model-catalog refresh over ACP (`_omp/models/refresh`) | Fleet-wide model updates without side-channel CLI races |
-| Headless collab host | Item 14 |
-| Runtime-neutral SDK | Item 16 |
-| `--list-models`-equivalent stable flag | Already covered by `omp models --json`; formalize as contract |
+## P0 — v0.9 "Correctness & containment"
+
+Everything here is adapter-local unless marked. Ordered by dependency, not by size.
+**Rule for this release: no new capability until every item below is true.**
+
+### 17. Run identity and control-plane delivery
+
+The adapter never declares `supportsLocalAgentJwt`, so Paperclip mints no run token, so the
+engine never sets `PAPERCLIP_API_KEY`. Consequences: session-snapshot and usage work products
+return `no run auth token available`, and the bridge's approval POST fails closed with
+`governance env unavailable`. The local guardrail rail still denies correctly — the human
+round-trip and both work products are dead.
+
+- Declare `supportsLocalAgentJwt: true`, `runtimeToolDelivery: "native_mcp"`,
+  `supportsInstructionsBundle` + `instructionsPathKey`, and `getQuotaWindows`.
+- Read connection tools from the declared delivery channel; today `paperclipRuntimeTools` is
+  never read, so Paperclip connection tools are dropped entirely.
+- Acceptance: one live heartbeat produces a run token, a posted work product, a readable
+  approval verdict, and a non-zero MCP server count.
+
+### 18. Per-employee data fence
+
+Every employee shares `~/.omp`: sessions, titles, model cache, auth state, extensions. The
+session browser posts a **global** `_omp/sessions/listAll` snapshot to the issue, so one
+company's board can display another company's sessions, and any employee can load another's
+session id.
+
+- Set `PI_CODING_AGENT_DIR` per agent (the state dir already exists per company/agent) and
+  pass the same value to side channels.
+- Replace the global listing with ACP `session/list` scoped to the run's cwd; keep
+  `_omp/*` only as an explicitly operator-gated diagnostic.
+- Add retention: scheduled `omp gc --apply` per agent dir; redact with `/dump anon` before
+  anything becomes a work product.
+- Acceptance: two agents in two companies see disjoint session sets; an unset
+  `PI_CODING_AGENT_DIR` is treated as a misconfiguration warning, not a silent default.
+
+### 19. Repair features that report success but are dead
+
+- **Session-panel plugin**: SQL uses `heartbeat_runs.ended_at` (schema: `finished_at`) and
+  `cost_events.run_id` (schema: `heartbeat_run_id`), and `cost_cents` is `numeric` returned
+  as a string, so even a fixed query renders $0.00. Fix the query, the type handling, and add
+  a schema-derived fixture instead of a mocked one.
+- **`refreshModels` does not refresh**: `force: true` only bypasses the adapter's own 5-minute
+  cache. Run `omp models refresh` (bounded, single-flight) first, and return `cost` +
+  `contextWindow` so rate cards reach the board.
+- **`detectModel` shape**: returns a bare id while `refreshModels` returns `provider/id`;
+  reconcile, and stop persisting a throwaway session on every probe.
+- **Work products on non-issue wakes** 404 warn-only (chat wakes carry `taskId: "chat-1"`);
+  POSTs are also unbounded network waits on the run path. Gate on a real issue id and bound
+  the call.
+- **Cost truth** (absorbs item 6): parse omp's `pricingStatus` (`fixed|free|included|variable|
+  unknown`) instead of guessing from a zero rate card; emit `costStatus`/`pricingProvenance`;
+  populate `usageByModel` so failover produces per-model receipts.
+- **Discovery honesty**: drop the `_omp/subagents` probe (the method does not exist; every run
+  pays a wasted frame).
+
+Acceptance: the panel renders real cost on a real run; a retired model disappears after one
+refresh; no 404 work-product POSTs in a chat-wake run.
+
+### 20. Spend that can actually stop
+
+- Add `--max-cost` (hard stop, subagents included, print exit 3) and `--warn-cost` to the run
+  overlay. The bridge's `budgetCapUsd` stays as a soft, earlier signal — it is bypassable by
+  any tool that never reaches the bridge, and it is per-process, so subagents multiply it.
+- Reconcile the README's rate-card table with `pricingStatus`; keep declared-free and unpriced
+  visually distinct.
+- Acceptance: a run with a 1¢ cap stops before the second model request; the board shows
+  `costStatus` matching what the engine actually reported.
+
+### 21. Session correctness (absorbs 9's correctness half)
+
+- **Per-session lease.** Warm reuse is rejected by the engine, so consecutive heartbeats are
+  close-and-relaunch: two overlapping runs are two processes on one session file. Add an
+  adapter-owned per-`sessionKey` lease covering `execute()`.
+- **Fork precondition.** `session/fork` is passed the *current* run's cwd; omp rejects the
+  open when it differs from the source session's recorded cwd. Read the source cwd from the
+  listing and pass that.
+- **Restore cliff.** omp ≥18.6.3 fails `session/load|fork|switch` with `Could not restore
+  model <id>` instead of silently switching; the adapter classifies that as a hard
+  `acpx_session_init_failed` and the employee never recovers. Classify it as rotate-to-fresh.
+- **Context pressure.** Consume `usage_update` (`size`/`used`/`cost`) instead of estimating
+  cost from rate cards; it is the only place omp reports the compaction signal.
+- Acceptance: kill one of two concurrent runs mid-turn — the survivor completes; a removed
+  model degrades to a fresh session instead of a dead employee.
+
+### 22. Governance integrity (the item 4 decision, plus the fence that survives yolo)
+
+- **Fail closed on a missing bridge.** Today `armed` means "manifest path set and dist path
+  has no whitespace", never "the extension loaded". A failed load is logged and the run
+  continues with `approvalMode: yolo` and no gate. If a policy was expected, refuse the run.
+- **`tools.restrictedFolders`** for `.git`, secret stores and sibling tenants' worktrees —
+  the only fence that asks in every approval mode, `yolo` included.
+- **Single-gate reality check**: a settings-level `yolo` is coerced to `always-ask` for the
+  four gated tools, so bash/edit/delete/move still reach the engine proxy. Document it, and
+  reject `deny-all` combined with a governed bash allow (it rejects the call outright).
+- **Do not enable plan mode** until an elicitation client exists on one side or the other.
+  This is a deliberate "no", not a pending feature.
+- Acceptance: an unloadable bridge fails the run loudly; a write to a restricted folder asks
+  even under yolo; plan mode cannot be switched on by config.
+
+### 23. Upgrade contract
+
+- Pin a tested omp range in `peerDependencies` and enforce the **minor** in
+  `testEnvironment` (today any `x.y.z` parses as fine).
+- Pin `@paperclipai/adapter-utils` to a tested calver rather than a caret across ~30 weekly
+  releases that carry the engine behavior this adapter compensates for.
+- Tolerate a missing `schemaVersion` in `omp models --json`; parse by field, not position.
+- Known cliffs to encode as tests: `ui.approve()` shape change, OTLP `pi.*`→`omp.*`
+  attributes, `session/set_config_option` accepting only `mode|model|thinking`.
+- Acceptance: a simulated 18.x minor bump with a renamed config key fails `testEnvironment`
+  with a readable message instead of failing a heartbeat.
+
+---
+
+## P1 — v0.10 "Fleet, honestly"
+
+Only work whose lever exists in the current engine.
+
+### 2. Thinking and model control without rotation
+Move `--thinking` into a `--config` overlay (`defaultThinkingLevel`), add live
+`session/set_config_option {configId:"thinking"}` after handshake, and switch models via
+`set_config_option {configId:"model"}` instead of re-invoking a run. Stop rotating the
+Paperclip fingerprint when only the thinking level changes (prompt-cache loss today).
+
+### 10. Failover that survives quota
+Write `retry.fallbackOn: usage-limit`, `retry.waitForUsageReset`, `retry.fallbackRevertPolicy`,
+and per-role chains — `default` never applies to model-kind roles. Report which model served
+the turn (needs item 19's `usageByModel`).
+
+### 3. MCP, second half
+Managed company gateways need an adapter-declarable allowlist upstream (today hardcoded to
+`codex_local`); stdio servers need a command discriminator on `AdapterRuntimeMcpServer`.
+Per-server allow/deny and failure surfacing stay adapter-side.
+
+### 9. Session intelligence, second half
+ACP `session/list` with cursors instead of the unpaged `_omp/*` scan; align rotation with
+omp's per-model compaction thresholds instead of adapter-owned run counters; keep the shipped
+browser as the board surface.
+
+### 7b. Credential grants per employee
+`auth-gateway serve --clients` (model allowlist + broker account per client, hot-reloaded, no
+fallback) — the per-employee enforcement the v0.6 descope called redundant.
+
+### 24. Cold-start economics (replaces item 1)
+`omp --restore <session>` (resumes the interrupted turn **and its subagents**),
+`omp -p --wait-async` for maintenance heartbeats, `omp session pack|unpack` for host
+migration, `/compact`/`/handoff` as CLI actions. Target: a maintenance heartbeat costs a
+fraction of a full run.
+
+### 25. Sandbox / remote execution — **blocked upstream**
+Two hardcoded sets exclude `omp_local`: `REMOTE_MANAGED_ADAPTERS` (local only) and the Rust
+runner's closed ACPX profile list. Until one opens, omp employees cannot be sandboxed or run
+remotely; any fleet plan that assumes a sandbox boundary is fiction.
+
+---
+
+## P2 — v1.0 "Org runtime"
+
+### 12. The RPC lane
+One employee, two transports. RPC is the only place these exist:
+
+- **12a executor** — spawn `omp --mode rpc`, map frames to the adapter's event stream, keep
+  ACP as the governed work lane and RPC as the control lane.
+- **12b subagents** — `set_subagent_subscription` (`off|progress|events`), `get_subagents`,
+  `get_subagent_messages` (byte-incremental), `cancel_subagent`, `steer_subagent`.
+- **12c host tools** — `set_host_tools` / `set_host_uri_schemes`: Paperclip registers tools
+  and `paperclip://` URIs natively instead of through an extension, plus `goal.token_budget`
+  as a per-task spend budget.
+
+Acceptance: an employee's heartbeat shows a subagent tree with per-subagent transcripts and
+cost, and can cancel one without stopping the parent turn.
+
+### 26. Live steering — **blocked upstream (paperclip)**
+`_session/steering` injects a message into a running turn and reports `promptRequired` when
+it cannot. The adapter side is trivial; the engine has no steering path. Until then, a board
+comment costs a new heartbeat.
+
+### 5 / 13 — done
+Skills-as-tools and the extension bridge shipped in v0.7/v0.8. Nothing to build; keep them
+covered by tests.
+
+---
+
+## Parked (with the reason, so nobody re-proposes them)
+
+| Item | Why parked | What would unpark it |
+|---|---|---|
+| 4 plan-mode governance | Plan approval is auto-granted without an `elicitation/form` client; extension plan-review hooks are TUI-only | A paperclip elicitation client on the ACP lane, or omp emitting `plan_review_requested` in ACP mode |
+| 8 warm process pool | Host-lane reuse is discarded while a live run-scoped credential exists | An upstream credential-rebind protocol |
+| 11 OTLP export | Paperclip's launch builder is hardcoded to claude/codex; other harnesses resolve `unsupported_harness` | A harness-agnostic observability launcher |
+| 14 headless collab | `CollabHost` depends on the TUI context; `omp join` refuses non-TTY | Upstream extraction of a headless host |
+| 15 omp worktrees | Paperclip already owns `git_worktree` per run | Nothing — this is the correct division |
+| 16 in-process SDK | Bun-only public surface | Not expected; the process boundary (ACP + RPC) is sufficient |
+
+---
+
+## Upstream contributions (Paperclip) — status verified 2026-10-26
+
+| Item | Status | Unlocks |
+|---|---|---|
+| `supportsAcp`-style capability for engine-backed externals | **done** (`Boolean(adapter.acp)`) | Close this ask |
+| Custom-lane control-key forwarding | **half done** — `model` forwarded, thinking key is still `effort` | Item 2 without omp-side changes |
+| Per-agent config on `refreshModels`/`detectModel` | **absent** (still zero-arg) | Discovery honors `command` overrides |
+| ACP elicitation client on the legacy lane | **absent** | Unparks item 4; makes plan mode meaningful |
+| Steering path for `_session/steering` | **absent** | Item 26 |
+| `session/fork` / `session/set_mode` in the ACPX engine | **absent** | Item 21 without shelling out |
+| stdio MCP servers in `AdapterRuntimeMcpServer` | **absent** (url+token only) | Item 3 second half |
+| Adapter-declarable managed-MCP allowlist | **absent** (hardcoded `codex_local`) | Item 3 second half |
+| Remote/sandbox allowlist that accepts external adapters | **absent** | Item 25 |
+| Mobile/web-worker fallback in the sandboxed parser | **absent** | Rendered transcripts on every device |
+| Type + document `paperclipRuntimeTools` / `runtimeToolDelivery` | **absent** | Item 17 stops guessing |
+
+## Upstream requests (oh-my-pi) — status verified 2026-10-26
+
+| Item | Status | Why |
+|---|---|---|
+| `_omp/models/refresh` over ACP | **absent** — workaround is `omp models refresh` from `refreshModels` | Item 19 |
+| `_omp/subagents` over ACP | **will not happen** — drop the ask, use RPC | Item 12 |
+| Headless collab host | **partial** — registry/CLI already run outside the TUI; only hosting itself is gated | Item 14 |
+| Runtime-neutral SDK | **moot** — Go/Python/Rust RPC clients exist at the process boundary | Item 16 |
+| Stable, versioned model-list schema | **partial** — fields documented, envelope unversioned | Item 19 |
+| ACP plan-review hook outside the TUI | **absent** | Unparks item 4 cheaply |
 
 ---
 
 ## Completed
+
+*Historical entries are preserved as written. Where an entry states a blocker that the
+2026-10-30 assessment resolved (for example the "resume fingerprint instability"), the
+assessment above supersedes it.*
 
 - **2026-09-03 — v0.8.0 (Governance & control).** Guardrail `tool_call` engine (path/bash/deny/revise,
   control-tool-allowlist, mtime re-read) via the paperclip bridge as the sole deny point
