@@ -384,6 +384,37 @@ describe("supervisor", () => {
     }
   }, 20_000);
 
+  it("starts a fresh session when the stored one cannot be resumed", async () => {
+    const log = path.join(root, "openfail.log");
+    const running = await start();
+    const client = await connectClient(running.socketPath);
+    try {
+      client.send(beginFrame({
+        runId: "run-move", sessionKey: "sk-move",
+        worker: {
+          command: process.execPath,
+          args: [fixture],
+          env: { FAKE_RPC_MODE: "openfail", FAKE_RPC_LOG: log },
+        },
+        session: { ompSessionId: "sess-old-cwd" },
+      }));
+      const settled = await client.waitFor(
+        (frame) => frame.type === "run.settled" && frame.runId === "run-move",
+      );
+      if (settled.type !== "run.settled") throw new Error("unreachable");
+      expect(settled.result.exitCode).toBe(0);
+      expect(settled.result.sessionParams?.acpSessionId).toBe("sess-new-1");
+      const commands = (await readFile(log, "utf8")).trim().split("\n")
+        .map((line) => JSON.parse(line) as { type: string });
+      expect(commands.some((command) => command.type === "open_session")).toBe(true);
+      expect(commands.some((command) => command.type === "new_session")).toBe(true);
+      const opened = (await readLedgerRecords(root)).find((record) => record.state === "session_open");
+      expect(opened?.ompSessionId).toBe("sess-new-1");
+    } finally {
+      client.close();
+    }
+  }, 20_000);
+
   it("spawns a second worker for another cwd and leaves the first warm", async () => {
     const a = path.join(root, "work-a");
     const b = path.join(root, "work-b");

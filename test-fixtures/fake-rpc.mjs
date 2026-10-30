@@ -101,6 +101,10 @@ rl.on("line", (line) => {
       sessionFile = `/tmp/fake-session-new-${seq}.json`;
       return succeed(id, "new_session", { cancelled: false });
     case "open_session":
+      if (mode === "openfail") {
+        // What omp does when the stored session cannot be resumed in this cwd.
+        return succeed(id, "open_session", { cancelled: true, resumed: false, sessionId });
+      }
       return succeed(id, "open_session", {
         cancelled: false, resumed: true, sessionId, sessionFile,
       });
