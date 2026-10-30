@@ -26,6 +26,8 @@ export interface LedgerWorker {
   pid: number;
   pgid: number | null;
   startedAt: string;
+  /** Process start identity at spawn: what makes pid reuse detectable. */
+  startIdentity: string | null;
   argvHash: string;
   bridgeHash: string;
   ompVersion: string | null;

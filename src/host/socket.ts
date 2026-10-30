@@ -38,12 +38,28 @@ export function hostRootDir(): string {
   return path.join(resolvePaperclipInstanceRootForAdapter(), "omp-host");
 }
 
+export function hostDiscoveryIn(rootDir: string): string {
+  return path.join(rootDir, "host.json");
+}
+
+export function hostLockIn(rootDir: string): string {
+  return path.join(rootDir, "host.lock");
+}
+
 export function hostDiscoveryPath(): string {
-  return path.join(hostRootDir(), "host.json");
+  return hostDiscoveryIn(hostRootDir());
+}
+
+export function hostLockPath(): string {
+  return hostLockIn(hostRootDir());
+}
+
+export function socketPathIn(rootDir: string, token: string): string {
+  return path.join(rootDir, `host-${token}.sock`);
 }
 
 export function socketPathFor(token: string): string {
-  return path.join(hostRootDir(), `host-${token}.sock`);
+  return socketPathIn(hostRootDir(), token);
 }
 
 /** A fresh filename token; 24 hex chars keeps well under the 108-byte sun_path limit. */
@@ -52,22 +68,81 @@ export function newHostToken(): string {
 }
 
 /** Create the host directory and force its mode: mkdir's mode is umask-masked. */
-export async function ensureHostDir(): Promise<void> {
-  await mkdir(hostRootDir(), { recursive: true, mode: 0o700 });
-  await chmod(hostRootDir(), 0o700);
+export async function ensureHostDirIn(rootDir: string): Promise<void> {
+  await mkdir(rootDir, { recursive: true, mode: 0o700 });
+  await chmod(rootDir, 0o700);
 }
 
-export async function writeDiscovery(discovery: HostDiscovery): Promise<void> {
-  await ensureHostDir();
-  const target = hostDiscoveryPath();
+export async function ensureHostDir(): Promise<void> {
+  await ensureHostDirIn(hostRootDir());
+}
+
+/**
+ * One supervisor per instance root, enforced by an exclusive-create lock file
+ * (the socket token is random, so two hosts would bind two sockets otherwise).
+ * A lock naming a dead or reused pid is reclaimed; a live one refuses the start.
+ */
+export async function acquireHostLock(rootDir: string = hostRootDir()): Promise<{ release: () => Promise<void> }> {
+  await ensureHostDirIn(rootDir);
+  const target = hostLockIn(rootDir);
+  const record = {
+    pid: process.pid,
+    startedAt: new Date().toISOString(),
+    startIdentity: await readProcessStartIdentity(process.pid),
+  };
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const handle = await open(target, "wx", 0o600);
+      try {
+        await handle.writeFile(`${JSON.stringify(record)}\n`, "utf8");
+      } finally {
+        await handle.close();
+      }
+      return {
+        release: async () => {
+          try {
+            const current = JSON.parse(await readFile(target, "utf8")) as { pid?: unknown };
+            if (current.pid === process.pid) await unlink(target);
+          } catch {
+            // A missing/altered lock is not this host's failure to report.
+          }
+        },
+      };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      let holder: { pid?: unknown; startIdentity?: unknown } = {};
+      try {
+        holder = JSON.parse(await readFile(target, "utf8")) as typeof holder;
+      } catch {
+        // Unreadable is treated as stale below: nothing can be proven live.
+      }
+      const pid = typeof holder.pid === "number" ? holder.pid : 0;
+      const identity = typeof holder.startIdentity === "string" ? holder.startIdentity : null;
+      const current = pid > 0 ? await readProcessStartIdentity(pid) : null;
+      const stale = pid <= 0 || !pidAlive(pid) || (identity !== null && current !== null && identity !== current);
+      if (!stale) {
+        throw new Error(`another omp-host is running for this instance (pid ${pid})`);
+      }
+      await unlink(target).catch(() => {});
+    }
+  }
+  throw new Error(`the omp-host lock at ${target} kept being reclaimed; refusing to start a second supervisor`);
+}
+
+export async function writeDiscovery(
+  discovery: HostDiscovery,
+  rootDir: string = hostRootDir(),
+): Promise<void> {
+  await ensureHostDirIn(rootDir);
+  const target = hostDiscoveryIn(rootDir);
   const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
   await writeFile(tmp, `${JSON.stringify(discovery, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   await chmod(tmp, 0o600);
   await rename(tmp, target);
 }
 
-export async function clearDiscovery(): Promise<void> {
-  await unlink(hostDiscoveryPath()).catch(() => {});
+export async function clearDiscovery(rootDir: string = hostRootDir()): Promise<void> {
+  await unlink(hostDiscoveryIn(rootDir)).catch(() => {});
 }
 
 function parseDiscovery(raw: string): HostDiscovery | null {
@@ -90,9 +165,9 @@ function parseDiscovery(raw: string): HostDiscovery | null {
 }
 
 /** The running supervisor's record, or null when there is none (or it is unreadable). */
-export async function readDiscovery(): Promise<HostDiscovery | null> {
+export async function readDiscovery(rootDir: string = hostRootDir()): Promise<HostDiscovery | null> {
   try {
-    return parseDiscovery(await readFile(hostDiscoveryPath(), "utf8"));
+    return parseDiscovery(await readFile(hostDiscoveryIn(rootDir), "utf8"));
   } catch {
     return null;
   }

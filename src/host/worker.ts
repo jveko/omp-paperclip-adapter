@@ -99,6 +99,7 @@ export class RpcWorker {
   private readonly requestTimeoutMs: number;
   private readonly pending = new Map<string, PendingRequest>();
   private readonly listeners = new Set<(frame: RpcFrame) => void>();
+  private readonly stderrListeners = new Set<(chunk: string) => void>();
   private readonly retained: RpcFrame[] = [];
   private readonly chunks = new Map<string, PendingChunks>();
   private hostToolHandler: ((frame: RpcFrame) => Promise<Record<string, unknown>> | Record<string, unknown>) | null = null;
@@ -127,7 +128,9 @@ export class RpcWorker {
       }
     });
     child.stderr?.on("data", (chunk: Buffer) => {
-      this.stderrTail = (this.stderrTail + chunk.toString("utf8")).slice(-4_000);
+      const text = chunk.toString("utf8");
+      this.stderrTail = (this.stderrTail + text).slice(-4_000);
+      for (const listener of this.stderrListeners) listener(text);
     });
     const finish = (code: number | null, signal: NodeJS.Signals | null) => {
       if (this.dead) return;
@@ -191,6 +194,12 @@ export class RpcWorker {
   onFrame(listener: (frame: RpcFrame) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  /** Stream the worker's stderr; the run log relays it 1:1. */
+  onStderr(listener: (chunk: string) => void): () => void {
+    this.stderrListeners.add(listener);
+    return () => this.stderrListeners.delete(listener);
   }
 
   /**

@@ -46,7 +46,7 @@ export interface SessionLeaseRecord {
 }
 
 export type SessionLease =
-  | { ok: true; release: () => Promise<void> }
+  | { ok: true; owner: string; release: () => Promise<void> }
   | { ok: false; error: string };
 
 /**
@@ -246,6 +246,7 @@ export async function acquireSessionLease(input: {
       const owner = record.owner;
       return {
         ok: true,
+        owner,
         release: async () => {
           try {
             const current = parseRecord(await readFile(file, "utf8"));

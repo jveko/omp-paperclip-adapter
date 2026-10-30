@@ -1,0 +1,1258 @@
+import { createHash, randomBytes } from "node:crypto";
+import { execFile } from "node:child_process";
+import { chmod, mkdir, unlink } from "node:fs/promises";
+import net from "node:net";
+import { StringDecoder } from "node:string_decoder";
+import type { AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import {
+  acquireSessionLease, pidAlive, SESSION_LEASE_TIMEOUT_GRACE_MS,
+} from "../server/session-lease.js";
+import { sessionIntelDir } from "../server/session-state.js";
+import {
+  LedgerWriteError, RunLedger, isTerminalState, type LedgerInput,
+  type LedgerRecord, type LedgerUsage, type LedgerWorker,
+} from "./ledger.js";
+import {
+  HOST_PROTOCOL_VERSION, encodeFrame, parseFrame, isHostFrame,
+  type HostFrame, type HostReply, type LedgerCause, type RunBeginFrame,
+  type RunEventKind, type RunSettledFrame,
+} from "./protocol.js";
+import { clearRunContext, reapRunContexts, runContextPointer, writeRunContext } from "./run-context.js";
+import {
+  acquireHostLock, clearDiscovery, ensureHostDirIn, hostRootDir, isDiscoveryStale,
+  newHostToken, readDiscovery, readProcessStartIdentity, socketPathIn, writeDiscovery,
+  type HostDiscovery,
+} from "./socket.js";
+import { RpcWorker, type RpcFrame } from "./worker.js";
+
+/**
+ * The supervisor: one per Paperclip instance, lazily spawned by the adapter.
+ *
+ * It owns workers (spawn, reuse, capacity, reaping), owns the run ledger and the
+ * run-context credentials, and turns `omp --mode rpc` frames into the settle
+ * result the adapter returns. It never infers settlement from a timer: a run
+ * ends on `prompt_result.sessionSettled` / `session_settled`, on a worker exit,
+ * on an operator/adapter cancel, or on the run lease expiring — each with its
+ * own ledger cause.
+ *
+ * Nothing here may be a background service: it exits after `hostIdleMs` with no
+ * workers, and `close()` settles or journals every in-flight run before exit.
+ */
+
+export interface HostOptions {
+  /** Defaults to the instance root's `omp-host`; tests pass a temp dir. */
+  rootDir?: string;
+  hostIdleMs?: number;
+  workerIdleMs?: number;
+  maxWorkers?: number;
+  runLeaseTtlMs?: number;
+  drainMs?: number;
+  cancelGraceMs?: number;
+  /** Phase 1 runs cold; warm reuse is the v0.12 phase-2 default. */
+  reuseWorkers?: boolean;
+  version?: string;
+}
+
+export interface RunningHost {
+  socketPath: string;
+  discovery: HostDiscovery;
+  /** Resolves when the host has closed (idle, shutdown frame, SIGTERM or close()). */
+  closed: Promise<void>;
+  close(reason?: string): Promise<void>;
+  readonly workers: number;
+  readonly runs: number;
+}
+
+const DEFAULT_HOST_IDLE_MS = 30 * 60 * 1000;
+const DEFAULT_WORKER_IDLE_MS = 20 * 60 * 1000;
+const DEFAULT_MAX_WORKERS = 8;
+const DEFAULT_RUN_LEASE_TTL_MS = 90_000;
+const DEFAULT_DRAIN_MS = 30_000;
+const DEFAULT_CANCEL_GRACE_MS = 5_000;
+
+function positiveEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function hashText(...parts: string[]): string {
+  return createHash("sha256").update(parts.join("\u0000")).digest("hex").slice(0, 16);
+}
+
+/** `omp --version` once per command; null when the probe is useless. */
+function probeOmpVersion(command: string): Promise<string | null> {
+  const result = Promise.withResolvers<string | null>();
+  execFile(command, ["--version"], { encoding: "utf8", timeout: 1_500 }, (error, stdout) => {
+    const text = typeof stdout === "string" ? stdout.trim() : "";
+    const match = text.match(/\d+\.\d+\.\d+/);
+    result.resolve(error === null && match !== null ? match[0] : null);
+  });
+  return result.promise;
+}
+
+interface Fingerprint {
+  argvHash: string;
+  bridgeHash: string;
+  agentDir: string | null;
+  cwd: string;
+  ompVersion: string | null;
+}
+
+interface WorkerEntry {
+  key: string;
+  worker: RpcWorker;
+  begin: RunBeginFrame;
+  fingerprint: Fingerprint;
+  sessionDir: string;
+  sessionKey: string;
+  startIdentity: string | null;
+  currentRun: string | null;
+  lastUsedAt: number;
+}
+
+interface StatsSnapshot {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cost: number;
+  routedModels: Record<string, number>;
+  contextUsage: { used: number; size: number } | null;
+}
+
+interface PromptOutcome {
+  status: "completed" | "aborted" | "error";
+  agentInvoked: boolean;
+  sessionSettled: boolean;
+  errorMessage: string | null;
+}
+
+interface RunState {
+  runId: string;
+  begin: RunBeginFrame;
+  worker: WorkerEntry;
+  reusedWorker: boolean;
+  sessionOpening: "new" | "open";
+  ompSessionId: string;
+  sessionFile: string | null;
+  seq: number;
+  connection: Connection;
+  runContextPath: string;
+  leaseOwner: string;
+  leaseRelease: () => Promise<void>;
+  leaseDeadline: number;
+  leaseMisses: number;
+  leaseTimer?: NodeJS.Timeout;
+  timeoutTimer?: NodeJS.Timeout;
+  outcome: PromptOutcome | null;
+  settledResult: AdapterExecutionResult | null;
+  /** Set when the caller is gone: the settle is journaled as lost, not settled. */
+  abandoned: "adapter_gone" | null;
+  terminal: boolean;
+  startedAtMs: number;
+  statsBefore: StatsSnapshot | null;
+  unsubscribe: Array<() => void>;
+  lastAssistantText: string | null;
+}
+
+interface Connection {
+  socket: net.Socket;
+  buffer: string;
+  decoder: StringDecoder;
+  runId: string | null;
+  closed: boolean;
+}
+
+function readStats(data: Record<string, unknown>): StatsSnapshot | null {
+  const tokens = data.tokens;
+  if (typeof tokens !== "object" || tokens === null || Array.isArray(tokens)) return null;
+  const record = tokens as Record<string, unknown>;
+  const input = typeof record.input === "number" ? record.input : 0;
+  const output = typeof record.output === "number" ? record.output : 0;
+  const cacheRead = typeof record.cacheRead === "number" ? record.cacheRead : 0;
+  const routed: Record<string, number> = {};
+  if (typeof data.routedModels === "object" && data.routedModels !== null && !Array.isArray(data.routedModels)) {
+    for (const [model, count] of Object.entries(data.routedModels as Record<string, unknown>)) {
+      if (typeof count === "number") routed[model] = count;
+    }
+  }
+  const usage = data.contextUsage;
+  const contextUsage = typeof usage === "object" && usage !== null && !Array.isArray(usage)
+    && typeof (usage as Record<string, unknown>).used === "number"
+    && typeof (usage as Record<string, unknown>).size === "number"
+    ? {
+      used: (usage as Record<string, number>).used,
+      size: (usage as Record<string, number>).size,
+    }
+    : null;
+  return {
+    input,
+    output,
+    cacheRead,
+    cost: typeof data.cost === "number" ? data.cost : 0,
+    routedModels: routed,
+    contextUsage,
+  };
+}
+
+function delta(before: StatsSnapshot | null, after: StatsSnapshot | null): StatsSnapshot {
+  const base = before ?? { input: 0, output: 0, cacheRead: 0, cost: 0, routedModels: {}, contextUsage: null };
+  const top = after ?? base;
+  return {
+    input: Math.max(0, top.input - base.input),
+    output: Math.max(0, top.output - base.output),
+    cacheRead: Math.max(0, top.cacheRead - base.cacheRead),
+    cost: Math.max(0, top.cost - base.cost),
+    routedModels: top.routedModels,
+    contextUsage: top.contextUsage,
+  };
+}
+
+/** The last assistant text a `message_end` frame carried, if any. */
+function assistantText(frame: RpcFrame): string | null {
+  const message = frame.message;
+  if (typeof message !== "object" || message === null || Array.isArray(message)) return null;
+  const content = (message as Record<string, unknown>).content;
+  if (!Array.isArray(content)) return null;
+  const text = content
+    .map((block) => (typeof block === "object" && block !== null && !Array.isArray(block)
+      ? (block as Record<string, unknown>).text
+      : null))
+    .filter((value): value is string => typeof value === "string")
+    .join("");
+  return text.trim() === "" ? null : text;
+}
+
+/** The provider error text a `prompt_result.error` carries, when it carries one. */
+function promptErrorMessage(value: unknown): string | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  if (!("message" in value) || typeof value.message !== "string") return null;
+  return value.message;
+}
+
+class Supervisor {
+  private readonly options: Required<Pick<HostOptions, "hostIdleMs" | "workerIdleMs" | "maxWorkers"
+    | "runLeaseTtlMs" | "drainMs" | "cancelGraceMs" | "reuseWorkers" | "version">> & { rootDir: string };
+  private readonly runs = new Map<string, RunState>();
+  private readonly workers = new Map<string, WorkerEntry>();
+  private readonly connections = new Set<Connection>();
+  private readonly versionCache = new Map<string, string | null>();
+  private ledger: RunLedger | null = null;
+  private server: net.Server | null = null;
+  private lock: { release: () => Promise<void> } | null = null;
+  private socketPath = "";
+  private epoch = "";
+  private closedAt: number | null = null;
+  private lastActivity = Date.now();
+  private sweepTimer: NodeJS.Timeout | null = null;
+  private shuttingDown = false;
+  private readonly closed = Promise.withResolvers<void>();
+  private discovery: HostDiscovery | null = null;
+  private closeReason = "";
+
+  constructor(options: HostOptions) {
+    this.options = {
+      rootDir: options.rootDir ?? hostRootDir(),
+      hostIdleMs: options.hostIdleMs ?? positiveEnv("OMP_HOST_IDLE_MS", DEFAULT_HOST_IDLE_MS),
+      workerIdleMs: options.workerIdleMs ?? positiveEnv("OMP_HOST_WORKER_IDLE_MS", DEFAULT_WORKER_IDLE_MS),
+      maxWorkers: options.maxWorkers ?? positiveEnv("OMP_HOST_MAX_WORKERS", DEFAULT_MAX_WORKERS),
+      runLeaseTtlMs: options.runLeaseTtlMs ?? positiveEnv("OMP_HOST_RUN_LEASE_TTL_MS", DEFAULT_RUN_LEASE_TTL_MS),
+      drainMs: options.drainMs ?? positiveEnv("OMP_HOST_DRAIN_MS", DEFAULT_DRAIN_MS),
+      cancelGraceMs: options.cancelGraceMs ?? positiveEnv("OMP_HOST_CANCEL_GRACE_MS", DEFAULT_CANCEL_GRACE_MS),
+      reuseWorkers: options.reuseWorkers ?? false,
+      version: options.version ?? "0.12.0",
+    };
+  }
+
+  get root(): string {
+    return this.options.rootDir;
+  }
+
+  async start(): Promise<RunningHost> {
+    await ensureHostDirIn(this.root);
+    await this.takeOver();
+    this.lock = await acquireHostLock(this.root);
+    this.ledger = await RunLedger.open(this.root);
+    this.epoch = `host-${randomBytes(3).toString("hex")}`;
+    await reconcileWith(this.root, this.ledger);
+    await this.listen();
+    this.sweepTimer = setInterval(() => this.sweep(), sweepInterval(this.options));
+    this.sweepTimer.unref();
+    const supervisor = this;
+    return {
+      socketPath: this.socketPath,
+      discovery: this.discovery as HostDiscovery,
+      closed: this.closed.promise,
+      close: (reason = "requested") => this.close(reason),
+      get workers() { return supervisor.workers.size; },
+      get runs() { return supervisor.runs.size; },
+    };
+  }
+
+  /** Refuse to start over a live supervisor; remove a stale record and socket. */
+  private async takeOver(): Promise<void> {
+    const existing = await readDiscovery(this.root);
+    if (existing === null) return;
+    const identity = await readProcessStartIdentity(existing.pid);
+    if (!isDiscoveryStale(existing, identity)) {
+      throw new Error(`another omp-host is already serving this instance (pid ${existing.pid})`);
+    }
+    await unlink(existing.socket).catch(() => {});
+    await clearDiscovery(this.root);
+  }
+
+  private async listen(): Promise<void> {
+    const token = newHostToken();
+    this.socketPath = socketPathIn(this.root, token);
+    if (Buffer.byteLength(this.socketPath) > 100) {
+      throw new Error(`the omp-host socket path is too long for a Unix socket: ${this.socketPath}`);
+    }
+    const server = net.createServer((socket) => this.accept(socket));
+    const listening = Promise.withResolvers<void>();
+    server.once("error", (err) => listening.reject(err));
+    server.listen(this.socketPath, () => listening.resolve());
+    await listening.promise;
+    this.server = server;
+    await chmod(this.socketPath, 0o600).catch(() => {});
+    this.discovery = {
+      v: 1,
+      socket: this.socketPath,
+      token,
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+      startIdentity: await readProcessStartIdentity(process.pid),
+      epoch: this.epoch,
+      version: this.options.version,
+    };
+    await writeDiscovery(this.discovery, this.root);
+  }
+
+  private accept(socket: net.Socket): void {
+    const connection: Connection = {
+      socket,
+      buffer: "",
+      decoder: new StringDecoder("utf8"),
+      runId: null,
+      closed: false,
+    };
+    this.connections.add(connection);
+    this.touch();
+    socket.on("data", (chunk: Buffer) => {
+      connection.buffer += connection.decoder.write(chunk);
+      let newline = connection.buffer.indexOf("\n");
+      while (newline >= 0) {
+        const line = connection.buffer.slice(0, newline);
+        connection.buffer = connection.buffer.slice(newline + 1);
+        if (line.trim() !== "") this.readFrame(connection, line);
+        newline = connection.buffer.indexOf("\n");
+      }
+    });
+    socket.on("error", () => {});
+    socket.on("close", () => {
+      connection.closed = true;
+      this.connections.delete(connection);
+      this.touch();
+      const runId = connection.runId;
+      if (runId !== null) {
+        const run = this.runs.get(runId);
+        if (run !== undefined && !run.terminal) void this.adapterGone(run);
+      }
+    });
+  }
+
+  private readFrame(connection: Connection, line: string): void {
+    const frame = parseFrame(line);
+    if (frame === null || !isHostFrame(frame)) {
+      this.send(connection, { type: "error", code: "bad_frame", message: "the supervisor did not understand that frame" });
+      return;
+    }
+    this.touch();
+    void this.dispatch(connection, frame).catch((err: unknown) => {
+      this.send(connection, {
+        type: "error",
+        ...("id" in frame && typeof frame.id === "string" ? { id: frame.id } : {}),
+        code: "host_error",
+        message: err instanceof Error ? err.message : String(err),
+      });
+    });
+  }
+
+  private async dispatch(connection: Connection, frame: HostFrame): Promise<void> {
+    switch (frame.type) {
+      case "hello":
+        this.send(connection, {
+          type: "hello_ok",
+          hostVersion: this.options.version,
+          hostPid: process.pid,
+          epoch: this.epoch,
+          workers: this.workers.size,
+        });
+        return;
+      case "run.begin":
+        await this.beginRun(connection, frame);
+        return;
+      case "run.heartbeat": {
+        const run = this.runs.get(frame.runId);
+        if (run !== undefined) {
+          run.leaseMisses = 0;
+          run.leaseDeadline = Date.now() + run.begin.limits.runLeaseTtlMs;
+        }
+        return;
+      }
+      case "run.cancel": {
+        const run = this.runs.get(frame.runId);
+        if (run !== undefined && !run.terminal) void this.cancelRun(run, frame.reason);
+        return;
+      }
+      case "run.status":
+        this.send(connection, await this.statusOf(frame.id, frame.runId));
+        return;
+      case "probe":
+        this.send(connection, this.probe(frame));
+        return;
+      case "shutdown":
+        await this.close(frame.reason ?? "operator");
+        return;
+    }
+  }
+
+  private send(connection: Connection, frame: HostReply): void {
+    if (connection.closed) return;
+    connection.socket.write(encodeFrame(frame));
+  }
+
+  private emitEvent(run: RunState, kind: RunEventKind, payload: Record<string, unknown>): void {
+    run.seq += 1;
+    this.send(run.connection, {
+      type: "run.event",
+      runId: run.runId,
+      seq: run.seq,
+      at: new Date().toISOString(),
+      kind,
+      payload,
+    });
+  }
+
+  private sendSettled(connection: Connection, runId: string, result: AdapterExecutionResult): void {
+    const frame: RunSettledFrame = { type: "run.settled", runId, result };
+    this.send(connection, frame);
+  }
+
+  private probe(frame: Extract<HostFrame, { type: "probe" }>): HostReply {
+    if (frame.kind !== "capabilities") {
+      return {
+        type: "probe.result",
+        id: frame.id,
+        kind: frame.kind,
+        payload: { ok: false, error: `the supervisor does not serve '${frame.kind}' probes; use the ACP probe lane` },
+      };
+    }
+    return {
+      type: "probe.result",
+      id: frame.id,
+      kind: frame.kind,
+      payload: {
+        ok: true,
+        protocol: HOST_PROTOCOL_VERSION,
+        hostVersion: this.options.version,
+        epoch: this.epoch,
+        workers: this.workers.size,
+        runs: this.runs.size,
+        uptimeMs: this.closedAt === null ? Date.now() - Date.parse(this.discovery?.startedAt ?? new Date().toISOString()) : 0,
+      },
+    };
+  }
+
+  private async statusOf(id: string, runId: string): Promise<HostReply> {
+    const run = this.runs.get(runId);
+    if (run !== undefined) {
+      return {
+        type: "run.status.result",
+        id,
+        runId,
+        state: run.terminal ? "settled" : "prompting",
+        ...(run.settledResult !== null ? { settled: run.settledResult } : {}),
+      };
+    }
+    const ledger = this.ledger;
+    if (ledger !== null) {
+      const record = ledger.snapshot().get(runId);
+      if (record !== undefined) return { type: "run.status.result", id, runId, state: record.state };
+    }
+    return { type: "run.status.result", id, runId, state: "lost" };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  Run lifecycle                                                      */
+  /* ------------------------------------------------------------------ */
+
+  private async beginRun(connection: Connection, begin: RunBeginFrame): Promise<void> {
+    const ledger = this.ledger as RunLedger;
+    const refuse = async (cause: LedgerCause, errorCode: string, errorMessage: string): Promise<void> => {
+      await this.journal({
+        epoch: this.epoch,
+        runId: begin.runId,
+        companyId: begin.agent.companyId,
+        agentId: begin.agent.id,
+        sessionKey: begin.sessionKey,
+        cwd: begin.cwd,
+        state: "refused",
+        cause,
+      }).catch(() => {});
+      this.sendSettled(connection, begin.runId, {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorCode,
+        errorMessage,
+      });
+    };
+
+    const known = this.runs.get(begin.runId);
+    if (known !== undefined) {
+      if (known.settledResult !== null) this.sendSettled(connection, begin.runId, known.settledResult);
+      else this.sendAccepted(connection, known);
+      return;
+    }
+    const prior = ledger.snapshot().get(begin.runId);
+    if (prior !== undefined && isTerminalState(prior.state)) {
+      this.sendSettled(connection, begin.runId, {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorCode: "omp_host_run_ended",
+        errorMessage: `run ${begin.runId} already ended (ledger state '${prior.state}') in this supervisor's epoch; it is not replayed`,
+      });
+      return;
+    }
+    if (this.shuttingDown) {
+      await refuse("config_error", "omp_host_shutting_down", "the omp supervisor is draining and does not accept new runs");
+      return;
+    }
+
+    const lease = await acquireSessionLease({
+      dir: sessionIntelDir(begin.agent.companyId, begin.agent.id),
+      key: begin.sessionKey,
+      pid: process.pid,
+      ...(begin.limits.timeoutMs !== null ? { ttlMs: begin.limits.timeoutMs + SESSION_LEASE_TIMEOUT_GRACE_MS } : {}),
+    });
+    if (!lease.ok) {
+      await refuse("lease_held", "omp_session_lease_held", lease.error);
+      return;
+    }
+    try {
+      await this.journal({
+        epoch: this.epoch,
+        runId: begin.runId,
+        companyId: begin.agent.companyId,
+        agentId: begin.agent.id,
+        sessionKey: begin.sessionKey,
+        cwd: begin.cwd,
+        state: "leased",
+        lease: {
+          owner: lease.owner,
+          expiresAt: new Date(
+            Date.now() + (begin.limits.timeoutMs ?? 0) + SESSION_LEASE_TIMEOUT_GRACE_MS,
+          ).toISOString(),
+        },
+      });
+    } catch (err) {
+      await lease.release();
+      this.sendSettled(connection, begin.runId, {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorCode: "omp_host_unwritable",
+        errorMessage: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+
+    let worker: WorkerEntry;
+    let reused = false;
+    try {
+      const ensured = await this.ensureWorker(begin);
+      worker = ensured.worker;
+      reused = ensured.reused;
+    } catch (err) {
+      await lease.release();
+      const message = err instanceof Error ? err.message : String(err);
+      const capacity = message.includes("omp_host_capacity");
+      await refuse(
+        capacity ? "capacity" : "config_error",
+        capacity ? "omp_host_capacity" : "omp_host_worker_failed",
+        message,
+      );
+      return;
+    }
+
+    const run: RunState = {
+      runId: begin.runId,
+      begin,
+      worker,
+      reusedWorker: reused,
+      sessionOpening: begin.session.ompSessionId ? "open" : "new",
+      ompSessionId: begin.session.ompSessionId ?? "",
+      sessionFile: null,
+      seq: 0,
+      connection,
+      runContextPath: "",
+      leaseOwner: lease.owner,
+      leaseRelease: lease.release,
+      leaseDeadline: Date.now() + begin.limits.runLeaseTtlMs,
+      leaseMisses: 0,
+
+      outcome: null,
+      settledResult: null,
+      abandoned: null,
+      terminal: false,
+      startedAtMs: Date.now(),
+      statsBefore: null,
+      unsubscribe: [],
+      lastAssistantText: null,
+    };
+
+    try {
+      await this.journal(this.runRecord(run, "worker_ready", {
+        worker: this.ledgerWorker(worker),
+      }));
+
+      const sessionDir = worker.sessionDir;
+      await mkdir(sessionDir, { recursive: true, mode: 0o700 });
+      let sessionId = run.ompSessionId;
+      if (sessionId !== "") {
+        const opened = await worker.worker.openSession(sessionDir);
+        if (opened.cancelled) {
+          const fresh = await worker.worker.newSession();
+          if (fresh.cancelled) throw new Error("omp refused to open or create a session for this run");
+          sessionId = "";
+        } else {
+          sessionId = opened.sessionId;
+          run.sessionFile = opened.sessionFile ?? null;
+        }
+      } else {
+        const fresh = await worker.worker.newSession();
+        if (fresh.cancelled) throw new Error("omp refused to create a session for this run");
+      }
+      if (sessionId === "") {
+        const state = await worker.worker.getState();
+        sessionId = typeof state.sessionId === "string" ? state.sessionId : "";
+        if (typeof state.sessionFile === "string") run.sessionFile = state.sessionFile;
+      }
+      run.ompSessionId = sessionId;
+      await this.journal(this.runRecord(run, "session_open", {
+        ompSessionId: sessionId,
+        ...(run.sessionFile !== null ? { sessionFile: run.sessionFile } : {}),
+      }));
+
+      run.statsBefore = readStats(await worker.worker.getStats().catch(() => ({})));
+
+      run.runContextPath = await writeRunContext(
+        this.root, run.runId, begin.credentials, begin.manifests,
+      );
+      this.attach(run);
+      await this.journal(this.runRecord(run, "prompting", {
+        lease: { owner: run.leaseOwner, expiresAt: new Date(run.leaseDeadline).toISOString() },
+      }));
+      worker.currentRun = run.runId;
+      this.runs.set(run.runId, run);
+      connection.runId = run.runId;
+      this.startLeaseWatch(run);
+      this.sendAccepted(connection, run);
+      await worker.worker.prompt(begin.prompt, begin.runId);
+      if (begin.limits.timeoutMs !== null) {
+        run.timeoutTimer = setTimeout(() => {
+          void this.timeoutRun(run);
+        }, begin.limits.timeoutMs);
+        run.timeoutTimer.unref();
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const unwritable = err instanceof LedgerWriteError;
+      await this.settle(run, {
+        kind: "lost",
+        cause: worker.worker.alive ? "config_error" : "worker_exit",
+        errorCode: unwritable ? "omp_host_unwritable" : "omp_host_run_failed",
+        errorMessage: message,
+        executionRecovery: worker.worker.alive
+          ? undefined
+          : { kind: "interrupted", providerStopped: true, sessionPreserved: true, actionOutcomes: "settled" },
+      });
+    }
+  }
+
+  private sendAccepted(connection: Connection, run: RunState): void {
+    this.send(connection, {
+      type: "run.accepted",
+      id: run.begin.id,
+      runId: run.runId,
+      worker: {
+        pid: run.worker.worker.pid,
+        pgid: run.worker.worker.pgid,
+        startedAt: run.worker.worker.startedAt,
+      },
+      reusedWorker: run.reusedWorker,
+      sessionOpening: run.sessionOpening,
+      ompSessionId: run.ompSessionId,
+      runContextPath: run.runContextPath,
+    });
+  }
+
+  private attach(run: RunState): void {
+    const worker = run.worker.worker;
+    run.unsubscribe.push(worker.onFrame((frame) => this.onWorkerFrame(run, frame)));
+    run.unsubscribe.push(worker.onStderr((chunk) => {
+      this.emitEvent(run, "omp.log", { stream: "stderr", chunk });
+    }));
+    void worker.exited.then((exit) => {
+      if (run.terminal) return;
+      void this.settle(run, {
+        kind: "lost",
+        cause: run.abandoned ?? "worker_exit",
+        errorCode: "omp_host_worker_exit",
+        errorMessage: `omp worker exited (${exit.signal ?? exit.code}) mid-run`,
+        executionRecovery: { kind: "interrupted", providerStopped: true, sessionPreserved: true, actionOutcomes: "settled" },
+      });
+    });
+  }
+
+  private onWorkerFrame(run: RunState, frame: RpcFrame): void {
+    if (run.terminal) return;
+    switch (frame.type) {
+      case "prompt_result": {
+        if (typeof frame.id === "string" && frame.id !== run.runId) return;
+        run.outcome = {
+          status: frame.status === "completed" || frame.status === "aborted" || frame.status === "error"
+            ? frame.status
+            : "error",
+          agentInvoked: frame.agentInvoked === true,
+          sessionSettled: frame.sessionSettled === true,
+          errorMessage: promptErrorMessage(frame.error),
+        };
+        if (run.outcome.sessionSettled) void this.finishFromOutcome(run);
+        return;
+      }
+      case "session_settled":
+        if (run.outcome !== null) void this.finishFromOutcome(run);
+        return;
+      case "tool_call":
+      case "tool_result": {
+        this.emitEvent(run, "acpx.tool_call", {
+          phase: frame.type,
+          toolName: typeof frame.toolName === "string" ? frame.toolName : null,
+          toolCallId: typeof frame.toolCallId === "string" ? frame.toolCallId : null,
+        });
+        return;
+      }
+      case "message_end": {
+        const text = assistantText(frame);
+        if (text !== null) run.lastAssistantText = text;
+        this.emitEvent(run, "omp.turn", {
+          messageId: typeof frame.messageId === "string" ? frame.messageId : null,
+          ...(text !== null ? { text } : {}),
+        });
+        return;
+      }
+      case "agent_start":
+      case "agent_end":
+      case "turn_start":
+      case "turn_end":
+        this.emitEvent(run, "omp.turn", { event: frame.type });
+        return;
+      default:
+        // Token deltas and UI frames never reach the board: the engine lane only
+        // ever emitted turn-level activity, and a per-token event is not one.
+        return;
+    }
+  }
+
+  private async finishFromOutcome(run: RunState): Promise<void> {
+    const outcome = run.outcome;
+    if (outcome === null || run.terminal) return;
+    if (run.abandoned !== null) {
+      await this.settle(run, { kind: "lost", cause: run.abandoned });
+      return;
+    }
+    if (outcome.status === "completed") {
+      await this.settle(run, { kind: "settled", stopReason: "end_turn" });
+      return;
+    }
+    if (outcome.status === "aborted") {
+      await this.settle(run, { kind: "settled", cause: "cancel", stopReason: "aborted" });
+      return;
+    }
+    await this.settle(run, {
+      kind: "settled",
+      stopReason: "error",
+      errorCode: "omp_rpc_turn_failed",
+      errorMessage: outcome.errorMessage ?? "the omp turn ended in error",
+    });
+  }
+
+  private async timeoutRun(run: RunState): Promise<void> {
+    if (run.terminal) return;
+    run.timeoutTimer = undefined;
+    // settle() marks the run terminal before its first await, so the abort it
+    // triggers cannot race in a competing 'cancel' outcome.
+    const settling = this.settle(run, {
+      kind: "settled",
+      cause: "timeout",
+      stopReason: "timeout",
+      timedOut: true,
+      errorCode: "omp_host_timeout",
+      errorMessage: `the run exceeded its ${run.begin.limits.timeoutMs}ms timeout`,
+    });
+    await run.worker.worker.abort().catch(() => {});
+    await settling;
+  }
+
+  private async cancelRun(run: RunState, reason: "operator" | "timeout" | "shutdown"): Promise<void> {
+    if (run.terminal) return;
+    await run.worker.worker.abort().catch(() => {});
+    const settled = await this.waitForSettle(run, this.options.cancelGraceMs);
+    if (!settled) {
+      const settling = this.settle(run, {
+        kind: "settled",
+        cause: "cancel",
+        stopReason: "cancelled",
+        detail: { cancelUnconfirmed: true, reason },
+      });
+      run.worker.worker.kill("SIGKILL");
+      await settling;
+    }
+  }
+
+  private async adapterGone(run: RunState): Promise<void> {
+    if (run.terminal) return;
+    run.abandoned = "adapter_gone";
+    await run.worker.worker.abort().catch(() => {});
+    const settled = await this.waitForSettle(run, this.options.cancelGraceMs);
+    if (settled) return;
+    if (run.worker.worker.alive) run.worker.worker.kill("SIGKILL");
+    await this.settle(run, { kind: "lost", cause: "adapter_gone" });
+  }
+
+  /** Resolve true if the run reached a terminal state within `ms`. */
+  private async waitForSettle(run: RunState, ms: number): Promise<boolean> {
+    if (run.terminal) return true;
+    const done = Promise.withResolvers<boolean>();
+    const unsubscribe = run.worker.worker.onFrame((frame) => {
+      if (frame.type !== "prompt_result") return;
+      if (typeof frame.id === "string" && frame.id !== run.runId) return;
+      done.resolve(true);
+    });
+    const timer = setTimeout(() => done.resolve(false), ms);
+    try {
+      return await done.promise;
+    } finally {
+      clearTimeout(timer);
+      unsubscribe();
+    }
+  }
+
+  private startLeaseWatch(run: RunState): void {
+    const ttl = Math.max(50, Math.floor(run.begin.limits.runLeaseTtlMs / 3));
+    run.leaseTimer = setInterval(() => {
+      if (run.terminal) return;
+      if (Date.now() <= run.leaseDeadline) return;
+      run.leaseMisses += 1;
+      if (run.leaseMisses === 1) {
+        this.emitEvent(run, "run.system", {
+          level: "warn",
+          message: `run ${run.runId}: no adapter heartbeat within ${run.begin.limits.runLeaseTtlMs}ms; aborting the prompt (the worker is kept one more window)`,
+        });
+        run.leaseDeadline = Date.now() + run.begin.limits.runLeaseTtlMs;
+        void run.worker.worker.abort().catch(() => {});
+        return;
+      }
+      const settling = this.settle(run, { kind: "lost", cause: "adapter_gone" });
+      run.worker.worker.kill("SIGKILL");
+      void settling;
+    }, ttl);
+    run.leaseTimer.unref();
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  Settlement                                                         */
+  /* ------------------------------------------------------------------ */
+
+  private async settle(
+    run: RunState,
+    outcome: {
+      kind: "settled" | "lost";
+      stopReason?: string;
+      cause?: LedgerCause;
+      errorCode?: string;
+      errorMessage?: string;
+      timedOut?: boolean;
+      detail?: Record<string, unknown>;
+      executionRecovery?: { kind: "interrupted"; providerStopped: true; sessionPreserved: true; actionOutcomes: "settled" };
+    },
+  ): Promise<void> {
+    if (run.terminal) return;
+    run.terminal = true;
+    clearInterval(run.leaseTimer);
+    run.leaseTimer = undefined;
+    clearTimeout(run.timeoutTimer);
+    run.timeoutTimer = undefined;
+    for (const off of run.unsubscribe) off();
+    run.unsubscribe = [];
+    this.runs.delete(run.runId);
+    run.worker.currentRun = null;
+    run.worker.lastUsedAt = Date.now();
+
+    const statsAfter = readStats(await run.worker.worker.getStats().catch(() => ({})));
+    const used = delta(run.statsBefore, statsAfter);
+    const model = this.singleModel(used.routedModels) ?? run.begin.cell.model;
+    const status = run.outcome?.status ?? (outcome.kind === "settled" ? "completed" : "error");
+    const agentInvoked = run.outcome?.agentInvoked ?? false;
+    const usage: LedgerUsage = {
+      inputTokens: used.input,
+      outputTokens: used.output,
+      cachedInputTokens: used.cacheRead,
+      costUsd: used.cost,
+      routedModels: used.routedModels,
+      ...(used.contextUsage !== null ? { contextUsage: used.contextUsage } : {}),
+    };
+    const result: AdapterExecutionResult & { executionRecovery?: Record<string, unknown> } = {
+      exitCode: status === "completed" ? 0 : 1,
+      signal: null,
+      timedOut: outcome.timedOut === true,
+      ...(outcome.errorCode !== undefined ? { errorCode: outcome.errorCode } : {}),
+      ...(outcome.errorMessage !== undefined ? { errorMessage: outcome.errorMessage } : {}),
+      sessionId: run.ompSessionId,
+      sessionDisplayId: run.ompSessionId,
+      sessionParams: {
+        acpSessionId: run.ompSessionId,
+        sessionKey: run.begin.sessionKey,
+        cwd: run.begin.cwd,
+      },
+      model,
+      usage: { inputTokens: used.input, outputTokens: used.output, cachedInputTokens: used.cacheRead },
+      usageBasis: "per_run",
+      costUsd: used.cost,
+      resultJson: {
+        status,
+        stopReason: outcome.stopReason ?? null,
+        agentInvoked,
+        sessionSettled: run.outcome?.sessionSettled ?? false,
+        transport: "host-rpc",
+        workerPid: run.worker.worker.pid,
+        reusedWorker: run.reusedWorker,
+        routedModels: used.routedModels,
+        ...(used.contextUsage !== null ? { contextUsage: used.contextUsage } : {}),
+      },
+      summary: run.lastAssistantText ?? outcome.stopReason ?? status,
+      ...(outcome.executionRecovery !== undefined ? { executionRecovery: outcome.executionRecovery } : {}),
+    };
+    run.settledResult = result;
+
+    const record = this.runRecord(run, outcome.kind, {
+      ...(outcome.cause !== undefined ? { cause: outcome.cause } : {}),
+      detail: {
+        stopReason: outcome.stopReason ?? null,
+        agentInvoked,
+        sessionSettled: run.outcome?.sessionSettled ?? false,
+        status,
+        ...(outcome.detail ?? {}),
+      },
+      usage,
+      worker: this.ledgerWorker(run.worker),
+      ompSessionId: run.ompSessionId,
+      ...(run.sessionFile !== null ? { sessionFile: run.sessionFile } : {}),
+    });
+    await this.journal(record).catch((err: unknown) => {
+      this.emitEvent(run, "run.system", {
+        level: "warn",
+        message: `the run ledger could not record the settle: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    });
+    await clearRunContext(this.root, run.runId).catch(() => {});
+    if (!run.connection.closed) {
+      const receipt = {
+        usage: { inputTokens: used.input, outputTokens: used.output, cachedInputTokens: used.cacheRead },
+        usageBasis: "per_run" as const,
+        model,
+        costUsd: used.cost,
+        complete: true,
+      };
+      this.emitEvent(run, "omp.usage", receipt);
+      this.sendSettled(run.connection, run.runId, result);
+    }
+    await this.journal(this.runRecord(run, "closed", { cause: outcome.cause ?? "clean" })).catch(() => {});
+    await run.leaseRelease().catch(() => {});
+    if (!this.options.reuseWorkers) await this.retireWorker(run.worker);
+    this.touch();
+  }
+
+  private singleModel(routed: Record<string, number>): string | null {
+    const models = Object.keys(routed);
+    return models.length === 1 ? models[0] : null;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  Workers                                                            */
+  /* ------------------------------------------------------------------ */
+
+  private workerKey(begin: RunBeginFrame): string {
+    return [begin.agent.companyId, begin.agent.id, begin.cwd, begin.sessionKey].join("\u0000");
+  }
+
+  private sessionDirFor(begin: RunBeginFrame): string {
+    return `${this.root}/sessions/${hashText(begin.sessionKey)}`;
+  }
+
+  private async ompVersionOf(command: string): Promise<string | null> {
+    if (!this.versionCache.has(command)) {
+      this.versionCache.set(command, await probeOmpVersion(command));
+    }
+    return this.versionCache.get(command) ?? null;
+  }
+
+  private async ensureWorker(begin: RunBeginFrame): Promise<{ worker: WorkerEntry; reused: boolean }> {
+    const key = this.workerKey(begin);
+    const fingerprint: Fingerprint = {
+      argvHash: begin.cell.argvHash,
+      bridgeHash: begin.cell.bridgeHash,
+      agentDir: begin.cell.agentDir,
+      cwd: begin.cwd,
+      ompVersion: await this.ompVersionOf(begin.worker.command),
+    };
+    const existing = this.workers.get(key);
+    if (existing !== undefined && this.options.reuseWorkers && this.sameFingerprint(existing.fingerprint, fingerprint)) {
+      return { worker: existing, reused: true };
+    }
+    if (existing !== undefined) {
+      await this.retireWorker(existing);
+    }
+    if (this.workers.size >= this.options.maxWorkers) {
+      const idle = [...this.workers.values()]
+        .filter((entry) => entry.currentRun === null)
+        .sort((a, b) => a.lastUsedAt - b.lastUsedAt)[0];
+      if (idle === undefined) {
+        throw new Error(
+          `omp_host_capacity: the supervisor already runs ${this.workers.size} workers (max ${this.options.maxWorkers}) and none is idle`,
+        );
+      }
+      await this.retireWorker(idle);
+    }
+    const sessionDir = this.sessionDirFor(begin);
+    const runContext = runContextPointer(this.root);
+    const worker = await RpcWorker.spawn({
+      command: begin.worker.command,
+      args: begin.worker.args,
+      env: { ...begin.worker.env, PAPERCLIP_RUN_CONTEXT: runContext },
+      cwd: begin.cwd,
+    });
+    const entry: WorkerEntry = {
+      key,
+      worker,
+      begin,
+      fingerprint,
+      sessionDir,
+      sessionKey: begin.sessionKey,
+      startIdentity: await readProcessStartIdentity(worker.pid),
+      currentRun: null,
+      lastUsedAt: Date.now(),
+    };
+    this.workers.set(key, entry);
+    return { worker: entry, reused: false };
+  }
+
+  private sameFingerprint(a: Fingerprint, b: Fingerprint): boolean {
+    return a.argvHash === b.argvHash
+      && a.bridgeHash === b.bridgeHash
+      && a.agentDir === b.agentDir
+      && a.cwd === b.cwd
+      && a.ompVersion === b.ompVersion;
+  }
+
+  private async retireWorker(entry: WorkerEntry): Promise<void> {
+    if (entry.worker.alive) await entry.worker.stop(this.options.cancelGraceMs);
+    if (this.workers.get(entry.key) === entry) this.workers.delete(entry.key);
+  }
+
+  private ledgerWorker(entry: WorkerEntry): LedgerWorker {
+    return {
+      pid: entry.worker.pid,
+      pgid: entry.worker.pgid,
+      startedAt: entry.worker.startedAt,
+      startIdentity: entry.startIdentity,
+      argvHash: entry.fingerprint.argvHash,
+      bridgeHash: entry.fingerprint.bridgeHash,
+      ompVersion: entry.fingerprint.ompVersion,
+    };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  Journal                                                            */
+  /* ------------------------------------------------------------------ */
+
+  private async journal(input: LedgerInput): Promise<LedgerRecord> {
+    const ledger = this.ledger;
+    if (ledger === null) throw new LedgerWriteError("the ledger is not open");
+    return ledger.append(input);
+  }
+
+  private runRecord(
+    run: RunState,
+    state: LedgerInput["state"],
+    extra: Partial<LedgerInput> = {},
+  ): LedgerInput {
+    return {
+      epoch: this.epoch,
+      runId: run.runId,
+      companyId: run.begin.agent.companyId,
+      agentId: run.begin.agent.id,
+      sessionKey: run.begin.sessionKey,
+      cwd: run.begin.cwd,
+      state,
+      ...extra,
+    };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  Sweeps, close, reaping                                             */
+  /* ------------------------------------------------------------------ */
+
+  private touch(): void {
+    this.lastActivity = Date.now();
+  }
+
+  private sweep(): void {
+    const now = Date.now();
+    for (const entry of [...this.workers.values()]) {
+      if (entry.currentRun !== null) continue;
+      if (now - entry.lastUsedAt < this.options.workerIdleMs) continue;
+      void this.retireWorker(entry);
+    }
+    if (this.shuttingDown || this.closedAt !== null) return;
+    if (this.workers.size > 0 || this.runs.size > 0 || this.connections.size > 0) return;
+    if (now - this.lastActivity < this.options.hostIdleMs) return;
+    void this.close("idle");
+  }
+
+  async close(reason = "requested"): Promise<void> {
+    if (this.closedAt !== null) return;
+    this.shuttingDown = true;
+    const deadline = Date.now() + this.options.drainMs;
+    while (this.runs.size > 0 && Date.now() < deadline) {
+      const tick = Promise.withResolvers<void>();
+      setTimeout(tick.resolve, 25);
+      await tick.promise;
+    }
+    for (const run of [...this.runs.values()]) {
+      run.worker.worker.kill("SIGKILL");
+      await this.settle(run, { kind: "lost", cause: "host_exit" }).catch(() => {});
+    }
+    for (const entry of [...this.workers.values()]) await this.retireWorker(entry);
+    for (const connection of [...this.connections]) connection.socket.destroy();
+    this.connections.clear();
+    if (this.sweepTimer !== null) clearInterval(this.sweepTimer);
+    this.sweepTimer = null;
+    const server = this.server;
+    this.server = null;
+    if (server !== null) {
+      const done = Promise.withResolvers<void>();
+      server.close(() => done.resolve());
+      await done.promise;
+    }
+    await unlink(this.socketPath).catch(() => {});
+    await clearDiscovery(this.root);
+    if (this.ledger !== null) await this.ledger.close().catch(() => {});
+    this.ledger = null;
+    if (this.lock !== null) await this.lock.release().catch(() => {});
+    this.lock = null;
+    this.closedAt = Date.now();
+    this.closed.resolve();
+    // `reason` is operator-facing only: the ledger already records the per-run
+    // cause, and the CLI prints the discovery/pid it stopped.
+    this.closeReason = reason;
+  }
+}
+
+/** The sweep cadence: fast enough for tests, cheap enough for a real host. */
+function sweepInterval(options: { hostIdleMs: number; workerIdleMs: number }): number {
+  return Math.max(50, Math.min(5_000, Math.floor(options.hostIdleMs / 4), Math.floor(options.workerIdleMs / 4)));
+}
+
+/**
+ * Reconcile a previous host's ledger: every run that never reached a terminal
+ * state is `lost/host_exit`. Its worker is killed by process group when the pid
+ * and start identity still name it; a reused pid is never killed. Leftover
+ * run-context files for terminal runs are removed.
+ *
+ * Shared by host start and `omp-host gc`.
+ */
+export async function reconcile(rootDir: string = hostRootDir()): Promise<{
+  killed: number[];
+  lost: number;
+  runContexts: number;
+}> {
+  const ledger = await RunLedger.open(rootDir);
+  try {
+    return await reconcileWith(rootDir, ledger);
+  } finally {
+    await ledger.close();
+  }
+}
+
+async function reconcileWith(rootDir: string, ledger: RunLedger): Promise<{
+  killed: number[];
+  lost: number;
+  runContexts: number;
+}> {
+  const killed: number[] = [];
+  let lost = 0;
+  const terminal = new Set<string>();
+  for (const [runId, record] of ledger.snapshot()) {
+    if (isTerminalState(record.state)) {
+      terminal.add(runId);
+      continue;
+    }
+    let orphan: "killed" | "gone" | "unverified" | "none" = "none";
+    const pid = record.worker?.pid ?? 0;
+    if (pid > 0) {
+      const alive = pidAlive(pid);
+      const identity = alive ? await readProcessStartIdentity(pid) : null;
+      const expected = record.worker?.startIdentity ?? null;
+      if (!alive) {
+        orphan = "gone";
+      } else if (expected !== null && identity !== null && expected !== identity) {
+        orphan = "unverified";
+      } else {
+        const pgid = record.worker?.pgid ?? pid;
+        try {
+          if (pgid > 1) process.kill(-pgid, "SIGKILL");
+          else process.kill(pid, "SIGKILL");
+          orphan = "killed";
+          killed.push(pid);
+        } catch {
+          orphan = "gone";
+        }
+      }
+    }
+    await ledger.append({
+      epoch: record.epoch,
+      runId,
+      companyId: record.companyId,
+      agentId: record.agentId,
+      sessionKey: record.sessionKey,
+      cwd: record.cwd,
+      state: "lost",
+      cause: "host_exit",
+      detail: { orphan },
+    });
+    lost += 1;
+    terminal.add(runId);
+  }
+  const runContexts = await reapRunContexts(rootDir, (runId) => terminal.has(runId));
+  return { killed, lost, runContexts };
+}
+
+/** Start the instance's supervisor. Refuses when another live host owns it. */
+export async function startHost(options: HostOptions = {}): Promise<RunningHost> {
+  const supervisor = new Supervisor(options);
+  return supervisor.start();
+}

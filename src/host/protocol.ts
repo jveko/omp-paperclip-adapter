@@ -189,7 +189,7 @@ export interface RunAcceptedFrame {
 }
 
 /** The event vocabulary the adapter maps onto its own sinks. */
-export type RunEventKind = "acpx.tool_call" | "run.system" | "omp.turn" | "omp.usage";
+export type RunEventKind = "acpx.tool_call" | "run.system" | "omp.turn" | "omp.usage" | "omp.log";
 
 export interface RunEventFrame {
   type: "run.event";

@@ -126,7 +126,9 @@ rl.on("line", (line) => {
       return succeed(id, frame.type);
     case "abort":
       succeed(id, "abort");
-      if (pendingPrompt) settlePrompt("aborted");
+      // "deaf" models a worker that is alive but never reports the aborted
+      // prompt, so the supervisor's second lease window must kill it.
+      if (pendingPrompt && mode !== "deaf") settlePrompt("aborted");
       return;
     case "host_tool_result":
       if (hostToolWaiter) {
@@ -155,7 +157,7 @@ rl.on("line", (line) => {
         send({ type: "host_tool_call", id: "htc-1", toolCallId: "tc-1", toolName: "connections_search", arguments: { query: "acme" } });
         return;
       }
-      if (mode === "hang") {
+      if (mode === "hang" || mode === "deaf") {
         pendingPrompt = { id };
         return;
       }

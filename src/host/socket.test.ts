@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  acquireHostLock,
   clearDiscovery,
   ensureHostDir,
   hostDiscoveryPath,
@@ -85,5 +86,23 @@ describe("host socket placement", () => {
     await ensureHostDir();
     await writeFile(hostDiscoveryPath(), "{not json", "utf8");
     expect(await readDiscovery()).toBeNull();
+  });
+});
+
+describe("host lock", () => {
+  it("refuses a second lock for the same instance and reclaims a stale one", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "omp-host-lock-"));
+    vi.stubEnv("PAPERCLIP_HOME", home);
+    vi.stubEnv("PAPERCLIP_INSTANCE_ID", "test-lock");
+    try {
+      const lock = await acquireHostLock();
+      await expect(acquireHostLock()).rejects.toThrow(/another omp-host/);
+      await lock.release();
+      const again = await acquireHostLock();
+      await again.release();
+    } finally {
+      vi.unstubAllEnvs();
+      await rm(home, { recursive: true, force: true });
+    }
   });
 });
