@@ -192,6 +192,9 @@ describe("thinkingLevelChanged", () => {
     // never resets a running employee.
     expect(thinkingLevelChanged(null, "sess-a", "high")).toBe(false);
     expect(thinkingLevelChanged(record, "sess-b", "high")).toBe(false);
+    // A record whose level could not be known (a fork from a session the
+    // adapter never ran) stays unknown: adopt, never rotate.
+    expect(thinkingLevelChanged({ sessionId: "sess-a", level: null }, "sess-a", "high")).toBe(false);
   });
 });
 

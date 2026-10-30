@@ -26,9 +26,11 @@ export interface SessionIntelState {
    * The thinking level the adapter asked for when the CURRENT session was
    * created, with that session's id. omp stores the level inside the transcript
    * (`thinking_level_change`) and prefers it on resume, so this is the only way
-   * to notice that the operator now asks for a different one.
+   * to notice that the operator now asks for a different one. A null `level`
+   * means unknown — a fork inherits its source's level, which the adapter can
+   * only name when it ran that source itself.
    */
-  lastThinking: { sessionId: string; level: string } | null;
+  lastThinking: { sessionId: string; level: string | null } | null;
 }
 
 const MAX_TOKENS = 64;
@@ -99,12 +101,12 @@ function isRunCounters(value: unknown): value is Record<string, RunCounter> {
   );
 }
 
-function isThinkingRecord(value: unknown): value is { sessionId: string; level: string } {
+function isThinkingRecord(value: unknown): value is { sessionId: string; level: string | null } {
   return typeof value === "object" && value !== null
     && "sessionId" in value
     && typeof value.sessionId === "string"
     && "level" in value
-    && typeof value.level === "string";
+    && (typeof value.level === "string" || value.level === null);
 }
 
 function isRotateInfo(value: unknown): value is { reason: string; at: string } {

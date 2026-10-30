@@ -799,6 +799,77 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     expect((await loadState(dir)).lastThinking).toEqual({ sessionId: "old", level: "max" });
   });
 
+  it("records the source's level, not the requested one, for a fork session", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
+    const dir = sessionIntelDir("co-1", "agent-1");
+    const seeded = await loadState(dir);
+    seeded.lastThinking = { sessionId: "sess-a", level: "low" };
+    await saveState(dir, seeded);
+    const events: Array<{ level?: string; message?: string }> = [];
+    await createOmpAcpExecutor()(baseCtx({
+      config: {
+        command: `${process.execPath} ${fakeAcp}`,
+        sessionForkSourceId: "sess-a", sessionForkToken: "t1", thinking: "high",
+      },
+      onEvent: async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); },
+    }));
+    // Forking rewrites the source transcript wholesale, so the forked session
+    // holds the SOURCE's stored level; the run child's overlay never reaches the
+    // fork side channel. Claiming the requested level here would make every
+    // later run match and the operator's edit would never apply.
+    expect((await loadState(dir)).lastThinking).toEqual({ sessionId: "fork-1", level: "low" });
+    // The mismatch is still visible: the next run rotates to apply it.
+    const next = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fresh-2", sessionKey: "sk" } });
+    await createOmpAcpExecutor()(baseCtx({
+      config: {
+        command: `${process.execPath} ${fakeAcp}`,
+        sessionForkSourceId: "sess-a", sessionForkToken: "t1", thinking: "high",
+      },
+      runtime: {
+        sessionId: "fork-1", sessionDisplayId: "fork-1", taskKey: "t",
+        sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" },
+      } as AdapterExecutionContext["runtime"],
+    }));
+    expect(next.mock.calls[0][0].runtime.sessionParams).toEqual({});
+    expect((await loadState(dir)).lastThinking).toEqual({ sessionId: "fresh-2", level: "high" });
+  });
+
+  it("leaves a fork's level unknown when the record names another session", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
+    const dir = sessionIntelDir("co-1", "agent-1");
+    const seeded = await loadState(dir);
+    seeded.lastThinking = { sessionId: "someone-else", level: "low" };
+    await saveState(dir, seeded);
+    await createOmpAcpExecutor()(baseCtx({
+      config: {
+        command: `${process.execPath} ${fakeAcp}`,
+        sessionForkSourceId: "sess-a", sessionForkToken: "t1", thinking: "high",
+      },
+    }));
+    // Unknown, not asserted: the adapter never ran the source, so it cannot say
+    // what level the fork inherited.
+    expect((await loadState(dir)).lastThinking).toEqual({ sessionId: "fork-1", level: null });
+  });
+
+  it("lets an already-armed threshold rotation keep its own reason", async () => {
+    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fresh-3", sessionKey: "sk" } });
+    const dir = sessionIntelDir("co-1", "agent-1");
+    const seeded = await loadState(dir);
+    seeded.lastThinking = { sessionId: "old", level: "low" };
+    seeded.pendingRotate = { reason: "maxRuns", at: "2026-01-02T00:00:00.000Z" };
+    await saveState(dir, seeded);
+    const events: Array<{ level?: string; message?: string }> = [];
+    await createOmpAcpExecutor()(baseCtx({
+      config: { command: `${process.execPath} ${fakeAcp}`, thinking: "high" },
+      onEvent: async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); },
+    }));
+    // The rotation was already owed; this run applies it and the fresh session
+    // picks up the new level, so the level edit must not re-attribute the event.
+    expect(executorFn.mock.calls[0][0].runtime.sessionParams).toEqual({});
+    expect(events.some((e) => /thinking level changed/.test(e.message ?? ""))).toBe(false);
+    expect((await loadState(dir)).lastThinking).toEqual({ sessionId: "fresh-3", level: "high" });
+  });
+
   it("successful fork supersedes a pending rotation and restarts the run count", async () => {
     const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();

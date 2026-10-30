@@ -126,7 +126,10 @@ ACP stdio transport.
   run-scoped settings overlay (fixed filename, run child only), not as a
   \`--thinking\` flag on the agent command. The engine hashes the command line
   into the session key, so the flag made every level edit start a fresh
-  session; the overlay path is stable and only its content changes.
+  session; the overlay path is stable and only its content changes. Setting the
+  first level (or clearing the last) adds or removes that path, which the
+  engine does fingerprint: one fresh session when the level first appears,
+  never on a later edit of its value.
 - The setting is not the strongest source. omp resolves a run's level as:
   CLI flag, then the level stored in the session's transcript
   (\`thinking_level_change\`), then a model-selector suffix, then the model

@@ -178,16 +178,17 @@ const NEXT_RUN = "Takes effect on the next run (the adapter has no live connecti
  * (sdk.ts:2139-2146; agent-session.ts:12811-12835), so a level change on an
  * existing session needs a fresh session to take effect. The record is the
  * level the adapter asked for when the session started; with no record (a state
- * written before this field, or a fork carrying its source's level) the level is
- * unknown and is adopted rather than rotated on — an upgrade must never reset a
- * running employee.
+ * written before this field) or a null level (a fork whose source this adapter
+ * never ran) the level is unknown and is adopted rather than rotated on — an
+ * upgrade must never reset a running employee, and a fork must not be claimed to
+ * run at a level nobody set.
  */
 export function thinkingLevelChanged(
-  record: { sessionId: string; level: string } | null,
+  record: { sessionId: string; level: string | null } | null,
   sessionId: string,
   requested: string,
 ): boolean {
-  if (record === null || record.sessionId !== sessionId) return false;
+  if (record === null || record.sessionId !== sessionId || record.level === null) return false;
   return record.level !== requested;
 }
 
@@ -228,7 +229,7 @@ export function getSessionConfigSchema(): AdapterConfigSchema {
           { label: "xhigh", value: "xhigh" },
           { label: "max", value: "max" },
         ],
-        hint: `Reasoning depth for sessions this agent starts: the run child gets it as omp's own defaultThinkingLevel through a run-scoped settings overlay, so changing it does not enter the engine fingerprint. omp keeps the level a session started with inside that session's transcript and prefers it on resume, so a resumed session keeps that stored level: editing this restarts the session once so the new level applies (the run says so), and nothing else rotates. A model whose catalog declares its own default effort outranks this setting unless the level is "auto". "off" runs the CLI flag because omp's setting has no off value. "Model default" sends nothing. ${NEXT_RUN}` },
+        hint: `Reasoning depth for sessions this agent starts: the run child gets it as omp's own defaultThinkingLevel through a run-scoped settings overlay, so changing the level does not enter the engine fingerprint (adding the first level or clearing it flips PI_CONFIG_FILES present↔absent, which rotates once). omp keeps the level a session started with inside that session's transcript and prefers it on resume, so a resumed session keeps that stored level: editing this restarts the session once so the new level applies (the run says so), and nothing else rotates. A model whose catalog declares its own default effort outranks this setting unless the level is "auto". "off" runs the CLI flag because omp's setting has no off value. "Model default" sends nothing. ${NEXT_RUN}` },
       { key: "fallbackChain", label: "Model fallback chain", type: "textarea",
         hint: `One selector per line, injected via PI_CONFIG_FILES. Adding the first selector or clearing the last flips PI_CONFIG_FILES present↔absent, which rotates the agent's session (fingerprint change) on the next run. ${NEXT_RUN}` },
       { key: "fallbackOn", label: "Failover trigger", type: "select", default: "any",

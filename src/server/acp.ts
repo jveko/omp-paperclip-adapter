@@ -713,9 +713,9 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     }
     const sideChannelEnv = ompEnv({ config: ctx.config, overlayPath: failoverOverlayPath });
     const ompTokens = resolveOmpAgentCommand(ctx.config, bridge).split(/\s+/);
-    // The resolved agent command may carry trailing flags (e.g. `--thinking
-    // medium`). Locate `acp` by index so trailing tokens are never confused
-    // with the base command.
+    // The resolved agent command may carry trailing flags (`--extension <path>`,
+    // the `off` thinking flag, or an operator's own). Locate `acp` by index so
+    // trailing tokens are never confused with the base command.
     const acpIdx = ompTokens.indexOf("acp");
     const base = acpIdx >= 0 ? ompTokens.slice(0, acpIdx) : ompTokens;
     const models = firstNonEmptyString(ctx.config.model)
@@ -911,7 +911,8 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     // silently inert.
     const requestedThinking = requestedThinkingLevel(ctx.config);
     let thinkingRotateArmed = false;
-    if (thinkingLevelChanged(intelState.lastThinking, storedSessionId, requestedThinking)) {
+    if (intelState.pendingRotate === null
+      && thinkingLevelChanged(intelState.lastThinking, storedSessionId, requestedThinking)) {
       const from = intelState.lastThinking?.level ?? "";
       intelState.pendingRotate = {
         reason: `thinking level changed from '${from === "" ? "omp default" : from}' to '${requestedThinking === "" ? "omp default" : requestedThinking}'`,
@@ -1112,9 +1113,17 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     }
     // Record the level this session was started with. Adopted whenever the
     // session id changed under us (a rotation, a fork, or an engine-side fresh
-    // start): whatever created it requested the level in force right now.
+    // start). A fork is the exception: it rewrites the source transcript
+    // wholesale, so the new session keeps the SOURCE's stored level and the run
+    // child's overlay never reaches the fork side channel. Claiming the
+    // requested level there would make every later run compare equal and the
+    // operator's edit would never apply; carry the source's level when the
+    // adapter ran that source, and leave it unknown when it did not.
     if (usedSessionId && intelState.lastThinking?.sessionId !== usedSessionId) {
-      intelState.lastThinking = { sessionId: usedSessionId, level: requestedThinking };
+      const level = directive.kind === "fork" && forkedSessionId === usedSessionId
+        ? (intelState.lastThinking?.sessionId === directive.forkSourceId ? intelState.lastThinking.level : null)
+        : requestedThinking;
+      intelState.lastThinking = { sessionId: usedSessionId, level };
     }
     if (typeof resultParams.sessionKey === "string") {
       bumpRunCounter(intelState, resultParams.sessionKey, nowIso);

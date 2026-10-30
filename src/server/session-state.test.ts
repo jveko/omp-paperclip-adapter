@@ -106,6 +106,15 @@ describe("session state", () => {
     expect((await loadState(dir)).lastThinking).toEqual({ sessionId: "sess-a", level: "high" });
   });
 
+  it("keeps an unknown level as null (a fork from a session this adapter never ran)", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "omp-intel-"));
+    dirs.push(dir);
+    const state = emptyState();
+    state.lastThinking = { sessionId: "fork-1", level: null };
+    await saveState(dir, state);
+    expect((await loadState(dir)).lastThinking).toEqual({ sessionId: "fork-1", level: null });
+  });
+
   it("drops a malformed lastThinking", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "omp-intel-"));
     dirs.push(dir);
