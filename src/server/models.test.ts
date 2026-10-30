@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  listOmpModels, normalizeOmpModelId, parseOmpModelsJson, type OmpModelInfo,
+  detectOmpConfiguredModel, listOmpModels, normalizeOmpModelId, parseOmpModelsJson,
+  refreshOmpModelCatalog, type OmpModelInfo,
 } from "./models.js";
 import { deriveDefaultTimeoutSec } from "./acp.js";
 
@@ -38,20 +39,18 @@ const SAMPLE = JSON.stringify({
 });
 
 describe("parseOmpModelsJson", () => {
-  it("maps entries to paperclip shape with declared-cost flag", () => {
+  it("maps entries to paperclip shape", () => {
     const out = parseOmpModelsJson(SAMPLE);
     expect(out).toHaveLength(3);
     expect(out[0]).toMatchObject({
-      id: "openrouter/glm-5.2", label: "GLM-5.2",
-      contextWindow: 200000, priced: true,
+      id: "openrouter/glm-5.2", label: "GLM-5.2", contextWindow: 200000,
     });
-    expect(out[1]).toMatchObject({ id: "openrouter/preview-free", priced: false });
   });
-  it("maps an entry without cost to priced:false and cost:undefined", () => {
+  it("maps an entry without cost to cost:undefined", () => {
     const out = parseOmpModelsJson(SAMPLE);
     expect(out[2]).toEqual({
       id: "openrouter/no-cost", label: "No Cost",
-      contextWindow: undefined, cost: undefined, priced: false,
+      contextWindow: undefined, cost: undefined, pricingStatus: undefined,
     });
   });
   it("returns [] on malformed json or missing models array", () => {
@@ -61,35 +60,138 @@ describe("parseOmpModelsJson", () => {
   });
 });
 
-describe("parseOmpModelsJson priced flag", () => {
-  it("marks a model with all-zero cost as free (priced=false)", () => {
+describe("parseOmpModelsJson pricingStatus", () => {
+  it.each(["fixed", "free", "included", "variable", "unknown"] as const)(
+    "carries omp's %s status instead of guessing from the cost card",
+    (status) => {
+      const parsed = parseOmpModelsJson(JSON.stringify({
+        models: [{
+          provider: "openrouter", id: "m", pricingStatus: status,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        }],
+      }));
+      expect(parsed[0].pricingStatus).toBe(status);
+    },
+  );
+
+  it("drops an unrecognized pricingStatus rather than passing it through", () => {
     const parsed = parseOmpModelsJson(JSON.stringify({
-      models: [{ provider: "openrouter", id: "free-model", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
+      models: [{ provider: "openrouter", id: "m", pricingStatus: "cheapish" }],
     }));
-    expect(parsed[0].priced).toBe(false);
+    expect(parsed[0].pricingStatus).toBeUndefined();
   });
 
-  it("marks a model with nonzero input/output cost as priced", () => {
-    const parsed = parseOmpModelsJson(JSON.stringify({
-      models: [{ provider: "openrouter", id: "paid-model", cost: { input: 3, output: 15 } }],
-    }));
-    expect(parsed[0].priced).toBe(true);
-  });
-
-  it("marks a model priced via cache-only cost as priced", () => {
-    const parsed = parseOmpModelsJson(JSON.stringify({
-      models: [{ provider: "openrouter", id: "cache-model", cost: { input: 0, output: 0, cacheRead: 0.0028, cacheWrite: 0.0028 } }],
-    }));
-    expect(parsed[0].priced).toBe(true);
-  });
-
-  it("treats a partial zero card (cache fields omitted) as free in both priced and timeout derivation", () => {
+  it("keeps a partial zero cost card for timeout derivation", () => {
     const partial = { input: 0, output: 0 };
     const parsed = parseOmpModelsJson(JSON.stringify({
       models: [{ provider: "openrouter", id: "partial-free-model", cost: partial }],
     }));
-    expect(parsed[0].priced).toBe(false);
     expect(deriveDefaultTimeoutSec(parsed[0].cost)).toBe(1800);
+  });
+});
+
+describe("refreshOmpModelCatalog", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+    execFileMock.mockReset();
+  });
+
+  it("runs omp models refresh before listing the refreshed catalog", async () => {
+    const models = await freshModels();
+    const calls: string[][] = [];
+    execFileMock.mockImplementation((cmd: string, args: string[], _o: unknown, cb: (e: null, out: string) => void) => {
+      calls.push([cmd, ...args]);
+      cb(null, args.includes("refresh") ? "" : SAMPLE);
+    });
+    const out = await models.refreshOmpModelCatalog();
+    expect(calls).toEqual([
+      ["omp", "models", "refresh"],
+      ["omp", "models", "ls", "--json"],
+    ]);
+    expect(out).toHaveLength(3);
+  });
+
+  it("shares one refresh and listing across concurrent callers", async () => {
+    const models = await freshModels();
+    let release: (() => void) | null = null;
+    execFileMock.mockImplementation((_c: string, args: string[], _o: unknown, cb: (e: null, out: string) => void) => {
+      const done = () => cb(null, args.includes("refresh") ? "" : SAMPLE);
+      if (args.includes("refresh")) release = done;
+      else done();
+    });
+    const first = models.refreshOmpModelCatalog();
+    const second = models.refreshOmpModelCatalog();
+    await Promise.resolve();
+    release?.();
+    expect(await first).toEqual(await second);
+    expect(execFileMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not re-run the network refresh inside the cooldown, but still lists", async () => {
+    vi.useFakeTimers();
+    const models = await freshModels();
+    execFileMock.mockImplementation((_c: string, args: string[], _o: unknown, cb: (e: null, out: string) => void) =>
+      cb(null, args.includes("refresh") ? "" : SAMPLE));
+    await models.refreshOmpModelCatalog();
+    await models.refreshOmpModelCatalog();
+    expect(execFileMock).toHaveBeenCalledTimes(3);
+    vi.advanceTimersByTime(60_000);
+    await models.refreshOmpModelCatalog();
+    expect(execFileMock).toHaveBeenCalledTimes(5);
+    vi.useRealTimers();
+  });
+
+  it("recovers when the refresh command fails: the listing still runs", async () => {
+    const models = await freshModels();
+    execFileMock.mockImplementation((_c: string, args: string[], _o: unknown, cb: (e: Error | null, out: string) => void) =>
+      args.includes("refresh") ? cb(new Error("network down"), "") : cb(null, SAMPLE));
+    expect(await models.refreshOmpModelCatalog()).toHaveLength(3);
+  });
+});
+
+describe("detectOmpConfiguredModel", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+    execFileMock.mockReset();
+  });
+
+  it("reads modelRoles.default and returns the resolved provider/id", async () => {
+    const models = await freshModels();
+    execFileMock.mockImplementation((_c: string, args: string[], _o: unknown, cb: (e: null, out: string) => void) =>
+      cb(null, args[0] === "config"
+        ? JSON.stringify({ key: "modelRoles", value: { default: "glm-5.2" }, type: "record" })
+        : SAMPLE));
+    expect(await models.detectOmpConfiguredModel()).toEqual({
+      model: "openrouter/glm-5.2", provider: "openrouter", source: "config:modelRoles.default",
+    });
+    expect(execFileMock).toHaveBeenNthCalledWith(
+      1, "omp", ["config", "get", "modelRoles", "--json"],
+      expect.objectContaining({ timeout: 20_000 }), expect.any(Function),
+    );
+  });
+
+  it("returns null without listing when no default role is configured", async () => {
+    const models = await freshModels();
+    execFileMock.mockImplementation((_c: string, _a: string[], _o: unknown, cb: (e: null, out: string) => void) =>
+      cb(null, JSON.stringify({ key: "modelRoles", value: {} })));
+    expect(await models.detectOmpConfiguredModel()).toBeNull();
+    expect(execFileMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns null when the selector is not in the catalog", async () => {
+    const models = await freshModels();
+    execFileMock.mockImplementation((_c: string, args: string[], _o: unknown, cb: (e: null, out: string) => void) =>
+      cb(null, args[0] === "config"
+        ? JSON.stringify({ key: "modelRoles", value: { default: "retired/model" } })
+        : SAMPLE));
+    expect(await models.detectOmpConfiguredModel()).toBeNull();
+  });
+
+  it("returns null when omp is missing or config output is unreadable", async () => {
+    const models = await freshModels();
+    execFileMock.mockImplementation((_c: string, _a: string[], _o: unknown, cb: (e: Error, out: string) => void) =>
+      cb(new Error("ENOENT"), ""));
+    expect(await models.detectOmpConfiguredModel()).toBeNull();
   });
 });
 
