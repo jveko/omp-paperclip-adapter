@@ -21,11 +21,12 @@ describe("side-channel env forwarding", () => {
       "s",
       "/w",
     );
-    expect(mocks.driveAcpSession).toHaveBeenCalledWith(
-      expect.objectContaining({ env: { OMP_AUTH_BROKER_URL: "http://b" } }),
-      expect.anything(),
-      expect.anything(),
-    );
+    // The side channel's env is the contract; the request list and the
+    // paging callback are the caller's business.
+    expect(mocks.driveAcpSession).toHaveBeenCalled();
+    expect(mocks.driveAcpSession.mock.calls[0][0]).toMatchObject({
+      env: { OMP_AUTH_BROKER_URL: "http://b" },
+    });
   });
 
   it("queryOmpSessions forwards env to driveAcpSession", async () => {
@@ -34,10 +35,11 @@ describe("side-channel env forwarding", () => {
       { command: "omp", args: [], env: { OMP_AUTH_BROKER_URL: "http://b" } },
       { cwd: "/w" },
     );
-    expect(mocks.driveAcpSession).toHaveBeenCalledWith(
-      expect.objectContaining({ env: { OMP_AUTH_BROKER_URL: "http://b" } }),
-      expect.anything(),
-      expect.anything(),
-    );
+    // The side channel's env is the contract; the request list and the
+    // paging callback are the caller's business.
+    expect(mocks.driveAcpSession).toHaveBeenCalled();
+    expect(mocks.driveAcpSession.mock.calls[0][0]).toMatchObject({
+      env: { OMP_AUTH_BROKER_URL: "http://b" },
+    });
   });
 });

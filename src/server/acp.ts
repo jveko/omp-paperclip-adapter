@@ -375,13 +375,22 @@ export interface AcpDriveResult {
  * need no session, while `session/new` always persists a new session record
  * and would pollute session listings. Kills the child on completion, error,
  * or timeout; never throws.
+ *
+ * `follow` (optional) is called every time the queue drains, with the responses
+ * so far in request order; the frames it returns are appended and driven on the
+ * same connection (a paged read needs the next cursor, which only a response can
+ * supply, and re-spawning the child per page would pay the ACP handshake once
+ * per page). Returning null/[] finishes the drive. The caller owns the cap: an
+ * unbounded follow runs until the timeout.
  */
 export function driveAcpSession(
   omp: { command: string; args?: string[]; env?: Record<string, string> },
   requests: AcpFrameRequest[],
   timeoutMs = 10_000,
+  follow?: (responses: AcpFrameResponse[]) => AcpFrameRequest[] | null,
 ): Promise<AcpDriveResult> {
   return new Promise<AcpDriveResult>((resolve) => {
+    const queue = [...requests];
     const child = spawn(omp.command, omp.args ?? [], {
       stdio: ["pipe", "pipe", "pipe"],
       env: omp.env ? { ...process.env, ...omp.env } : undefined,
@@ -419,11 +428,12 @@ export function driveAcpSession(
       finish({ ok: false, responses, error: `ACP child exited before the drive completed${suffix()}` });
     });
     const sendNext = () => {
-      if (nextIndex >= requests.length) {
-        finish({ ok: true, initializeInfo, responses });
-        return;
+      if (nextIndex >= queue.length) {
+        const more = follow?.(responses) ?? null;
+        if (more && more.length > 0) queue.push(...more);
+        else { finish({ ok: true, initializeInfo, responses }); return; }
       }
-      const req = requests[nextIndex];
+      const req = queue[nextIndex];
       child.stdin.write(
         JSON.stringify({ jsonrpc: "2.0", id: nextIndex + 2, method: req.method, params: req.params ?? {} }) + "\n",
       );

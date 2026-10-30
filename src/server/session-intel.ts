@@ -1,4 +1,4 @@
-import { driveAcpSession, type AcpFrameRequest } from "./acp.js";
+import { driveAcpSession, type AcpFrameRequest, type AcpFrameResponse } from "./acp.js";
 
 export interface OmpSessionInfo {
   sessionId: string;
@@ -98,19 +98,32 @@ function projectBuckets(sessions: OmpSessionInfo[]): OmpProjectInfo[] {
 }
 
 /**
+ * Page cap for the snapshot read. omp's `session/list` pages at 50
+ * (acp-agent.ts:111) and offers the next offset as an opaque `nextCursor`
+ * (acp-agent.ts:897-912), so a bounded read covers 250 sessions — well past any
+ * workspace an employee works in — while keeping one heartbeat's side channel
+ * from walking an unbounded listing. The cap is reported, never hidden: past it
+ * the landscape says `truncated` and claims no count.
+ */
+const MAX_SNAPSHOT_PAGES = 5;
+
+/**
  * Read the run's own session landscape over an initialize-only ACP side
  * channel. Never sends session/new: session/list reads persisted state and
  * needs no session, while session/new always persists a new record that would
  * pollute the listings this function reads. Any failure degrades to a typed
  * error — callers log and skip, never fail the run.
  *
- * The single required frame is ACP `session/list` with the run's cwd
- * (acp-agent.ts:897-911). Its cwd filter resolves the sessions bucket for THIS
+ * The required frames are ACP `session/list` with the run's cwd
+ * (acp-agent.ts:897-912), followed through `nextCursor` up to
+ * MAX_SNAPSHOT_PAGES. Its cwd filter resolves the sessions bucket for THIS
  * workspace under the agent dir the child resolved, so it is the tenant-scoped
  * replacement for `_omp/sessions/listAll` (a host-wide scan) and
- * `_omp/projects/list` (same scan, bucketed). There is deliberately no
- * `_omp/*` fallback: on an omp that cannot list sessions the snapshot is
- * skipped with a warning rather than widened to every tenant on the host.
+ * `_omp/projects/list` (same scan, bucketed). Every page carries that cwd: a
+ * cursor page without it would list every tenant on the host. There is
+ * deliberately no `_omp/*` fallback: on an omp that cannot list sessions the
+ * snapshot is skipped with a warning rather than widened to every tenant on the
+ * host.
  *
  * `diagnostic` adds the host-wide `_omp/*` reads for an operator who explicitly
  * turned the switch on. They contribute counts only (`OmpHostDiagnostic`) —
@@ -133,21 +146,38 @@ export async function queryOmpSessions(
       { method: "_omp/projects/list", params: {} },
     );
   }
-  const drive = await driveAcpSession(omp, requests, opts.timeoutMs ?? 10_000);
+  // The page responses sit at known indices (diagnostics are queued once, ahead
+  // of the followed pages), so the cursor is read by index rather than by
+  // sniffing the payload.
+  const pageIndices = [0];
+  let truncated = false;
+  const follow = (responses: AcpFrameResponse[]): AcpFrameRequest[] | null => {
+    const cursor = responses[pageIndices[pageIndices.length - 1]]?.result?.nextCursor;
+    if (typeof cursor !== "string" || cursor.length === 0) return null;
+    if (pageIndices.length >= MAX_SNAPSHOT_PAGES) {
+      // The cap was hit with more to read: the landscape is incomplete.
+      truncated = true;
+      return null;
+    }
+    pageIndices.push(responses.length);
+    return [{ method: "session/list", params: { cwd: opts.cwd, cursor } }];
+  };
+  const drive = await driveAcpSession(omp, requests, opts.timeoutMs ?? 10_000, follow);
   if (!drive.ok) return { ok: false, error: drive.error ?? "ACP drive failed" };
   const byMethod = new Map(
     requests.map((request, index) => [request.method, drive.responses[index]]),
   );
-  const listing = byMethod.get("session/list");
-  if (!listing) return { ok: false, error: "session/list returned no response" };
-  if (listing.error) return { ok: false, error: listing.error.message };
-  const sessions = parseSessions(listing.result?.sessions);
-  const truncated = typeof listing.result?.nextCursor === "string"
-    && listing.result.nextCursor.length > 0;
+  const pages = pageIndices
+    .map((index) => drive.responses[index])
+    .filter((response): response is AcpFrameResponse => Boolean(response));
+  if (pages.length === 0) return { ok: false, error: "session/list returned no response" };
+  const failed = pages.find((response) => response.error);
+  if (failed?.error) return { ok: false, error: failed.error.message };
+  const sessions = pages.flatMap((response) => parseSessions(response.result?.sessions));
   const snapshot: OmpSessionsSnapshot = {
     projects: projectBuckets(sessions),
     sessions,
-    // A paged listing cannot claim a complete count.
+    // A listing that stopped short cannot claim a complete count.
     total: truncated ? null : sessions.length,
     truncated,
   };

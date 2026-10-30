@@ -55,6 +55,30 @@ rl.on("line", (line) => {
       send({ jsonrpc: "2.0", id: msg.id, error: { code: -32003, message: "session/list boom" } });
       return;
     }
+    if (mode === "pages" || mode === "cap" || mode === "page2error") {
+      // Offset paging like omp: the cursor is the next offset. `pages` ends on
+      // page 3, `cap` never ends, `page2error` fails every cursor page.
+      const cursor = typeof msg.params?.cursor === "string" ? Number(msg.params.cursor) : 0;
+      if (mode === "page2error" && cursor > 0) {
+        send({ jsonrpc: "2.0", id: msg.id, error: { code: -32004, message: "page 2 boom" } });
+        return;
+      }
+      const pages = [["s-a", "s-b"], ["s-c", "s-d"], ["s-e"]];
+      const ids = mode === "pages" ? (pages[cursor / 2] ?? []) : [`s-${cursor}`];
+      let next;
+      if (mode === "pages") next = cursor / 2 >= pages.length - 1 ? undefined : String(cursor + 2);
+      else if (mode === "page2error") next = "2";
+      else next = String(cursor + 1);
+      const cwd = typeof msg.params?.cwd === "string" ? msg.params.cwd : "/workspace";
+      send({ jsonrpc: "2.0", id: msg.id, result: {
+        sessions: ids.map(id => ({
+          sessionId: id, cwd, title: id, updatedAt: "2026-08-28T00:00:00Z",
+          _meta: { messageCount: 1, size: 10 },
+        })),
+        ...(next === undefined ? {} : { nextCursor: next }),
+      } });
+      return;
+    }
     // An unscoped listing (no client cwd) must expose sessions from DIFFERENT
     // workspaces: that is how a caller resolves a source session's own cwd
     // before forking it. A client-sent cwd is still echoed unchanged.

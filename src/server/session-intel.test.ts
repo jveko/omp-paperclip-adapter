@@ -157,6 +157,57 @@ describe("queryOmpSessions", () => {
     expect(snapshot.total).toBe(null);
   }, 15_000);
 
+  it("follows every page and reports a total the listing actually finished", async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "omp-session-intel-"));
+    tmpDirs.push(dir);
+    const frameFile = path.join(dir, "frames.log");
+    const out = await queryOmpSessions(
+      {
+        command: process.execPath,
+        args: [fakeAcp],
+        env: { FAKE_ACP_MODE: "pages", FAKE_ACP_FRAME_LOG: frameFile },
+      },
+      { cwd: "/workspace" },
+    );
+    const snapshot = okSnapshot(out);
+    // Three pages of two, two and one: the whole landscape, newest first.
+    expect(snapshot.sessions.map((s) => s.sessionId)).toEqual(["s-a", "s-b", "s-c", "s-d", "s-e"]);
+    expect(snapshot.total).toBe(5);
+    expect(snapshot.truncated).toBe(false);
+    const listings = readFrames(frameFile).filter((frame) => frame.method === "session/list");
+    expect(listings).toHaveLength(3);
+    // Every page keeps the run's cwd: a cursor page without it would list every
+    // tenant's sessions on the host.
+    for (const frame of listings) expect(frame.params.cwd).toBe("/workspace");
+    expect(listings.map((frame) => frame.params.cursor ?? null)).toEqual([null, "2", "4"]);
+  }, 15_000);
+
+  it("stops at the page cap and leaves the total unknown", async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "omp-session-intel-"));
+    tmpDirs.push(dir);
+    const frameFile = path.join(dir, "frames.log");
+    const out = await queryOmpSessions(
+      {
+        command: process.execPath,
+        args: [fakeAcp],
+        env: { FAKE_ACP_MODE: "cap", FAKE_ACP_FRAME_LOG: frameFile },
+      },
+      { cwd: "/workspace" },
+    );
+    const snapshot = okSnapshot(out);
+    // A listing that always offers a cursor must stay bounded, and a count it
+    // did not read must never be reported.
+    expect(snapshot.truncated).toBe(true);
+    expect(snapshot.total).toBe(null);
+    expect(readFrames(frameFile).filter((frame) => frame.method === "session/list")).toHaveLength(5);
+  }, 20_000);
+
+  it("degrades a failure on a later page to the typed error", async () => {
+    const { out } = await queryWithSeen({ cwd: "/workspace" }, "page2error");
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.error).toContain("page 2 boom");
+  }, 15_000);
+
   it("maps a session/list failure onto a typed error and issues no _omp/* fallback", async () => {
     const { out, seen } = await queryWithSeen({ cwd: "/w" }, "listerror");
     expect(out.ok).toBe(false);
