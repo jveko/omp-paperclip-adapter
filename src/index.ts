@@ -178,7 +178,9 @@ ACP stdio transport.
   and records \`resultJson.subagents\`:
   \`{ total, completed, failed, cancelled, running, items }\`. Counts come from
   the lifecycle this run saw; \`running\` includes what omp's roster still
-  holds. A run with no subagent activity adds no \`subagents\` field.
+  holds. A run with no subagent activity adds no \`subagents\` field, and a
+  detached subagent from an earlier run on the same warm worker is never
+  attributed to a later run.
 - Engine mode has no subagent surface and ignores the key.
 - Cancelling or timing out a run kills the worker's process group, so its
   children die with it. A per-subagent \`cancel_subagent\`/\`steer_subagent\`

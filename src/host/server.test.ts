@@ -479,6 +479,18 @@ describe("supervisor", () => {
     }
   }, 20_000);
 
+  it("does not attribute an earlier run's straggler to this run", async () => {
+    const { client, log, settled } = await runFixture("run-subagents-ghost", "subagentghost", "events");
+    try {
+      expect(subagentPayloads(client.frames)).toEqual([]);
+      expect(settled.result.resultJson).not.toHaveProperty("subagents");
+      const commands = await commandLog(log);
+      expect(commands.filter((command) => command.type === "get_subagents")).toHaveLength(0);
+    } finally {
+      client.close();
+    }
+  }, 20_000);
+
   it("reuses one warm worker across runs and does not reopen the active session", async () => {
     const log = path.join(root, "frames.log");
     const worker = {

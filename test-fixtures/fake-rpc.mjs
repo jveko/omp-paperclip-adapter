@@ -13,6 +13,7 @@
 //   subagents     three subagents: one completed, one failed, one still running
 //   subagents200  two hundred running subagents (frame-cap fixture)
 //   subagentsleak same as subagents, with credentials/prompt text in fields
+//   subagentghost a straggler from an earlier run: roster entry plus one event
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import readline from "node:readline";
 
@@ -173,6 +174,16 @@ const emitSubagentWork = () => {
     for (let index = 0; index < 200; index += 1) {
       startSubagent(`sa-${String(index).padStart(3, "0")}`, index, "explore", `unit ${index}`);
     }
+    return;
+  }
+  if (mode === "subagentghost") {
+    // A detached subagent from an earlier run: it sits in omp's roster and
+    // emits its own event, but this run never saw it start.
+    subagents.set("ghost", {
+      id: "ghost", index: 0, agent: "explore", agentSource: "bundled",
+      status: "running", description: "started before this run", lastUpdate: Date.now(),
+    });
+    eventSubagent("ghost", { type: "tool_execution_end", toolName: "read", isError: false });
   }
 };
 

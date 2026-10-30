@@ -1056,8 +1056,12 @@ class Supervisor {
     if (frame.type === "subagent_event" && run.subagentLevel !== "events") return;
     const read = readSubagentFrame(frame);
     if (read === null) return;
-    run.subagentSeen = true;
     const existing = run.subagents.get(read.id);
+    // An event frame for an id this run never saw start is a straggler from an
+    // earlier run: it carries no index or agent here, so it is not this run's
+    // evidence and must not become a phantom observation.
+    if (existing === undefined && frame.type === "subagent_event") return;
+    run.subagentSeen = true;
     // A terminal status stays terminal: omp removes finished subagents from its
     // roster, and a late progress frame must not count one as running again.
     const status = read.status === null
@@ -1108,7 +1112,10 @@ class Supervisor {
    * run saw nothing, so runs without subagents keep their resultJson unchanged.
    */
   private async subagentSummary(run: RunState): Promise<SubagentSummary | null> {
-    if (run.subagentLevel === "off" && !run.subagentSeen) return null;
+    // Evidence is what this run observed. omp's roster keeps detached
+    // stragglers from earlier runs (it is per worker/session, not per run), so
+    // an unobserved roster entry would be another run's subagent misattributed.
+    if (!run.subagentSeen) return null;
     const roster = await run.worker.worker.getSubagents(5_000).catch(() => []);
     const running = roster
       .map((entry) => readSubagentSnapshot(entry))
