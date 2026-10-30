@@ -9,6 +9,7 @@ function attribute(overrides: Partial<Parameters<typeof attributeRunCost>[0]> = 
     pricingStatus: "fixed",
     costUsd: 0.25,
     usage,
+    usageBasis: "per_run",
     model: "prov/m",
     failoverConfigured: false,
     ...overrides,
@@ -83,6 +84,11 @@ describe("attributeRunCost usageByModel", () => {
 
   it("omits the receipt when the usage totals are session-cumulative, not run-scoped", () => {
     expect(attribute({ usageBasis: "session_cumulative" }).fields.usageByModel).toBeUndefined();
+  });
+
+  it("omits the receipt when the basis is unknown: only per-run totals may be attributed", () => {
+    expect(attribute({ usageBasis: null }).fields.usageByModel).toBeUndefined();
+    expect(attribute({ usageBasis: undefined }).fields.usageByModel).toBeUndefined();
   });
 
   it("keeps the receipt for a per-run usage basis", () => {

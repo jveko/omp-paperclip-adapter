@@ -27,15 +27,17 @@ export interface RunCostAttribution {
 
 /**
  * Turn omp's pricing status plus the settled usage into Paperclip's accounting
- * fields. `unknown` must never look free: a zero cost with an absent rate card
- * is unpriced, while a declared-free or subscription-included card is a real
- * zero. A run whose model the catalog did not price is left alone so the
- * server's own default applies — the adapter only speaks about models it
- * inspected.
+ * fields. The two layers are independent:
  *
- * `usageByModel` is one receipt for the whole run, so it is emitted only when
- * one model can be named: a configured fallback chain means omp may have
- * switched models mid-run, and omp reports no served-model signal over ACP.
+ * - Cost claims come only from an inspected catalog card: `unknown` is
+ *   `unpriced` (never free), `fixed`/`variable` is an estimate, a declared-free
+ *   or subscription-included card is a known zero, and a model the catalog did
+ *   not price gets no cost claim at all so the server's own default applies.
+ * - `usageByModel` is a receipt, not a pricing claim: one entry is emitted
+ *   whenever a single model can be named and the run has run-scoped usage with
+ *   a known cost, unless the pricing is unpriced or a fallback chain could have
+ *   switched models (omp reports one aggregate and no served-model signal over
+ *   ACP).
  */
 export function attributeRunCost(input: {
   pricingStatus: OmpPricingStatus | null;
@@ -81,7 +83,7 @@ export function attributeRunCost(input: {
   const model = typeof input.model === "string" && input.model.length > 0 ? input.model : null;
   if (input.usage != null && costUsd != null && model !== null
     && fields.costStatus !== "unpriced" && !input.failoverConfigured
-    && input.usageBasis !== "session_cumulative") {
+    && input.usageBasis === "per_run") {
     fields.usageByModel = [{ model, usage: input.usage, costUsd }];
   } else if (input.failoverConfigured && input.usage != null && costUsd != null) {
     warnings.push(
