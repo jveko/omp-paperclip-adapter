@@ -111,6 +111,24 @@ describe("run-path capability diagnostics", () => {
     expect(events.some((event) => /capability|thinking/i.test(event.message ?? ""))).toBe(false);
   });
 
+  it("never refuses or crashes the run when the capability read itself fails", async () => {
+    // A capability read is advisory: an unreadable cache or an invalid instance
+    // id must not turn into a failed heartbeat.
+    capabilityMocks.snapshot.value = null;
+    const actual = await import("../capabilities.js");
+    const spy = vi.spyOn(actual, "loadCapabilities").mockRejectedValueOnce(new Error("instance root unavailable"));
+    const events: Array<{ level?: string; message?: string }> = [];
+    const planned = await buildRunPlan(
+      { ...ctx({ command: ompCommand, thinking: "high" }), onEvent: async (event) => {
+        events.push(event as { level?: string; message?: string });
+      } },
+      { bridge: bridgePath, moduleDir },
+    );
+    expect(planned.kind).toBe("ready");
+    expect(spy).toHaveBeenCalled();
+    expect(events.some((event) => /capability/i.test(event.message ?? ""))).toBe(false);
+  });
+
   it("reports nothing when the cache is cold (the run never probes)", async () => {
     capabilityMocks.snapshot.value = null;
     const events: Array<{ level?: string; message?: string }> = [];

@@ -31,7 +31,8 @@ import { mergePiConfigFiles, type OverlayEntry } from "./overlays.js";
 import { loadState, saveState, sessionIntelDir, type SessionIntelState } from "../session-state.js";
 import { buildOmpAcpConfig, bridgeArtifactError, configuredWarmHandleIdleMs, firstNonEmptyString, isGovernanceArmed, resolveBridgeRunMode, resolveOmpAgentCommand, resolveSessionCwd } from "../adapters/acp/launch.js";
 import {
-  capabilityCacheDir, capabilityDiagnostics, loadCapabilities, type CapabilityFeature,
+  capabilityCacheDir, capabilityDiagnostics, loadCapabilities,
+  type CapabilityFeature, type CapabilitySet,
 } from "../capabilities.js";
 import { buildWorkerArgv } from "../../host/worker.js";
 import {
@@ -255,16 +256,24 @@ async function planCapabilities(
   if (path.basename(acp.command) !== "omp") return;
   const features = runCapabilityFeatures(ctx, input);
   if (features.length === 0) return;
-  const env = ompEnv({ config: input.probeConfig });
-  const capabilities = await loadCapabilities({
-    acp: { ...acp, env },
-    mode: input.mode,
-    ...(input.mode === "managed"
-      ? { worker: { ...buildWorkerArgv(input.probeConfig, input.bridge), env } }
-      : {}),
-    cacheDir: capabilityCacheDir(),
-    cacheOnly: true,
-  });
+  // A capability read is advisory evidence: an unreadable cache, an invalid
+  // instance id or a broken cache entry must never refuse or crash the run.
+  // The features it would have named still degrade on their own paths.
+  let capabilities: CapabilitySet | null;
+  try {
+    const env = ompEnv({ config: input.probeConfig });
+    capabilities = await loadCapabilities({
+      acp: { ...acp, env },
+      mode: input.mode,
+      ...(input.mode === "managed"
+        ? { worker: { ...buildWorkerArgv(input.probeConfig, input.bridge), env } }
+        : {}),
+      cacheDir: capabilityCacheDir(),
+      cacheOnly: true,
+    });
+  } catch {
+    return;
+  }
   if (capabilities === null) return;
   for (const diagnostic of capabilityDiagnostics(capabilities, features)) {
     await ctx.onEvent?.({
