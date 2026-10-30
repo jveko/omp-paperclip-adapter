@@ -2462,6 +2462,18 @@ describe("managed lane (executionMode)", () => {
     expect(frames.some((frame) => frame.method === "session/list")).toBe(false);
   }, 30_000);
 
+  it("does not warn about a missing MCP server in managed mode", async () => {
+    const events: Array<{ message?: string }> = [];
+    const result = await createOmpAcpExecutor()(baseCtx({
+      config: { executionMode: "managed", agentCommand: `${process.execPath} ${fakeRpc}` },
+      runtimeTools: { mcpEndpoint: "http://paperclip.test/runtime-tools/mcp", bearerToken: "ct-x" },
+      runtimeMcp: { getServers: () => [] },
+      onEvent: async (event: unknown) => { events.push(event as { message?: string }); },
+    } as never));
+    expect(result.exitCode).toBe(0);
+    expect(events.some((event) => (event.message ?? "").includes("connection tools are unavailable this run: Paperclip delivered no MCP server"))).toBe(false);
+  }, 30_000);
+
   it("refuses an unknown executionMode before any lane is constructed", async () => {
     const engineFn = fakeEngine({ exitCode: 0 });
     const result = await createOmpAcpExecutor()(baseCtx({ config: { executionMode: "managd" } }));

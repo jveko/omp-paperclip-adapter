@@ -303,6 +303,48 @@ describe("supervisor", () => {
     }
   }, 20_000);
 
+  const slowTests = process.env.OMP_HOST_SLOW_TESTS === "1";
+
+  // The brief's wall-clock acceptance: two heartbeats a real minute apart. The
+  // sweep/worker-idle logic is driven by the platform clock, so deterministic
+  // time control cannot exercise it; this test is opt-in to keep the suite fast.
+  it.skipIf(!slowTests)("keeps one warm worker across heartbeats 60 s apart", async () => {
+    const log = path.join(root, "frames.log");
+    const worker = {
+      command: process.execPath,
+      args: [fixture],
+      env: { FAKE_RPC_MODE: "", FAKE_RPC_LOG: log },
+    };
+    const running = await start({ workerIdleMs: 5 * 60_000, hostIdleMs: 30 * 60_000 });
+    const client = await connectClient(running.socketPath);
+    try {
+      client.send(beginFrame({
+        runId: "run-1", sessionKey: "sk-minute", worker, session: { ompSessionId: "sess-0" },
+      }));
+      const acceptedA = await client.waitFor((frame) => frame.type === "run.accepted");
+      await client.waitFor((frame) => frame.type === "run.settled");
+      if (acceptedA.type !== "run.accepted") throw new Error("unreachable");
+      const heartbeatGap = Promise.withResolvers<void>();
+      setTimeout(heartbeatGap.resolve, 60_000);
+      await heartbeatGap.promise;
+      client.send(beginFrame({
+        runId: "run-2", sessionKey: "sk-minute", worker, session: { ompSessionId: "sess-1" },
+      }));
+      const acceptedB = await client.waitFor(
+        (frame) => frame.type === "run.accepted" && frame.runId === "run-2",
+      );
+      await client.waitFor((frame) => frame.type === "run.settled" && frame.runId === "run-2");
+      if (acceptedB.type !== "run.accepted") throw new Error("unreachable");
+      expect(acceptedB.reusedWorker).toBe(true);
+      expect(acceptedB.worker.pid).toBe(acceptedA.worker.pid);
+      const commands = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { type: string });
+      expect(commands.filter((command) => command.type === "open_session")).toHaveLength(1);
+      expect(commands.filter((command) => command.type === "new_session")).toHaveLength(0);
+    } finally {
+      client.close();
+    }
+  }, 90_000);
+
   it("spawns a second worker for another cwd and leaves the first warm", async () => {
     const a = path.join(root, "work-a");
     const b = path.join(root, "work-b");
