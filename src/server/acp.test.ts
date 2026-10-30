@@ -1708,7 +1708,10 @@ describe("session scope fence", () => {
     expect(events.some((e) => e.message?.includes("sessionScope"))).toBe(false);
 
     fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "new", sessionKey: "sk-new" } });
-    await createOmpAcpExecutor()(scopedCtx({ onEvent }));
+    const result = await createOmpAcpExecutor()(scopedCtx({ onEvent }));
+    // Guard the assertion below: an early omp_config_error return would also
+    // produce zero warnings, and would make "warns once" untestable.
+    expect(result.errorCode).toBeUndefined();
     const flips = events.filter((e) => e.message?.includes("sessionScope switched"));
     expect(flips).toHaveLength(1);
     expect(flips[0].level).toBe("warn");
@@ -1768,9 +1771,10 @@ describe("session scope fence", () => {
     await createOmpAcpExecutor()(scopedCtx({ onEvent }));
     events.length = 0;
     fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "newer", sessionKey: "sk-newer" } });
-    await createOmpAcpExecutor()(baseCtx({
+    const result = await createOmpAcpExecutor()(baseCtx({
       config: { command: `${process.execPath} ${fakeAcp}` }, onEvent,
     }));
+    expect(result.errorCode).toBeUndefined();
     const flips = events.filter((e) => e.message?.includes("sessionScope switched to 'shared'"));
     expect(flips).toHaveLength(1);
     expect(flips[0].message).toContain("the host-wide omp agent dir");

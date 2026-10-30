@@ -57,8 +57,11 @@ ACP stdio transport.
   credentials there.
 - Switching scope starts an empty dir, so the employee's previous session is
   not resumed: the run warns once, naming the previous session's short id, and
-  leaves the old transcript where it was. Reverting to \`shared\` returns to the
-  untouched legacy session.
+  leaves the old transcript where it was. Reverting to \`shared\` also starts a
+  fresh session (fingerprint and session id come from the run that just
+  happened), and warns the same way — the legacy transcript is untouched but is
+  not picked up automatically. Resume it explicitly on the host with
+  \`PI_CODING_AGENT_DIR=<that dir> omp --resume <id>\` if its history matters.
 - The session-snapshot work product is always scoped to the run's own cwd
   (ACP \`session/list\`); it never lists another tenant's sessions. The toggle
   \`sessionSnapshotDiagnostic\` additionally queries omp's host-wide \`_omp/*\`
