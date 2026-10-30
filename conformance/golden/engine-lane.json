@@ -1,0 +1,214 @@
+[
+  {
+    "profile": "18.13",
+    "coldFrames": [
+      "initialize",
+      "session/new",
+      "session/set_config_option:model",
+      "session/prompt"
+    ],
+    "warmFrames": [
+      "initialize",
+      "session/resume",
+      "session/set_config_option:model",
+      "initialize",
+      "session/resume",
+      "session/prompt"
+    ],
+    "usage": {
+      "inputTokens": 1050,
+      "outputTokens": 200,
+      "cachedInputTokens": 300
+    },
+    "usageBasis": "per_run",
+    "usageComplete": true,
+    "cost": {
+      "usd": 0.25,
+      "status": "estimated",
+      "source": "rate_card"
+    },
+    "usageByModel": [
+      {
+        "model": "prov/model-a",
+        "usage": {
+          "inputTokens": 1050,
+          "outputTokens": 200,
+          "cachedInputTokens": 300
+        },
+        "costUsd": 0.25
+      }
+    ],
+    "sessionKeys": [
+      "acpSessionId",
+      "acpxRecordId",
+      "agent",
+      "configFingerprint",
+      "cwd",
+      "mcpFingerprint",
+      "mode",
+      "runtimeSessionName",
+      "sessionKey",
+      "stateDir"
+    ],
+    "capabilities": [],
+    "events": []
+  },
+  {
+    "profile": "18.14",
+    "coldFrames": [
+      "initialize",
+      "session/new",
+      "session/set_config_option:model",
+      "session/prompt"
+    ],
+    "warmFrames": [
+      "initialize",
+      "session/resume",
+      "session/set_config_option:model",
+      "initialize",
+      "session/resume",
+      "session/prompt"
+    ],
+    "usage": {
+      "inputTokens": 1050,
+      "outputTokens": 200,
+      "cachedInputTokens": 300
+    },
+    "usageBasis": "per_run",
+    "usageComplete": true,
+    "cost": {
+      "usd": 0.25,
+      "status": "estimated",
+      "source": "rate_card"
+    },
+    "usageByModel": [
+      {
+        "model": "prov/model-a",
+        "usage": {
+          "inputTokens": 1050,
+          "outputTokens": 200,
+          "cachedInputTokens": 300
+        },
+        "costUsd": 0.25
+      }
+    ],
+    "sessionKeys": [
+      "acpSessionId",
+      "acpxRecordId",
+      "agent",
+      "configFingerprint",
+      "cwd",
+      "mcpFingerprint",
+      "mode",
+      "runtimeSessionName",
+      "sessionKey",
+      "stateDir"
+    ],
+    "capabilities": [],
+    "events": []
+  },
+  {
+    "profile": "drift",
+    "coldFrames": [
+      "initialize",
+      "session/new",
+      "session/set_config_option:model",
+      "session/prompt"
+    ],
+    "warmFrames": [
+      "initialize",
+      "session/resume",
+      "session/set_config_option:model",
+      "initialize",
+      "session/resume",
+      "session/prompt"
+    ],
+    "usage": {
+      "inputTokens": 1050,
+      "outputTokens": 200,
+      "cachedInputTokens": 300
+    },
+    "usageBasis": "per_run",
+    "usageComplete": true,
+    "cost": {
+      "usd": null,
+      "status": null,
+      "source": null
+    },
+    "usageByModel": [],
+    "sessionKeys": [
+      "acpSessionId",
+      "acpxRecordId",
+      "agent",
+      "configFingerprint",
+      "cwd",
+      "mcpFingerprint",
+      "mode",
+      "runtimeSessionName",
+      "sessionKey",
+      "stateDir"
+    ],
+    "capabilities": [
+      "omp_session_list_unsupported",
+      "omp_capability_missing_session_fork",
+      "omp_capability_missing_steering",
+      "omp_capability_missing_extensions",
+      "omp_config_option_thinking_missing",
+      "omp_settings_restricted_folders_missing",
+      "omp_cli_session_lease_missing"
+    ],
+    "events": []
+  },
+  {
+    "profile": "wrapper",
+    "coldFrames": [
+      "initialize",
+      "session/new",
+      "session/set_config_option:model",
+      "session/prompt"
+    ],
+    "warmFrames": [],
+    "usage": {
+      "inputTokens": 1050,
+      "outputTokens": 200,
+      "cachedInputTokens": 300
+    },
+    "usageBasis": "per_run",
+    "usageComplete": true,
+    "cost": {
+      "usd": 0.25,
+      "status": "estimated",
+      "source": "rate_card"
+    },
+    "usageByModel": [
+      {
+        "model": "prov/model-a",
+        "usage": {
+          "inputTokens": 1050,
+          "outputTokens": 200,
+          "cachedInputTokens": 300
+        },
+        "costUsd": 0.25
+      }
+    ],
+    "sessionKeys": [
+      "acpSessionId",
+      "acpxRecordId",
+      "agent",
+      "configFingerprint",
+      "cwd",
+      "mcpFingerprint",
+      "mode",
+      "runtimeSessionName",
+      "sessionKey",
+      "stateDir"
+    ],
+    "capabilities": [],
+    "events": []
+  },
+  {
+    "lane": "lease",
+    "contended": "omp_session_lease_held",
+    "afterRelease": 0
+  }
+]

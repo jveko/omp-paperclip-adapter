@@ -27,8 +27,9 @@
     "build:uiparser": "esbuild src/ui-parser.ts --bundle --format=cjs --outfile=dist/ui-parser.js",
     "build:bridge": "esbuild src/server/paperclip-bridge.ts --bundle --platform=node --format=esm --outfile=dist/paperclip-bridge.js",
     "build:host": "esbuild src/host/main.ts --bundle --platform=node --format=esm --banner:js='#!/usr/bin/env node' --outfile=dist/omp-host.js",
-    "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.conformance.json",
+    "test": "vitest run",
+    "test:conformance": "vitest run --config vitest.config.conformance.ts"
   },
   "dependencies": {
     "@paperclipai/adapter-utils": "2026.1023.0"

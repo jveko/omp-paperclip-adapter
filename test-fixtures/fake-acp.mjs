@@ -45,15 +45,26 @@ rl.on("line", (line) => {
       protocolVersion: mode === "badversion" ? 99 : 1,
       agentInfo: { name: "fake-acp", title: "Fake", version: "0.0.1" },
       authMethods: [{ id: "agent", name: "agent" }],
+      // `loadSession`/`resume` are what the engine needs to continue a stored
+      // session; the profile flags only remove the surfaces under test.
       agentCapabilities: mode === "nolist"
         ? {}
-        : { sessionCapabilities: mode === "nofork" ? { list: {} } : { list: {}, fork: {} } },
-      ...(mode === "nosteering" ? {} : { _meta: { steering: { supported: true } } }),
+        : mode === "drift"
+          ? { loadSession: true, sessionCapabilities: { resume: {} } }
+          : {
+            loadSession: true,
+            sessionCapabilities: mode === "nofork"
+              ? { list: {}, resume: {} }
+              : { list: {}, fork: {}, resume: {} },
+          },
+      ...(mode === "nosteering" || mode === "drift"
+        ? {}
+        : { _meta: { steering: { supported: true } } }),
     } });
   } else if (msg.method === "_session/steering") {
     // Real omp: an unknown session id is invalid params, never work. `nosteering`
     // removes the method entirely, which is JSON-RPC method-not-found.
-    if (mode === "nosteering") {
+    if (mode === "nosteering" || mode === "drift") {
       send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601,
         message: 'Method not found: _session/steering' } });
       return;
@@ -121,7 +132,9 @@ rl.on("line", (line) => {
         { id: "mode", name: "Mode", type: "select", currentValue: "default", options: [] },
         { id: "model", name: "Model", type: "select", currentValue: "prov/model-a",
           options: [{ value: "prov/model-a", name: "Model A" }] },
-        { id: "thinking", name: "Thinking", type: "select", currentValue: "auto", options: [] },
+        ...(mode === "drift"
+          ? []
+          : [{ id: "thinking", name: "Thinking", type: "select", currentValue: "auto", options: [] }]),
       ],
     } });
   } else if (typeof msg.method === "string" && msg.method.startsWith("_omp/")) {
@@ -151,7 +164,7 @@ rl.on("line", (line) => {
     } else if (msg.method === "_omp/extensions") {
       // Real omp lists what its module loader discovered; `noextensions` models
       // a build that never grew the method (the unknown-ext fallback below).
-      if (mode === "noextensions") {
+      if (mode === "noextensions" || mode === "drift") {
         send({ jsonrpc: "2.0", id: msg.id, error: unknownExtMethod(msg.method) });
         return;
       }
@@ -169,6 +182,42 @@ rl.on("line", (line) => {
       // JSON-RPC error, not an empty result.
       send({ jsonrpc: "2.0", id: msg.id, error: unknownExtMethod(msg.method) });
     }
+  } else if (msg.method === "session/prompt") {
+    // One scripted turn: a thought, one text chunk, one tool call, a usage
+    // update carrying both a cost and a token breakdown, then the terminal
+    // response. Streamed as separate `session/update` notifications, exactly as
+    // a real agent presents a turn to the engine.
+    const sessionId = typeof msg.params?.sessionId === "string" ? msg.params.sessionId : "s1";
+    const update = (u) => send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: u } });
+    update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "considering" } });
+    update({ sessionUpdate: "tool_call", toolCallId: "tc-1", title: "read README.md",
+      kind: "read", status: "completed", rawInput: { path: "README.md" } });
+    update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hello from the conformance worker." } });
+    update({
+      sessionUpdate: "usage_update",
+      size: 200_000,
+      used: 1_550,
+      ...(mode === "drift" ? {} : { cost: { amount: 0.25, currency: "USD" } }),
+      _meta: { usage: { inputTokens: 1000, outputTokens: 200, cachedReadTokens: 300, cachedWriteTokens: 50 } },
+    });
+    send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+  } else if (msg.method === "session/resume") {
+    // A resumed session continues without replaying history; the client keeps
+    // the id it asked for.
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: msg.params?.sessionId ?? "s1" } });
+  } else if (msg.method === "session/load") {
+    send({ jsonrpc: "2.0", id: msg.id, result: {} });
+  } else if (msg.method === "session/close") {
+    send({ jsonrpc: "2.0", id: msg.id, result: {} });
+  } else if (msg.method === "session/set_config_option") {
+    // Accepted unconditionally: a frame log is what proves the adapter never
+    // sent an `effort` key, not this response.
+    send({ jsonrpc: "2.0", id: msg.id, result: { configOptions: [
+      { id: msg.params?.configId ?? msg.params?.key ?? "model", name: "Config", type: "select",
+        currentValue: msg.params?.value ?? "" },
+    ] } });
+  } else if (msg.method === "session/cancel") {
+    send({ jsonrpc: "2.0", id: msg.id, result: {} });
   } else if (msg.method === "session/fork") {
     if (mode === "forkerror") {
       send({ jsonrpc: "2.0", id: msg.id, error: { code: -32002,

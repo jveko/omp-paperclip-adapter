@@ -1,0 +1,65 @@
+[
+  {
+    "lane": "managed",
+    "states": [
+      "leased",
+      "worker_ready",
+      "session_open",
+      "prompting",
+      "settled",
+      "closed",
+      "leased",
+      "worker_ready",
+      "session_open",
+      "prompting",
+      "settled",
+      "closed"
+    ],
+    "usage": {
+      "inputTokens": 110,
+      "outputTokens": 20,
+      "cachedInputTokens": 40
+    },
+    "sessionReused": true,
+    "events": [
+      "omp.turn:info"
+    ]
+  },
+  {
+    "lane": "managed-subagents",
+    "subagents": [
+      {
+        "agent": "explore",
+        "status": "running"
+      },
+      {
+        "agent": "plan",
+        "status": "running"
+      },
+      {
+        "agent": "task",
+        "status": "running"
+      },
+      {
+        "agent": "explore",
+        "status": "running"
+      },
+      {
+        "agent": "explore",
+        "status": "running"
+      },
+      {
+        "agent": "explore",
+        "status": "completed"
+      },
+      {
+        "agent": "plan",
+        "status": "failed"
+      }
+    ],
+    "events": [
+      "omp.turn:info",
+      "omp.subagent:info"
+    ]
+  }
+]
