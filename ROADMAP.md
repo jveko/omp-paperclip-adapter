@@ -31,10 +31,11 @@ v1.0 cut**.
 | v0.11 | **shipped in 0.11.0**: four behaviour-preserving cuts (ACP client extraction, side-channel port, one overlay writer, executor split) | identical behaviour, cycles 0, largest file ≤300 |
 | v0.12 | **shipped in 0.12.0** (opt-in): supervisor, RPC worker with warm reuse, host-tool delivery, run ledger + run lease, steering flag; `engine` remains the default | two heartbeats → one worker, one `open_session`; `kill -9` leaves no orphan |
 | v0.13 | **shipped in 0.13.0**: subagent observability on the managed lane (bounded events + settlement snapshot); engine lane untouched | redaction fixture proves no credential or prompt text; engine mode emits nothing |
-| v0.14 | adapter-utils reduced to `server-utils` + types, conformance harness in CI, capability probes replace the version pin | `grep acpx-engine src/` empty on the default path |
+| v0.14 | **shipped in 0.14.0**: pin bump, three shim deletions, `errorFamily`/`retryNotBefore`, capability probes replace the minor gate, conformance project in CI | probe a capability-less fake → warn not crash; `acpx-engine` confined to `adapters/acp/` |
 
-Non-negotiables: `executionMode: "engine"` reproduces v0.10 byte-for-byte and is the rollback; the
-bridge stays one self-contained bundle; no credential ever enters a warm worker's environment.
+Non-negotiables: `executionMode: "engine"` remains the rollback for the managed lane (it is no longer
+byte-identical to v0.10 as of 0.14.0, whose engine prompt template changed upstream); the bridge stays
+one self-contained bundle; no credential ever enters a warm worker's environment.
 
 ---
 
@@ -306,6 +307,14 @@ covered by tests.
 *Historical entries are preserved as written. Where an entry states a blocker that the
 2026-10-30 assessment resolved (for example the "resume fingerprint instability"), the
 assessment above supersedes it.*
+
+- **2026-10-30 — v0.14.0 (Pin bump, probes, conformance).** `adapter-utils` 2026.1023.0; the
+  `runtimeToolDelivery` and `RunCostFields` shims deleted; `errorFamily`/`retryNotBefore` first in retry
+  classification; warm-handle value passed through (the settlement gate still discards credential-carrying
+  saves — pinned by `warm-handle-settlement.test.ts`); capability probes replace the minor gate with
+  named warnings and major-only errors, RPC probes scoped to managed mode; a conformance project drives
+  both lanes against fixtures in CI; the engine codec/bundle boundary moved under `adapters/acp/`;
+  `dist/omp-host.js` externalizes the dependency (110 KB). 813 tests + 9 conformance + the 60 s warm test.
 
 - **2026-10-30 — v0.13.0 (Subagent observability).** `subagentObservability` (`off|summary|events`,
   default `summary`, typed refusal for typos) maps to omp's RPC subscription, is re-sent per run so a

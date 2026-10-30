@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.14.0 — 2026-10-30
+
+The engine pin moves, the pin workarounds die, and version gates become capability probes.
+
+- **`@paperclipai/adapter-utils` `2026.824.1` → `2026.1023.0`** (exact, lockfile updated). This is the
+  first build where the engine carries the settlement gate, `errorFamily` / `retryNotBefore` and the
+  session-reuse store.
+- **Shims deleted** — `OmpRuntimeToolDelivery` / `OmpServerAdapterModule` and `RunCostFields` are gone;
+  the adapter now uses the contract's own `runtimeToolDelivery` and the result's
+  `costStatus` / `pricingProvenance` / `usageByModel`. Retry reads the engine's `errorFamily` first,
+  then `retryNotBefore`, then the legacy `acpx_*` table.
+- **Warm handle passes through** — `buildOmpAcpConfig` no longer forces `warmHandleIdleMs` to 0; the
+  operator value flows and a run logs one `info` saying the settlement gate discards the handle. Warm
+  reuse does **not** return: any save carrying a run-scoped credential is discarded, which the new
+  `warm-handle-settlement.test.ts` pins (`discard / run-scoped credential still valid`).
+- **Capability probes replace the minor gate** — `testEnvironment` and the first run probe the build's
+  actual surfaces (ACP methods, config ids, settings keys, CLI verbs) and degrade with a named `warn`
+  per missing feature. A newer *minor* is a warning naming the tested set; a newer *major* is an error.
+  RPC-frame probes are managed-mode only, so the engine path never warns about frames it cannot use.
+- **Conformance project** — `npm run test:conformance` drives both lanes end to end against scripted
+  ACP/RPC fixtures with no Paperclip instance and no network: event order, usage/cost fields, session
+  reuse, lease behaviour and subagent events.
+- **Session codec pinned** — resume/settle round-trip `mcpFingerprint` and `interruptedCheckpoint`; a
+  legacy record gains neither; every field `isCompatibleSession` compares survives.
+- **Engine bundle boundary** — the engine loader, codec, UI-parser re-export and billing type live under
+  `server/adapters/acp/`, so `grep -r acpx-engine src/` matches only that directory. `dist/omp-host.js`
+  externalizes the dependency again (110 KB, not 1.8 MB).
+
+Behavior change to know about: 2026.1023.0 shortens the default agent prompt template to identity plus
+connection-tools guidance; the "Continue your Paperclip work." contract now arrives through the
+Paperclip skill. The engine lane uses the upstream constant, so its prompt text changes with this bump.
+
 ## 0.13.0 — 2026-10-30
 
 Subagent observability on the managed lane. The engine lane is untouched: no subscription, no
