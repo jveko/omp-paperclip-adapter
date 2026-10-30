@@ -337,9 +337,12 @@ export class RpcWorker {
     return Array.isArray(data.toolNames) ? data.toolNames.filter((n): n is string => typeof n === "string") : [];
   }
 
-  /** Answer `host_tool_call` frames; a missing handler answers an error result. */
+  /**
+   * Answer `host_tool_call` frames. `null` clears the handler at settle, so a
+   * warm worker never answers a later run with an earlier run's credentials.
+   */
   onHostToolCall(
-    handler: (frame: RpcFrame) => Promise<Record<string, unknown>> | Record<string, unknown>,
+    handler: ((frame: RpcFrame) => Promise<Record<string, unknown>> | Record<string, unknown>) | null,
   ): void {
     this.hostToolHandler = handler;
   }

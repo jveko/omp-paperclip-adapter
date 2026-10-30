@@ -36,7 +36,7 @@ import {
 import {
   readSessionIntelConfig, resolveExecutionMode, resolveRunDirective, thinkingLevelChanged,
   validateCredentialMode, validateExecutionMode, validatePlanMode, validateSessionScope,
-  validateThinkingLevel,
+  validateSteering, validateThinkingLevel,
   type RunDirective, type SessionIntelConfig, type SessionScope,
 } from "../session-directives.js";
 
@@ -62,6 +62,12 @@ export interface RunPlanDeps {
   bridge: string;
   /** `dist/server`: where the adapter resolves bundled skill content from. */
   moduleDir: string;
+  /**
+   * The managed lane's session index: the cwd a session this supervisor ran
+   * recorded. Null means "ask the ACP probe lane", which is the fallback for a
+   * source the host never ran (and for engine mode, which passes no function).
+   */
+  hostSessionCwd?: (sessionId: string) => Promise<string | null>;
 }
 
 export interface RunPlan {
@@ -129,6 +135,8 @@ async function gateRunConfig(ctx: AdapterExecutionContext): Promise<RunRefusal |
   // settlement semantics, so a typo must be a config error, never a fallback.
   const modeErr = validateExecutionMode(ctx.config);
   if (modeErr) return { errorCode: "omp_config_error", errorMessage: modeErr };
+  const steeringErr = validateSteering(ctx.config);
+  if (steeringErr) return { errorCode: "omp_config_error", errorMessage: steeringErr };
   // Fail closed: broker credentialMode demands a resolved broker url+token.
   // Return before any engine work so a misconfigured agent never runs a
   // half-configured session.
@@ -591,6 +599,7 @@ async function applySessionDirective(
     sessionCwd: string;
     storedParams: Record<string, unknown>;
     intelState: SessionIntelState;
+    hostSessionCwd?: (sessionId: string) => Promise<string | null>;
   },
 ): Promise<{
   engineConfig: Record<string, unknown>;
@@ -613,18 +622,26 @@ async function applySessionDirective(
     // omp opens the fork at the CLIENT-SUPPLIED cwd and then switches to the
     // source session, which refuses the switch when its recorded cwd differs
     // (`agent-session.ts` SESSION_CWD_CHANGE_REJECTED → -32603). So the frame
-    // must carry the SOURCE's cwd, not this run's. The lookup is a bounded,
-    // unfiltered `session/list` (the source may live under another workspace)
-    // and never leaves this function: only the cwd of the id the operator
-    // already named is read.
-    const source = await findOmpSessionCwd(sideChannel, directive.forkSourceId);
-    const forkCwd = source.ok ? source.cwd : input.sessionCwd;
-    if (!source.ok) {
-      await ctx.onEvent?.({
-        eventType: "run.system", stream: "system", level: "warn",
-        message: `omp fork source session ${directive.forkSourceId} could not be located (${source.error}); `
-          + `forking with this run's cwd (${input.sessionCwd}) — omp rejects the fork if the source recorded a different one`,
-      });
+    // must carry the SOURCE's cwd, not this run's.
+    //
+    // The managed lane answers this from the supervisor's session index first:
+    // a source the host ran needs no probe process at all. Only a source the
+    // host never ran falls back to the bounded, unfiltered `session/list` (the
+    // source may live under another workspace).
+    const hostCwd = input.hostSessionCwd === undefined
+      ? null
+      : await input.hostSessionCwd(directive.forkSourceId).catch(() => null);
+    let forkCwd = hostCwd ?? input.sessionCwd;
+    if (hostCwd === null) {
+      const source = await findOmpSessionCwd(sideChannel, directive.forkSourceId);
+      forkCwd = source.ok ? source.cwd : input.sessionCwd;
+      if (!source.ok) {
+        await ctx.onEvent?.({
+          eventType: "run.system", stream: "system", level: "warn",
+          message: `omp fork source session ${directive.forkSourceId} could not be located (${source.error}); `
+            + `forking with this run's cwd (${input.sessionCwd}) — omp rejects the fork if the source recorded a different one`,
+        });
+      }
     }
     const fork = await forkOmpSession(sideChannel, directive.forkSourceId, forkCwd);
     if (fork.ok) {
@@ -735,6 +752,7 @@ export async function buildRunPlan(
   for (const warning of preparedScope.prepared.warnings) {
     await ctx.onEvent?.({ eventType: "run.system", stream: "system", level: "warn", message: warning });
   }
+  const executionMode = resolveExecutionMode(ctx.config) ?? "engine";
   // Run-scoped control tools (v0.9). The adapter declares
   // `runtimeToolDelivery: "native_mcp"`, so Paperclip must hand the
   // connections server over as an ACP MCP server. Read the channel it
@@ -743,8 +761,13 @@ export async function buildRunPlan(
   // serve them and they would disappear silently — the pre-v0.9 failure.
   // Resolved once per run so the count reported at the end is the same list
   // the engine received.
-  const runtimeMcpServers = ctx.runtimeMcp?.getServers?.() ?? [];
-  const connectionEndpoint = connectionToolsEndpoint(ctx);
+  //
+  // Managed mode is the exception by design: no MCP server is forwarded into
+  // the worker. The run's `runtimeTools` travel to the supervisor as
+  // `connectionTools`, which becomes two omp host tools — so the "no MCP
+  // server delivered" warning is the managed lane's normal case, not a fault.
+  const runtimeMcpServers = executionMode === "managed" ? [] : ctx.runtimeMcp?.getServers?.() ?? [];
+  const connectionEndpoint = executionMode === "managed" ? null : connectionToolsEndpoint(ctx);
   if (connectionEndpoint && !runtimeMcpServers.some((server) => server.url === connectionEndpoint)) {
     await ctx.onEvent?.({
       eventType: "run.system", stream: "system", level: "warn",
@@ -797,7 +820,6 @@ export async function buildRunPlan(
     scopeAgentDir: preparedScope.prepared.agentDir,
     intelDir,
   });
-  const executionMode = resolveExecutionMode(ctx.config) ?? "engine";
   const applied = await applySessionDirective(ctx, {
     directive: session.directive,
     thinkingRotateArmed: session.thinkingRotateArmed,
@@ -807,6 +829,7 @@ export async function buildRunPlan(
     sessionCwd: session.sessionCwd,
     storedParams: session.storedParams,
     intelState: session.intelState,
+    ...(deps.hostSessionCwd !== undefined ? { hostSessionCwd: deps.hostSessionCwd } : {}),
   });
   return {
     kind: "ready",

@@ -44,6 +44,7 @@ describe("host protocol frames", () => {
       { id: "3", type: "run.heartbeat", runId: "run-1" },
       { id: "4", type: "run.cancel", runId: "run-1", reason: "operator" },
       { id: "5", type: "run.status", runId: "run-1" },
+      { id: "5b", type: "run.steer", runId: "run-1", message: "look at the tests", kind: "steer" },
       { id: "6", type: "probe", kind: "capabilities", payload: {} },
       { id: "7", type: "shutdown", reason: "operator" },
     ];
@@ -57,6 +58,7 @@ describe("host protocol frames", () => {
       { type: "run.event", runId: "run-1", seq: 1, at: "2026-10-30T00:00:00.000Z", kind: "run.system", payload: { message: "hi" } },
       { type: "run.settled", runId: "run-1", result: { exitCode: 0, signal: null, timedOut: false } },
       { type: "run.status.result", id: "5", runId: "run-1", state: "settled", settled: { exitCode: 0, signal: null, timedOut: false } },
+      { type: "run.steer.result", id: "5b", runId: "run-1", ok: true },
       { type: "probe.result", id: "6", kind: "capabilities", payload: { ok: true } },
       { type: "error", id: "1", code: "bad_frame", message: "nope" },
     ];

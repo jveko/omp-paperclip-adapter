@@ -23,6 +23,8 @@ import {
 } from "./acp.js";
 import { runWithFreshSessionRetry, withRetryChain } from "./retry.js";
 import { startHost } from "../host/server.js";
+import { buildRunPlan } from "./run/run-plan.js";
+import { steerManagedRun } from "./run/host-transport.js";
 import { readLedgerRecords } from "../host/ledger.js";
 import * as sessionState from "./session-state.js";
 import { loadState, ompAgentDir, saveState, sessionIntelDir } from "./session-state.js";
@@ -2253,6 +2255,45 @@ describe("probeOmpAcpSession session/list capability", () => {
 
 });
 
+describe("managed fork cwd precondition", () => {
+  it("uses the host session index instead of spawning the ACP list probe", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "omp-fork-host-"));
+    try {
+      serverUtilsMocks.readPaperclipSkillSyncPreference.mockReturnValue({
+        explicit: false, desiredSkills: [], desiredSkillEntries: [],
+      });
+      serverUtilsMocks.readPaperclipRuntimeSkillEntries.mockResolvedValue([]);
+      serverUtilsMocks.resolvePaperclipDesiredSkillNames.mockReturnValue([]);
+      serverUtilsMocks.readPaperclipSkillMarkdown.mockResolvedValue(null);
+      skillManifestMocks.materializeSkillManifest.mockReset();
+      modelsMocks.listOmpModels.mockImplementation(async () => modelsMocks.defaultModels);
+      const frameFile = path.join(dir, "frames.log");
+      vi.stubEnv("FAKE_ACP_FRAME_LOG", frameFile);
+      const planned = await buildRunPlan(baseCtx({
+        config: {
+          command: `${process.execPath} ${fakeAcp}`,
+          sessionForkSourceId: "sess-a",
+          sessionForkToken: "t1",
+          cwd: dir,
+        },
+      }), {
+        bridge: bridgePath,
+        moduleDir: path.dirname(bridgePath),
+        hostSessionCwd: async (sessionId) => (sessionId === "sess-a" ? "/host/recorded/cwd" : null),
+      });
+      expect(planned.kind).toBe("ready");
+      if (planned.kind !== "ready") throw new Error("unreachable");
+      const frames = await readAcpFrames(frameFile);
+      const fork = frames.find((frame) => frame.method === "session/fork");
+      expect(fork?.params.cwd).toBe("/host/recorded/cwd");
+      expect(frames.some((frame) => frame.method === "session/list")).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+});
+
 const fakeRpc = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)), "../../test-fixtures/fake-rpc.mjs",
 );
@@ -2329,6 +2370,36 @@ describe("managed lane (executionMode)", () => {
     expect(JSON.stringify(ledger)).not.toContain("run-jwt");
   }, 30_000);
 
+  it("steers a running managed turn only when steering is enabled", async () => {
+    for (const steering of ["on", "off"] as const) {
+      const controller = new AbortController();
+      const spawned = Promise.withResolvers<void>();
+      const ctx = baseCtx({
+        runId: `run-steer-${steering}`,
+        config: {
+          executionMode: "managed",
+          agentCommand: `${process.execPath} ${fakeRpc}`,
+          env: { FAKE_RPC_MODE: "hang" },
+          steering,
+        },
+        onSpawn: async () => spawned.resolve(),
+        signal: controller.signal,
+      } as never);
+      const running = createOmpAcpExecutor()(ctx);
+      await spawned.promise;
+      const steered = await steerManagedRun({ runId: ctx.runId, message: "look at the failing test" });
+      if (steering === "on") {
+        expect(steered).toEqual({ ok: true });
+      } else {
+        expect(steered.ok).toBe(false);
+        expect(steered.error).toContain("steering is disabled");
+      }
+      controller.abort();
+      const result = await running;
+      expect(result.resultJson).toMatchObject({ status: "aborted" });
+    }
+  }, 30_000);
+
   it("cancels an already-aborted run after the begin reaches the supervisor", async () => {
     const controller = new AbortController();
     controller.abort();
@@ -2343,6 +2414,52 @@ describe("managed lane (executionMode)", () => {
     expect(result.resultJson).toMatchObject({ status: "aborted" });
     const ledger = await readLedgerRecords(path.join(tmpRoot, "instances", "test-managed", "omp-host"));
     expect(ledger.some((record) => record.state === "settled" && record.cause === "cancel")).toBe(true);
+  }, 30_000);
+
+  it("answers the fork cwd from the host session index without an ACP list probe", async () => {
+    const work = path.join(tmpRoot, "work-fork");
+    const other = path.join(tmpRoot, "work-fork-other");
+    await mkdir(work, { recursive: true });
+    await mkdir(other, { recursive: true });
+    // One wrapper serves both lanes: `acp` for the probe lane, everything else
+    // (--mode rpc) for the worker.
+    const wrapper = path.join(tmpRoot, "fake-omp.sh");
+    await writeFile(
+      wrapper,
+      `#!/bin/sh\nfor a in "$@"; do if [ "$a" = "acp" ]; then exec "${process.execPath}" "${fakeAcp}"; fi; done\nexec "${process.execPath}" "${fakeRpc}" "$@"\n`,
+      { mode: 0o755 },
+    );
+    const frameFile = path.join(tmpRoot, "fork-frames.log");
+    vi.stubEnv("FAKE_ACP_FRAME_LOG", frameFile);
+    const first = await createOmpAcpExecutor()(baseCtx({
+      runId: "run-fork-1",
+      config: { executionMode: "managed", command: wrapper, cwd: work, sessionBrowser: false },
+      runtime: {
+        sessionId: null,
+        sessionParams: { sessionKey: "sk-fork-1", cwd: work },
+        sessionDisplayId: null,
+        taskKey: "task",
+      },
+    }));
+    expect(first.exitCode).toBe(0);
+    const second = await createOmpAcpExecutor()(baseCtx({
+      runId: "run-fork-2",
+      config: {
+        executionMode: "managed", command: wrapper, cwd: other, sessionBrowser: false,
+        sessionForkSourceId: "sess-new-1", sessionForkToken: "t1",
+      },
+      runtime: {
+        sessionId: null,
+        sessionParams: { acpSessionId: "sess-new-1", sessionKey: "sk-fork-2", cwd: work },
+        sessionDisplayId: null,
+        taskKey: "task",
+      },
+    }));
+    expect(second.exitCode).toBe(0);
+    const frames = await readAcpFrames(frameFile);
+    const fork = frames.find((frame) => frame.method === "session/fork");
+    expect(fork?.params.cwd).toBe(work);
+    expect(frames.some((frame) => frame.method === "session/list")).toBe(false);
   }, 30_000);
 
   it("refuses an unknown executionMode before any lane is constructed", async () => {

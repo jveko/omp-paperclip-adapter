@@ -80,9 +80,15 @@ describe("getSessionConfigSchema", () => {
       "sessionForkToken", "sessionMaxRuns", "sessionMaxAgeHours",
       "credentialMode", "thinking", "fallbackChain",
       "fallbackOn", "fallbackRevertPolicy", "waitForUsageReset", "maxDelayMs",
-      "usageReport", "skillsAsTools", "executionMode", "governancePolicy",
+      "usageReport", "skillsAsTools", "steering", "executionMode", "governancePolicy",
     ]);
     for (const field of schema.fields) expect(field.hint).toContain("next run");
+  });
+  it("exposes steering as an off-by-default managed-lane toggle", () => {
+    const byKey = Object.fromEntries(getSessionConfigSchema().fields.map((f) => [f.key, f]));
+    expect(byKey.steering.type).toBe("select");
+    expect(byKey.steering.default).toBe("off");
+    expect(byKey.steering.options.map((o: { value: string }) => o.value)).toEqual(["off", "on"]);
   });
   it("exposes executionMode as an engine-defaulted lane selector", () => {
     const byKey = Object.fromEntries(getSessionConfigSchema().fields.map((f) => [f.key, f]));

@@ -9,7 +9,7 @@ import type {
 import { bridgePath, moduleDir, packageRootDir } from "./adapters/acp/launch.js";
 import { buildRunPlan } from "./run/run-plan.js";
 import { executePlan, type RunTransport } from "./run/execute.js";
-import { createHostTransport } from "./run/host-transport.js";
+import { createHostTransport, lookupHostSessionCwd } from "./run/host-transport.js";
 import { resolveExecutionMode } from "./session-directives.js";
 
 /**
@@ -93,7 +93,13 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     return executor;
   };
   return async (ctx) => {
-    const planned = await buildRunPlan(ctx, { bridge, moduleDir });
+    const planned = await buildRunPlan(ctx, {
+      bridge,
+      moduleDir,
+      ...(resolveExecutionMode(ctx.config) === "managed"
+        ? { hostSessionCwd: (sessionId: string) => lookupHostSessionCwd(sessionId) }
+        : {}),
+    });
     if (planned.kind === "refused") {
       return {
         exitCode: 1,

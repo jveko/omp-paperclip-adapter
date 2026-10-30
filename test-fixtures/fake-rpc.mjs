@@ -151,6 +151,7 @@ rl.on("line", (line) => {
         send({ type: "rpc_chunk", chunkId: "rpc-1", index: 1, count: 2, byteLength: Buffer.byteLength(json), data: Buffer.from(json.slice(half)).toString("base64") });
       }
       succeed(id, "prompt");
+      pendingPrompt = { id };
       if (mode === "crash") {
         process.exit(3);
       }

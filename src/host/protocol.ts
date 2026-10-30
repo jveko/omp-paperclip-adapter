@@ -125,6 +125,8 @@ export interface RunBeginFrame {
   connectionTools?: ConnectionTools | null;
   manifests: Manifests;
   limits: Limits;
+  /** When true the supervisor forwards `run.steer` to the live turn. */
+  steering?: boolean;
 }
 
 export interface RunHeartbeatFrame {
@@ -146,6 +148,14 @@ export interface RunStatusFrame {
   runId: string;
 }
 
+export interface RunSteerFrame {
+  id: string;
+  type: "run.steer";
+  runId: string;
+  message: string;
+  kind: "steer" | "follow_up";
+}
+
 export interface ProbeFrame {
   id: string;
   type: "probe";
@@ -165,6 +175,7 @@ export type HostFrame =
   | RunHeartbeatFrame
   | RunCancelFrame
   | RunStatusFrame
+  | RunSteerFrame
   | ProbeFrame
   | ShutdownFrame;
 
@@ -216,6 +227,14 @@ export interface RunStatusResultFrame {
   settled?: AdapterExecutionResult;
 }
 
+export interface RunSteerResultFrame {
+  type: "run.steer.result";
+  id: string;
+  runId: string;
+  ok: boolean;
+  error?: string;
+}
+
 export interface ProbeResultFrame {
   type: "probe.result";
   id: string;
@@ -236,6 +255,7 @@ export type HostReply =
   | RunEventFrame
   | RunSettledFrame
   | RunStatusResultFrame
+  | RunSteerResultFrame
   | ProbeResultFrame
   | HostErrorFrame;
 
@@ -249,6 +269,7 @@ const COMMAND_TYPES: Record<HostFrame["type"], true> = {
   "run.heartbeat": true,
   "run.cancel": true,
   "run.status": true,
+  "run.steer": true,
   probe: true,
   shutdown: true,
 };
@@ -259,6 +280,7 @@ const REPLY_TYPES: Record<HostReply["type"], true> = {
   "run.event": true,
   "run.settled": true,
   "run.status.result": true,
+  "run.steer.result": true,
   "probe.result": true,
   error: true,
 };
@@ -316,11 +338,15 @@ function isWellFormed(frame: Record<string, unknown>): boolean {
         && isString((frame.credentials as Record<string, unknown>).apiKey)
         && isRecord(frame.manifests)
         && isRecord(frame.limits)
-        && typeof (frame.limits as Record<string, unknown>).runLeaseTtlMs === "number";
+        && typeof (frame.limits as Record<string, unknown>).runLeaseTtlMs === "number"
+        && (frame.steering === undefined || typeof frame.steering === "boolean");
     }
     case "run.heartbeat":
     case "run.status":
       return isString(frame.id) && isString(frame.runId);
+    case "run.steer":
+      return isString(frame.id) && isString(frame.runId) && isString(frame.message)
+        && (frame.kind === "steer" || frame.kind === "follow_up");
     case "run.cancel":
       return isString(frame.id) && isString(frame.runId)
         && (frame.reason === "operator" || frame.reason === "timeout" || frame.reason === "shutdown");
@@ -346,6 +372,8 @@ function isWellFormed(frame: Record<string, unknown>): boolean {
       return isString(frame.runId) && isRecord(frame.result);
     case "run.status.result":
       return isString(frame.id) && isString(frame.runId) && isString(frame.state);
+    case "run.steer.result":
+      return isString(frame.id) && isString(frame.runId) && typeof frame.ok === "boolean";
     case "probe.result":
       return isString(frame.id) && isString(frame.kind) && isRecord(frame.payload);
     case "error":

@@ -9,6 +9,7 @@ import { createOmpAcpExecutor } from "../server/acp.js";
 import { readLedgerRecords } from "./ledger.js";
 import { startHost } from "./server.js";
 import { readDiscovery } from "./socket.js";
+import { startFakeMcp } from "../../test/fake-mcp.js";
 
 /**
  * Phase-1 acceptance on the shipped binary: the adapter spawns `dist/omp-host.js`
@@ -129,6 +130,40 @@ describe("phase 1 acceptance on dist/omp-host.js", () => {
     expect(raw).not.toContain("run-jwt-ACCEPTANCE");
     const contextDirs = await readdir(path.join(hostRoot, "run-context")).catch(() => []);
     expect(contextDirs).toEqual([]);
+  }, 45_000);
+
+  it("serves the run's connection tools as host tools through the spawned binary", async () => {
+    const mcp = await startFakeMcp();
+    try {
+      const run = createOmpAcpExecutor({ hostScript });
+      const result = await run(ctx("", {
+        config: {
+          executionMode: "managed",
+          agentCommand: `${process.execPath} ${fixture}`,
+          env: { FAKE_RPC_MODE: "hosttool" },
+        },
+        runtimeTools: {
+          version: 1,
+          guidance: "Connection tools",
+          mcpEndpoint: mcp.url,
+          rest: { connectionsSearch: `${mcp.url}/search`, connectionRequest: `${mcp.url}/request` },
+          bearerToken: "ct-ACCEPTANCE",
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          tools: ["connections_search", "connection_request"],
+        },
+      } as never));
+      expect(result.exitCode).toBe(0);
+      expect(mcp.calls).toHaveLength(1);
+      expect(mcp.calls[0]).toMatchObject({
+        tool: "connections_search",
+        arguments: { query: "acme" },
+        authorization: "Bearer ct-ACCEPTANCE",
+      });
+      const raw = await readFile(path.join(instanceRoot, "omp-host", "ledger.jsonl"), "utf8");
+      expect(raw).not.toContain("ct-ACCEPTANCE");
+    } finally {
+      await mcp.close();
+    }
   }, 45_000);
 
   it("survives kill -9 of the supervisor, then reaps the orphan on restart", async () => {

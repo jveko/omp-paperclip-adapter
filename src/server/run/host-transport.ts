@@ -11,6 +11,7 @@ import type {
   Credentials, HostReply, Manifests, RunAcceptedFrame, RunBeginFrame, RunEventFrame,
 } from "../../host/protocol.js";
 import { buildWorkerArgv, buildWorkerEnv } from "../../host/worker.js";
+import { resolveSteering } from "../session-directives.js";
 import { sessionLeaseKey } from "../session-lease.js";
 import { firstNonEmptyString, packageRootDir } from "../adapters/acp/launch.js";
 import { resolveOmpBillingIdentity } from "./billing.js";
@@ -125,6 +126,34 @@ function manifestsOf(plan: RunPlan): Manifests {
   };
 }
 
+/**
+ * The run's connection-tools access, read from the HEAD-only `ctx.runtimeTools`
+ * (absent from the pinned declaration). The bearer is forwarded to the
+ * supervisor only — never to the worker, a log, an event or the ledger.
+ */
+function connectionToolsOf(ctx: AdapterExecutionContext): {
+  endpoint: string;
+  bearerToken: string;
+  expiresAt: string | null;
+  tools: string[];
+} | null {
+  if (!("runtimeTools" in ctx)) return null;
+  const value: unknown = ctx.runtimeTools;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const endpoint = typeof record.mcpEndpoint === "string" ? record.mcpEndpoint.trim() : "";
+  const bearerToken = typeof record.bearerToken === "string" ? record.bearerToken.trim() : "";
+  if (endpoint === "" || bearerToken === "") return null;
+  return {
+    endpoint,
+    bearerToken,
+    expiresAt: typeof record.expiresAt === "string" ? record.expiresAt : null,
+    tools: Array.isArray(record.tools)
+      ? record.tools.filter((name): name is string => typeof name === "string")
+      : [],
+  };
+}
+
 function credentialsOf(ctx: AdapterExecutionContext, env: Record<string, string>): Credentials {
   const apiUrl = env.PAPERCLIP_API_URL
     ?? firstNonEmptyString(process.env.PAPERCLIP_API_URL)
@@ -217,6 +246,77 @@ async function ensureHost(options: {
   );
 }
 
+/**
+ * Deliver a steering message to a live managed run (used by the board/plugin
+ * seam; the supervisor refuses when the run's `steering` is off). Never throws:
+ * an unreachable host, an unknown run or a disabled flag all return `{ok:false}`.
+ */
+export async function steerManagedRun(input: {
+  runId: string;
+  message: string;
+  kind?: "steer" | "follow_up";
+  rootDir?: string;
+}): Promise<{ ok: boolean; error?: string }> {
+  let client: HostClient;
+  try {
+    client = await HostClient.connect({ rootDir: input.rootDir });
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+  try {
+    client.send({
+      id: `steer-${input.runId}-${Date.now()}`,
+      type: "run.steer",
+      runId: input.runId,
+      message: input.message,
+      kind: input.kind ?? "steer",
+    });
+    const reply = await client.waitFor(
+      (frame) => frame.type === "run.steer.result" && frame.runId === input.runId,
+      10_000,
+    );
+    if (reply.type !== "run.steer.result") return { ok: false, error: "unexpected supervisor reply" };
+    return reply.ok ? { ok: true } : { ok: false, error: reply.error ?? "steering refused" };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  } finally {
+    client.close();
+  }
+}
+
+/**
+ * Ask the supervisor which cwd it recorded for a session it ran. Null when the
+ * host is not running or never ran that session (the caller falls back to the
+ * ACP probe lane). Connect-only: the fork decision happens before a run starts,
+ * so this must not spawn a supervisor.
+ */
+export async function lookupHostSessionCwd(
+  sessionId: string,
+  rootDir?: string,
+): Promise<string | null> {
+  let client: HostClient;
+  try {
+    client = await HostClient.connect({ rootDir, connectTimeoutMs: 1_000 });
+  } catch {
+    return null;
+  }
+  try {
+    const id = `session-cwd-${Date.now()}`;
+    client.send({ id, type: "probe", kind: "sessions", payload: { sessionId } });
+    const reply = await client.waitFor(
+      (frame) => frame.type === "probe.result" && frame.id === id,
+      2_000,
+    );
+    if (reply.type !== "probe.result") return null;
+    const payload = reply.payload;
+    return payload.ok === true && typeof payload.cwd === "string" ? payload.cwd : null;
+  } catch {
+    return null;
+  } finally {
+    client.close();
+  }
+}
+
 export type ManagedRun = (
   ctx: AdapterExecutionContext,
   plan: RunPlan,
@@ -271,8 +371,10 @@ export function createHostTransport(options: HostTransportOptions): ManagedRun {
       worker: { command: workerArgv.command, args: workerArgv.args, env },
       prompt: prompt.prompt,
       credentials: credentialsOf(ctx, env),
+      connectionTools: connectionToolsOf(ctx),
       manifests: manifestsOf(plan),
       limits: { timeoutMs: configuredTimeoutMs(ctx.config), runLeaseTtlMs: RUN_LEASE_TTL_MS },
+      steering: resolveSteering(ctx.config) === "on",
     };
 
     let client: HostClient;

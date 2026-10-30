@@ -23,6 +23,7 @@ import {
   isDiscoveryStale, newHostToken, readDiscovery, readProcessStartIdentity, socketPathIn,
   writeDiscovery, type HostDiscovery,
 } from "./socket.js";
+import { McpHttpClient } from "./mcp.js";
 import { RpcWorker, type RpcFrame } from "./worker.js";
 
 /**
@@ -48,7 +49,11 @@ export interface HostOptions {
   runLeaseTtlMs?: number;
   drainMs?: number;
   cancelGraceMs?: number;
-  /** Phase 1 runs cold; warm reuse is the v0.12 phase-2 default. */
+  /**
+   * Keep a worker warm between runs of the same `(company, agent, cwd,
+   * sessionKey)` unit. On by default; `false` is the v0.12 phase-1 cold lane and
+   * a test/rollback seam.
+   */
   reuseWorkers?: boolean;
   version?: string;
 }
@@ -112,6 +117,8 @@ interface WorkerEntry {
   sessionDir: string;
   sessionKey: string;
   startIdentity: string | null;
+  /** The omp session this process currently has open, if any. */
+  ompSessionId: string | null;
   currentRun: string | null;
   lastUsedAt: number;
 }
@@ -160,6 +167,8 @@ interface RunState {
   statsBefore: StatsSnapshot | null;
   unsubscribe: Array<() => void>;
   lastAssistantText: string | null;
+  /** Whether this run installed the connection tools on its worker. */
+  hostToolsInstalled: boolean;
 }
 
 interface Connection {
@@ -168,6 +177,11 @@ interface Connection {
   decoder: StringDecoder;
   runId: string | null;
   closed: boolean;
+}
+
+/** The canonical object guard for this file's IPC/JSON boundary reads. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function readStats(data: Record<string, unknown>): StatsSnapshot | null {
@@ -256,6 +270,8 @@ class Supervisor {
   private readonly abandonedBeforePrompt = new Set<string>();
   /** A cancel that arrived while the run was still in setup. */
   private readonly pendingCancels = new Map<string, "operator" | "timeout" | "shutdown">();
+  /** Every omp session this supervisor has run: the fork cwd precondition source. */
+  private readonly sessionIndex = new Map<string, { cwd: string; sessionFile: string | null }>();
   /** Worker slots claimed but not yet spawned, so interleaved begins respect maxWorkers. */
   private reservedWorkers = 0;
   private ledger: RunLedger | null = null;
@@ -280,7 +296,7 @@ class Supervisor {
       runLeaseTtlMs: options.runLeaseTtlMs ?? positiveEnv("OMP_HOST_RUN_LEASE_TTL_MS", DEFAULT_RUN_LEASE_TTL_MS),
       drainMs: options.drainMs ?? positiveEnv("OMP_HOST_DRAIN_MS", DEFAULT_DRAIN_MS),
       cancelGraceMs: options.cancelGraceMs ?? positiveEnv("OMP_HOST_CANCEL_GRACE_MS", DEFAULT_CANCEL_GRACE_MS),
-      reuseWorkers: options.reuseWorkers ?? false,
+      reuseWorkers: options.reuseWorkers ?? true,
       version: options.version ?? "0.12.0",
     };
   }
@@ -296,6 +312,7 @@ class Supervisor {
     this.ledger = await RunLedger.open(this.root);
     this.epoch = `host-${randomBytes(3).toString("hex")}`;
     await reconcileWith(this.root, this.ledger);
+    this.rebuildSessionIndex();
     await this.listen();
     this.sweepTimer = setInterval(() => this.sweep(), sweepInterval(this.options));
     this.sweepTimer.unref();
@@ -449,6 +466,40 @@ class Supervisor {
       case "run.status":
         this.send(connection, await this.statusOf(frame.id, frame.runId));
         return;
+      case "run.steer": {
+        const run = this.runs.get(frame.runId);
+        if (run === undefined || run.terminal) {
+          this.send(connection, {
+            type: "run.steer.result", id: frame.id, runId: frame.runId,
+            ok: false, error: "no live run with that id",
+          });
+          return;
+        }
+        if (run.begin.steering !== true) {
+          this.send(connection, {
+            type: "run.steer.result", id: frame.id, runId: frame.runId,
+            ok: false, error: "steering is disabled for this run (set steering: 'on' on the agent)",
+          });
+          return;
+        }
+        try {
+          if (frame.kind === "follow_up") await run.worker.worker.followUp(frame.message);
+          else await run.worker.worker.steer(frame.message);
+          this.emitEvent(run, "run.system", {
+            level: "info",
+            message: `steering delivered to the running turn (${frame.kind})`,
+          });
+          this.send(connection, {
+            type: "run.steer.result", id: frame.id, runId: frame.runId, ok: true,
+          });
+        } catch (err) {
+          this.send(connection, {
+            type: "run.steer.result", id: frame.id, runId: frame.runId,
+            ok: false, error: err instanceof Error ? err.message : String(err),
+          });
+        }
+        return;
+      }
       case "probe":
         this.send(connection, this.probe(frame));
         return;
@@ -485,7 +536,35 @@ class Supervisor {
     for (const connection of run.connections) this.sendSettled(connection, run.runId, result);
   }
 
+  private rebuildSessionIndex(): void {
+    const ledger = this.ledger;
+    if (ledger === null) return;
+    for (const record of ledger.snapshot().values()) {
+      if (record.ompSessionId === undefined || record.ompSessionId === "") continue;
+      this.sessionIndex.set(record.ompSessionId, {
+        cwd: record.cwd,
+        sessionFile: record.sessionFile ?? null,
+      });
+    }
+  }
+
   private probe(frame: Extract<HostFrame, { type: "probe" }>): HostReply {
+    if (frame.kind === "sessions") {
+      // The fork precondition: the cwd the source session recorded. Only
+      // sessions THIS supervisor ran are indexed; anything else is the
+      // adapter's ACP-probe fallback.
+      const payload = frame.payload ?? {};
+      const sessionId = typeof payload.sessionId === "string" ? payload.sessionId : "";
+      const found = this.sessionIndex.get(sessionId);
+      return {
+        type: "probe.result",
+        id: frame.id,
+        kind: frame.kind,
+        payload: found === undefined
+          ? { ok: false, error: "the supervisor has not run that session" }
+          : { ok: true, cwd: found.cwd, sessionFile: found.sessionFile },
+      };
+    }
     if (frame.kind !== "capabilities") {
       return {
         type: "probe.result",
@@ -670,6 +749,7 @@ class Supervisor {
       statsBefore: null,
       unsubscribe: [],
       lastAssistantText: null,
+      hostToolsInstalled: false,
     };
 
     let promptAccepted = false;
@@ -682,7 +762,8 @@ class Supervisor {
       const sessionDir = worker.sessionDir;
       await mkdir(sessionDir, { recursive: true, mode: 0o700 });
       let sessionId = run.ompSessionId;
-      if (sessionId !== "") {
+      const alreadyOpen = sessionId !== "" && worker.ompSessionId === sessionId;
+      if (sessionId !== "" && !alreadyOpen) {
         const opened = await worker.worker.openSession(sessionDir);
         if (opened.cancelled) {
           const fresh = await worker.worker.newSession();
@@ -692,7 +773,7 @@ class Supervisor {
           sessionId = opened.sessionId;
           run.sessionFile = opened.sessionFile ?? null;
         }
-      } else {
+      } else if (sessionId === "") {
         const fresh = await worker.worker.newSession();
         if (fresh.cancelled) throw new Error("omp refused to create a session for this run");
       }
@@ -702,6 +783,7 @@ class Supervisor {
         if (typeof state.sessionFile === "string") run.sessionFile = state.sessionFile;
       }
       run.ompSessionId = sessionId;
+      worker.ompSessionId = sessionId === "" ? null : sessionId;
       await this.journal(this.runRecord(run, "session_open", {
         worker: this.ledgerWorker(worker),
         ompSessionId: sessionId,
@@ -709,6 +791,10 @@ class Supervisor {
       }));
 
       run.statsBefore = readStats(await worker.worker.getStats().catch(() => ({})));
+
+      if (begin.connectionTools !== undefined && begin.connectionTools !== null) {
+        await this.installHostTools(run, begin.connectionTools);
+      }
 
       // The setup awaits are where a caller can vanish (open_session is slow).
       // Never prompt for a caller that is already gone.
@@ -767,6 +853,7 @@ class Supervisor {
       if (this.pendingRuns.get(begin.runId) === connection) this.pendingRuns.delete(begin.runId);
       this.abandonedBeforePrompt.delete(begin.runId);
       this.pendingCancels.delete(begin.runId);
+      if (connection.runId === begin.runId && !this.runs.has(begin.runId)) connection.runId = null;
     }
   }
 
@@ -852,6 +939,70 @@ class Supervisor {
         // Token deltas and UI frames never reach the board: the engine lane only
         // ever emitted turn-level activity, and a per-token event is not one.
         return;
+    }
+  }
+
+  /**
+   * Install the run's Paperclip connection tools as omp host tools.
+   *
+   * The bearer stays here: the worker gets tool DEFINITIONS, and each call
+   * comes back as a `host_tool_call` frame this process answers against the MCP
+   * endpoint. A warm worker is rebound on every run (set_host_tools replaces
+   * the handler set), so the token rotates without a respawn.
+   *
+   * Failure is a warning, not a failed run: the engine lane also degrades when
+   * connection tools cannot be delivered, and a run without them is ordinary.
+   */
+  private async installHostTools(
+    run: RunState,
+    access: { endpoint: string; bearerToken: string; expiresAt: string | null; tools: string[] },
+  ): Promise<void> {
+    const client = new McpHttpClient({ endpoint: access.endpoint, bearer: access.bearerToken });
+    try {
+      await client.initialize();
+      const available = await client.listTools();
+      const wanted = new Set(access.tools);
+      const selected = available.filter((tool) => wanted.size === 0 || wanted.has(tool.name));
+      if (selected.length === 0) {
+        this.emitEvent(run, "run.system", {
+          level: "warn",
+          message: "omp connection tools are unavailable this run: the MCP endpoint listed no tool the run was granted",
+        });
+        return;
+      }
+      const names = await run.worker.worker.setHostTools(selected.map((tool) => ({
+        name: tool.name,
+        label: tool.name,
+        description: tool.description,
+        parameters: tool.inputSchema,
+        loadMode: "essential",
+      })));
+      run.worker.worker.onHostToolCall(async (frame) => {
+        const toolName = typeof frame.toolName === "string" ? frame.toolName : "";
+        if (!selected.some((tool) => tool.name === toolName)) {
+          return {
+            isError: true,
+            result: { content: [{ type: "text", text: `tool '${toolName}' is not part of this run` }] },
+          };
+        }
+        const args = isRecord(frame.arguments) ? frame.arguments : {};
+        const result = await client.callTool(toolName, args);
+        return {
+          result: { content: [{ type: "text", text: result.text }] },
+          ...(result.isError ? { isError: true } : {}),
+        };
+      });
+      run.hostToolsInstalled = true;
+      this.emitEvent(run, "run.system", {
+        level: "info",
+        message: `omp connection tools installed as host tools: ${names.join(", ")}`,
+      });
+    } catch (err) {
+      run.worker.worker.onHostToolCall(null);
+      this.emitEvent(run, "run.system", {
+        level: "warn",
+        message: `omp connection tools are unavailable this run: ${err instanceof Error ? err.message : String(err)}`,
+      });
     }
   }
 
@@ -1057,6 +1208,12 @@ class Supervisor {
         message: `the run ledger could not record the settle: ${err instanceof Error ? err.message : String(err)}`,
       });
     });
+    if (run.hostToolsInstalled) {
+      // The handler closes over this run's bearer: drop it before the worker is
+      // reused by the next run (which installs its own).
+      run.worker.worker.onHostToolCall(null);
+      void run.worker.worker.setHostTools([]).catch(() => {});
+    }
     await clearRunContext(this.root, run.worker.workerId, run.runId).catch(() => {});
     if ([...run.connections].some((connection) => !connection.closed)) {
       const receipt = {
@@ -1069,7 +1226,18 @@ class Supervisor {
       this.emitEvent(run, "omp.usage", receipt);
       this.broadcastSettled(run, result);
     }
-    await this.journal(this.runRecord(run, "closed", { cause: outcome.cause ?? "clean" })).catch(() => {});
+    // The connection is free again: a sequential begin on it may carry the next
+    // run, while a concurrent second one is still refused.
+    for (const waiter of run.connections) {
+      if (waiter.runId === run.runId) waiter.runId = null;
+    }
+    await this.journal(this.runRecord(run, "closed", {
+      cause: outcome.cause ?? "clean",
+      // Kept on the final record: compaction leaves only this line per run, and
+      // the session index (fork cwd) must survive a host restart.
+      ompSessionId: run.ompSessionId,
+      ...(run.sessionFile !== null ? { sessionFile: run.sessionFile } : {}),
+    })).catch(() => {});
     await run.leaseRelease().catch(() => {});
     if (!this.options.reuseWorkers) await this.retireWorker(run.worker);
     this.touch();
@@ -1177,6 +1345,7 @@ class Supervisor {
       sessionDir,
       sessionKey: begin.sessionKey,
       startIdentity: await readProcessStartIdentity(worker.pid),
+      ompSessionId: null,
       currentRun: null,
       lastUsedAt: Date.now(),
     };
@@ -1218,7 +1387,14 @@ class Supervisor {
   private async journal(input: LedgerInput): Promise<LedgerRecord> {
     const ledger = this.ledger;
     if (ledger === null) throw new LedgerWriteError("the ledger is not open");
-    return ledger.append(input);
+    const record = await ledger.append(input);
+    if (record.ompSessionId !== undefined && record.ompSessionId !== "") {
+      this.sessionIndex.set(record.ompSessionId, {
+        cwd: record.cwd,
+        sessionFile: record.sessionFile ?? null,
+      });
+    }
+    return record;
   }
 
   private runRecord(

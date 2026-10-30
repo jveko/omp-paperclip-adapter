@@ -104,6 +104,25 @@ export function validateExecutionMode(config: Record<string, unknown>): string |
     + "'engine' keeps the v0.11 ACP lane; 'managed' hands the run to this instance's omp-host supervisor.";
 }
 
+/**
+ * Steering: whether a running turn accepts `steer`/`follow_up` from the board.
+ * Off by default because Paperclip has no UI contract for it yet; an unknown
+ * value is a config error so a typo never silently enables or disables it.
+ */
+export type SteeringMode = "off" | "on";
+
+export function resolveSteering(config: Record<string, unknown>): SteeringMode | null {
+  const raw = config.steering;
+  if (raw === undefined || raw === null || raw === "") return "off";
+  if (raw === "on" || raw === "off") return raw;
+  return null;
+}
+
+export function validateSteering(config: Record<string, unknown>): string | null {
+  if (resolveSteering(config) !== null) return null;
+  return `steering is '${String(config.steering)}' but expected 'off' or 'on'.`;
+}
+
 export type RunDirective =
   | { kind: "fork"; forkSourceId: string; forkToken: string }
   | { kind: "forceFresh"; token: string }
@@ -282,6 +301,12 @@ export function getSessionConfigSchema(): AdapterConfigSchema {
         hint: `Emit an omp-usage work product with cost estimates. ${NEXT_RUN}` },
       { key: "skillsAsTools", label: "Expose skills as on-demand tools", type: "toggle", default: false,
         hint: `Register each enabled company skill as a native omp tool that returns its instructions on demand, instead of injecting all skill text into the prompt. Reduces context use. ${NEXT_RUN}` },
+      { key: "steering", label: "Steering", type: "select", default: "off",
+        options: [
+          { label: "Off", value: "off" },
+          { label: "On (forward steer/follow_up to the live turn)", value: "on" },
+        ],
+        hint: `Managed lane only. When on, a steering request is forwarded to the running turn through omp RPC steer/follow_up; when off the supervisor refuses it. Engine mode has no steering transport, so this key has no effect there. ${NEXT_RUN}` },
       { key: "executionMode", label: "Execution lane", type: "select", default: "engine",
         options: [
           { label: "Engine (ACP, v0.11 behaviour)", value: "engine" },
