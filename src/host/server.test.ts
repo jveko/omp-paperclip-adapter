@@ -457,9 +457,9 @@ describe("supervisor", () => {
       const allEvents = JSON.stringify(client.frames.filter((frame) => frame.type === "run.event"));
       const allResult = JSON.stringify(settled.result);
       const sentinels = [
-        "sk-live-ABCDEF", "Bearer abcdefghij", "TRANSCRIPT-SENTINEL",
-        "ARG-SENTINEL", "TASK-SENTINEL", "ASSIGNMENT-SENTINEL", "PROMPT-SENTINEL",
-        "jwt-SENTINEL",
+        "sk-live-ABCDEF", "Bearer abcdefghij", "signature-sentinel", "eyJ",
+        "TRANSCRIPT-SENTINEL", "ARG-SENTINEL", "TASK-SENTINEL",
+        "ASSIGNMENT-SENTINEL", "PROMPT-SENTINEL", "jwt-SENTINEL",
       ];
       for (const sentinel of sentinels) {
         expect(allEvents).not.toContain(sentinel);
@@ -467,7 +467,7 @@ describe("supervisor", () => {
       }
       const payloads = subagentPayloads(client.frames);
       const leaking = payloads.find((payload) => payload.id === "sa-2");
-      expect(leaking?.description).toBe("scan [redacted] with Bearer [redacted]");
+      expect(leaking?.description).toBe("scan [redacted] with Bearer [redacted] then [redacted]");
       const tool = payloads.find((payload) => payload.event === "tool_execution_end");
       expect(tool?.summary).toBe("tool_execution_end: read");
       for (const payload of payloads) {

@@ -147,8 +147,16 @@ const eventSubagent = (id, event) => {
 
 const emitSubagentWork = () => {
   if (mode === "subagentsleak") {
+    // Built at runtime so the fixture carries a real JWT shape, not a sentinel
+    // costume: only the eyJ-based redaction pattern catches these segments.
+    const leakedJwt = [
+      Buffer.from('{"alg":"HS256"}').toString("base64url"),
+      Buffer.from('{"sub":"sa-2"}').toString("base64url"),
+      "signature-sentinel",
+    ].join(".");
     startSubagent("sa-1", 0, "explore", "read the config");
-    startSubagent("sa-2", 1, "plan", "scan sk-live-ABCDEF1234567890 with Bearer abcdefghijklmnop");
+    startSubagent("sa-2", 1, "plan",
+      `scan sk-live-ABCDEF1234567890 with Bearer abcdefghijklmnop then ${leakedJwt}`);
     startSubagent("sa-3", 2, "task", "keep working");
     progressSubagent("sa-1", "running", "reading files");
     eventSubagent("sa-1", {
