@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.11.0 — 2026-10-30
+
+Internal seams. No user-visible change: same env names, event types, error codes, warning text and
+public exports (18 runtime + 5 types from `server/acp`, 3 from `src/index.ts`), 655 tests before and
+after. What changed is where a run lives.
+
+- **ACP client extracted** (`adapters/acp/client.ts`) — `session-intel` no longer imports the executor;
+  the initialize-only reads go through an `OmpSideChannel` port with an ACP implementation.
+- **One overlay writer** (`run/overlays.ts`) replaces four hand-rolled `mkdir`/`write`/`try` blocks and
+  the five-term `PI_CONFIG_FILES` merge; the plan owns the overlay list, filenames and order unchanged.
+- **Executor split** — the 681-line closure is now a pure `buildRunPlan` (every pre-engine decision)
+  plus a 29-line `executePlan` (the engine call and the run's evidence). `server/acp.ts` is
+  1,311 → 112 lines and is a barrel + composition root.
+
+| Metric | Before | After |
+|---|---|---|
+| `acp.ts` lines | 1,311 | 112 |
+| `session-intel.ts` lines | 283 | 62 |
+| import cycles | 1 | 0 |
+| overlay writers | 4 | 1 |
+| product LOC (non-test) | 6,959 | 7,571 |
+
+Product LOC rose by 612: extraction creates module boundaries where there was one file. That is the
+trade this release makes, and it is why the RPC lane can be a new `adapters/rpc/` directory instead of
+a second conditional inside the executor.
+
 ## 0.10.1 — 2026-10-30
 
 Compatibility with omp 18.14.0, released two days after 0.10.0.

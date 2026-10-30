@@ -307,6 +307,15 @@ covered by tests.
 2026-10-30 assessment resolved (for example the "resume fingerprint instability"), the
 assessment above supersedes it.*
 
+- **2026-10-30 — v0.11.0 (Seams).** Four behaviour-preserving cuts: ACP client extracted
+  (`adapters/acp/client.ts`, cycle gone), side-channel port, one overlay writer, executor split into
+  `buildRunPlan` + `executePlan` (`acp.ts` 1,311 → 112 lines). Same exports, events and error codes;
+  655 tests before and after. Unblocks the RPC lane as a new `adapters/rpc/` directory.
+
+- **2026-10-30 — v0.10.1 (omp 18.14 compatibility).** Tested set is now 18.13.x + 18.14.x with peer
+  `<18.15.0`; provider-qualified model/fallback selectors are resolved against the catalog and refused
+  when unresolved (omp 18.14 resolves them exactly); bare selectors keep fuzzy matching. 655 tests.
+
 - **2026-10-30 — v0.10.0 (Model control & failover).** Thinking level moved into a settings overlay
   (no fingerprint rotation) with a one-time rotation when it changes on an existing session and a
   fork-aware record of what each session started with; validated `fallbackOn`,
