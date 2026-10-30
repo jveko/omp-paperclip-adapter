@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { forkOmpSession, queryOmpSessions } from "./session-intel.js";
 
-// Separate file from session-intel.test.ts: this one file-level mocks ./acp.js
-// so we can assert the side-channel env is forwarded through to driveAcpSession,
-// without disturbing the real-fake-acp tests that drive the actual subprocess.
+// Separate file from session-intel.test.ts: this one file-level mocks the ACP
+// client so we can assert the side-channel env is forwarded through to
+// driveAcpSession, without disturbing the real-fake-acp tests that drive the
+// actual subprocess.
 const mocks = vi.hoisted(() => ({
   driveAcpSession: vi.fn(async () => ({
     ok: true,
@@ -11,7 +12,7 @@ const mocks = vi.hoisted(() => ({
   })),
 }));
 
-vi.mock("./acp.js", () => ({ driveAcpSession: mocks.driveAcpSession }));
+vi.mock("./adapters/acp/client.js", () => ({ driveAcpSession: mocks.driveAcpSession }));
 
 describe("side-channel env forwarding", () => {
   it("forkOmpSession forwards env to driveAcpSession", async () => {

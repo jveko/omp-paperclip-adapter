@@ -1,4 +1,4 @@
-import { driveAcpSession, type AcpFrameRequest, type AcpFrameResponse } from "./acp.js";
+import { driveAcpSession, type AcpFrameRequest, type AcpFrameResponse } from "./adapters/acp/client.js";
 
 export interface OmpSessionInfo {
   sessionId: string;
