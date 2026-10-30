@@ -47,7 +47,7 @@ import {
 } from "./usage-report.js";
 import {
   buildSessionSnapshotWorkProduct, postWorkProduct, readSessionIntelConfig,
-  resolveRunDirective, sessionSnapshotDigestInput, validateCredentialMode,
+  resolveRunDirective, resolveWorkProductIssueId, sessionSnapshotDigestInput, validateCredentialMode,
   validateSessionScope, validThinkingLevel, validateThinkingLevel,
 } from "./session-directives.js";
 
@@ -959,7 +959,10 @@ export function createOmpAcpExecutor(options: OmpAcpExecutorOptions = {}): OmpAc
     }
     await persistState();
 
-    const issueId = typeof ctx.context.taskId === "string" ? ctx.context.taskId : "";
+    // A real issue id only: a non-issue wake (a chat wake carries
+    // `taskId: "chat-1"`) would 404 every work-product POST while the run
+    // reports success, so those runs post nothing at all.
+    const issueId = resolveWorkProductIssueId(ctx.context ?? {});
     if (intel.usageReport && issueId) {
       const cfgEnv = (ctx.config.env ?? {}) as Record<string, unknown>;
       const brokerUrl = typeof cfgEnv.OMP_AUTH_BROKER_URL === "string" ? cfgEnv.OMP_AUTH_BROKER_URL : "";

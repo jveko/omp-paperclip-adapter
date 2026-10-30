@@ -32,6 +32,9 @@ vi.mock("@paperclipai/adapter-utils/acpx-engine/execute", () => ({
   createAcpxEngineExecutor: mocks.createAcpxEngineExecutor,
 }));
 
+/** Paperclip issue ids are UUIDs; only those runs may post work products. */
+const ISSUE_ID = "0b8f0d5e-9a10-4f6a-8f2b-1c2d3e4f5a6b";
+
 function baseCtx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecutionContext {
   return {
     runId: "run-1",
@@ -91,7 +94,7 @@ describe("side-channel env threading", () => {
     const ctx = baseCtx({
       config: { command: "omp", sessionBrowser: true, ...BROKER_ENV },
     });
-    ctx.context.taskId = "issue-1";
+    ctx.context.taskId = ISSUE_ID;
     await run(ctx);
     expect(mocks.queryOmpSessions).toHaveBeenCalledTimes(1);
     const ompArg = mocks.queryOmpSessions.mock.calls[0][0] as { env?: Record<string, string> };
@@ -155,7 +158,7 @@ describe("side-channel env threading", () => {
         env: { OMP_AUTH_BROKER_URL: "http://b:8765", OMP_AUTH_BROKER_TOKEN: "tok" },
       },
     });
-    ctx.context.taskId = "issue-1";
+    ctx.context.taskId = ISSUE_ID;
     await createOmpAcpExecutor()(ctx);
     const expected = ompAgentDir("co-1", "agent-1");
     const forkArg = mocks.forkOmpSession.mock.calls[0][0] as { env?: Record<string, string> };

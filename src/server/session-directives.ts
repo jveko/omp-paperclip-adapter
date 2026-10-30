@@ -290,8 +290,31 @@ export function paperclipApiBase(env: NodeJS.ProcessEnv = process.env): string {
   return `http://${host}:${port}`;
 }
 
+const ISSUE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The issue a work product can be posted to, or null. Paperclip issues are
+ * UUIDs; a run's `taskId` is also set on non-issue wakes (a chat wake carries
+ * `chat-1`), and POSTing there is a guaranteed 404 on the run path. Both
+ * `issueId` and `taskId` are canonicalized to the issue UUID by the queue when
+ * one exists, so shape is the reliable discriminator the adapter can see.
+ */
+export function resolveWorkProductIssueId(context: Record<string, unknown>): string | null {
+  for (const candidate of [context.issueId, context.taskId]) {
+    if (typeof candidate === "string" && ISSUE_ID_PATTERN.test(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * POST one work product to the issue's board. One attempt: no retry (the run
+ * path must not amplify a failing control plane), and a bounded wait so a
+ * hung endpoint cannot hold a finished heartbeat open.
+ */
 export async function postWorkProduct(
-  deps: { authToken?: string; issueId: string; apiBase?: string; fetchImpl?: typeof fetch },
+  deps: {
+    authToken?: string; issueId: string; apiBase?: string; fetchImpl?: typeof fetch; timeoutMs?: number;
+  },
   payload: WorkProductPayload,
 ): Promise<{ ok: boolean; error?: string }> {
   if (!deps.issueId) return { ok: false, error: "no issue id on this run" };
@@ -302,6 +325,7 @@ export async function postWorkProduct(
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${deps.authToken}` },
       body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(deps.timeoutMs ?? 10_000),
     });
     if (!response.ok) {
       return { ok: false, error: `work-product POST failed: HTTP ${response.status}` };

@@ -81,6 +81,9 @@ function fakeEngine(result: Record<string, unknown>) {
   return executor;
 }
 
+/** Paperclip issue ids are UUIDs; a run's taskId is only postable when it is one. */
+const ISSUE_ID = "0b8f0d5e-9a10-4f6a-8f2b-1c2d3e4f5a6b";
+
 function baseCtx(
   // `runtimeTools` is absent from the installed adapter-utils declaration (it
   // ships at contract HEAD), so the fixture surface declares it explicitly.
@@ -95,7 +98,7 @@ function baseCtx(
       sessionDisplayId: "old", taskKey: "t",
     },
     config: {},
-    context: { taskId: "issue-1" },
+    context: { taskId: ISSUE_ID },
     onLog: async () => {},
     onEvent: async () => {},
     ...overrides,
@@ -770,7 +773,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
         config: { command: `${process.execPath} ${fakeAcp}`, usageReport: false },
       });
       // first run: emits
-      ctx.context.taskId = "issue-1";
+      ctx.context.taskId = ISSUE_ID;
       vi.stubEnv("PAPERCLIP_API_URL", `http://127.0.0.1:${port}`);
       await run(ctx);
       expect(posts).toHaveLength(1);
@@ -805,7 +808,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
         authToken: "jwt",
         config: { command: `${process.execPath} ${fakeAcp}`, usageReport: false },
       });
-      ctx.context.taskId = "issue-1";
+      ctx.context.taskId = ISSUE_ID;
       vi.stubEnv("PAPERCLIP_API_URL", `http://127.0.0.1:${port}`);
       await run(ctx);
       expect(posts).toHaveLength(1);
@@ -853,7 +856,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
         config: { command: `${process.execPath} ${fakeAcp}`, usageReport: false },
         onEvent: async (ev: { message: string }) => { events.push(ev); },
       });
-      ctx.context.taskId = "issue-1";
+      ctx.context.taskId = ISSUE_ID;
       vi.stubEnv("PAPERCLIP_API_URL", `http://127.0.0.1:${port}`);
       // fake-acp fails session/list -> queryOmpSessions fails.
       vi.stubEnv("FAKE_ACP_MODE", "listerror");
@@ -898,7 +901,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
         config: { command: `${process.execPath} ${fakeAcp}`, usageReport: false },
         onEvent: async (ev: { message: string }) => { events.push(ev); },
       });
-      ctx.context.taskId = "issue-1";
+      ctx.context.taskId = ISSUE_ID;
       vi.stubEnv("PAPERCLIP_API_URL", `http://127.0.0.1:${port}`);
       // First run: POST fails with HTTP 500.
       await run(ctx);
@@ -945,7 +948,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
         authToken: "jwt",
         config: { command: `${process.execPath} ${fakeAcp}`, usageReport: true, sessionBrowser: false },
       });
-      ctx.context.taskId = "issue-1";
+      ctx.context.taskId = ISSUE_ID;
       vi.stubEnv("PAPERCLIP_API_URL", `http://127.0.0.1:${port}`);
       await run(ctx);
       const usagePosts = () => posts.filter((p) => (p.body as { provider?: string } | null)?.provider === "omp-usage");
@@ -982,7 +985,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
           usageReport: true, sessionBrowser: false,
           env: { OMP_AUTH_BROKER_URL: `http://127.0.0.1:${port}`, OMP_AUTH_BROKER_TOKEN: "tok" } },
       });
-      ctx.context.taskId = "issue-1";
+      ctx.context.taskId = ISSUE_ID;
       vi.stubEnv("PAPERCLIP_API_URL", `http://127.0.0.1:${port}`);
       await run(ctx);
       // fetchBrokerUsage is only invoked in broker mode: even with broker env
@@ -1024,7 +1027,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
         config: { command: `${process.execPath} ${fakeAcp}`, model: "prov/m", credentialMode: "local", usageReport: true, sessionBrowser: false },
         onEvent: async (ev: { message: string }) => { events.push(ev); },
       });
-      ctx.context.taskId = "issue-1";
+      ctx.context.taskId = ISSUE_ID;
       vi.stubEnv("PAPERCLIP_API_URL", `http://127.0.0.1:${port}`);
       await run(ctx);
       expect(executorFn).toHaveBeenCalledOnce();
@@ -1065,7 +1068,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
         authToken: "jwt",
         config: { command: `${process.execPath} ${fakeAcp}`, model: "prov/m", credentialMode: "local", usageReport: true, sessionBrowser: false },
       });
-      ctx.context.taskId = "issue-1";
+      ctx.context.taskId = ISSUE_ID;
       vi.stubEnv("PAPERCLIP_API_URL", `http://127.0.0.1:${port}`);
       // run 1: emits a cost card ($ + /heartbeat est.)
       fakeEngine({ exitCode: 0, usage: { inputTokens: 1000, outputTokens: 100, cachedInputTokens: 500 }, usageBasis: "per_run", sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
@@ -1088,6 +1091,40 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
       await createOmpAcpExecutor()(ctx);
       const after = (await loadState(sessionIntelDir("co-1", "agent-1"))).recentRuns.length;
       expect(after).toBe(before);
+    } finally {
+      server.close();
+      server.closeAllConnections();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("posts nothing from a non-issue wake instead of 404ing on the run path", async () => {
+    const posts: string[] = [];
+    const server = http.createServer((req, res) => {
+      posts.push(req.url ?? "");
+      res.setHeader("content-type", "application/json");
+      res.end("{}");
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const addr = server.address();
+    const port = typeof addr === "object" && addr !== null && "port" in addr ? addr.port : 0;
+    try {
+      const events: Array<{ level?: string; message?: string }> = [];
+      const ctx = baseCtx({
+        authToken: "jwt",
+        config: { command: `${process.execPath} ${fakeAcp}`, usageReport: true, sessionBrowser: true },
+        onEvent: async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); },
+      });
+      // A chat wake: taskId is not an issue id, so no board endpoint exists.
+      ctx.context.taskId = "chat-1";
+      vi.stubEnv("PAPERCLIP_API_URL", `http://127.0.0.1:${port}`);
+      fakeEngine({
+        exitCode: 0, usage: { inputTokens: 1000, outputTokens: 100 }, usageBasis: "per_run",
+        sessionParams: { acpSessionId: "s", sessionKey: "sk" },
+      });
+      await createOmpAcpExecutor()(ctx);
+      expect(posts).toEqual([]);
+      expect(events.some((e) => /emission failed/.test(e.message ?? ""))).toBe(false);
     } finally {
       server.close();
       server.closeAllConnections();

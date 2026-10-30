@@ -182,7 +182,7 @@ describe("paperclipApiBase", () => {
   });
 });
 import http from "node:http";
-import { buildSessionSnapshotWorkProduct, postWorkProduct } from "./session-directives.js";
+import { buildSessionSnapshotWorkProduct, postWorkProduct, resolveWorkProductIssueId } from "./session-directives.js";
 
 describe("buildSessionSnapshotWorkProduct", () => {
   it("shapes an artifact card with provider omp-session and snapshot metadata", () => {
@@ -308,6 +308,50 @@ describe("postWorkProduct", () => {
       { type: "artifact", provider: "omp-session", title: "t", summary: "s", metadata: {} },
     );
     expect(out).toEqual({ ok: false, error: "no run auth token available" });
+  });
+
+  it("gives up on a hung endpoint instead of blocking the run path forever", async () => {
+    let aborted = false;
+    const out = await postWorkProduct(
+      {
+        authToken: "run-jwt",
+        issueId: "0b8f0d5e-9a10-4f6a-8f2b-1c2d3e4f5a6b",
+        apiBase: "http://127.0.0.1:9",
+        timeoutMs: 20,
+        fetchImpl: (_url, init) => new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            aborted = true;
+            reject(init.signal?.reason);
+          });
+        }),
+      },
+      { type: "artifact", provider: "omp-session", title: "t", summary: "s", metadata: {} },
+    );
+    expect(aborted).toBe(true);
+    expect(out.ok).toBe(false);
+    expect(out.error).toContain("work-product POST failed");
+  });
+});
+
+describe("resolveWorkProductIssueId", () => {
+  const issue = "0b8f0d5e-9a10-4f6a-8f2b-1c2d3e4f5a6b";
+
+  it("accepts a UUID issue id and prefers it over taskId", () => {
+    expect(resolveWorkProductIssueId({ issueId: issue, taskId: "chat-1" })).toBe(issue);
+  });
+
+  it("accepts a UUID taskId when the run has no issueId", () => {
+    expect(resolveWorkProductIssueId({ taskId: issue })).toBe(issue);
+  });
+
+  it("rejects a non-issue wake id so the run makes no doomed POST", () => {
+    expect(resolveWorkProductIssueId({ taskId: "chat-1" })).toBeNull();
+  });
+
+  it("rejects an empty or non-string id", () => {
+    expect(resolveWorkProductIssueId({})).toBeNull();
+    expect(resolveWorkProductIssueId({ issueId: 42 })).toBeNull();
+    expect(resolveWorkProductIssueId({ issueId: "" })).toBeNull();
   });
 });
 
