@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.10.1 — 2026-10-30
+
+Compatibility with omp 18.14.0, released two days after 0.10.0.
+
+- **Tested set is a range** — 18.13.x (live-verified) and 18.14.x (source-audited) both pass the
+  environment gate; anything outside errors with the same message. Peer range is
+  `>=18.13.0 <18.15.0`, and the upgrade-contract test now keeps the set contiguous and in sync with
+  the peer bounds instead of pinning one minor.
+- **Provider-qualified selectors are validated** — 18.14 resolves anything containing `/` exactly, so
+  a near-match `model` now fails and a near-match `fallbackChain` leg is silently skipped. The adapter
+  resolves slash values against `omp models ls --json` and refuses an unresolved one on the run path
+  and in `testEnvironment` (`omp_config_error`); bare selectors keep omp's fuzzy matching; an
+  unreadable catalog degrades to pass-through with a warning. A resolved selector is canonicalized to
+  `provider/id` because ACP's `set_config_option` is byte-exact.
+
+Honest limit: 18.14.x was audited against the release and its two relevant changes, not executed on
+this host — the installed binary here is 18.13.1.
+
 ## 0.10.0 — 2026-10-30
 
 Model control and failover. Both are config-seam work: the levers existed in omp, the adapter was
