@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.13.0 — 2026-10-30
+
+Subagent observability on the managed lane. The engine lane is untouched: no subscription, no
+`omp.subagent` events, no `resultJson.subagents`.
+
+- **`subagentObservability: "off" | "summary" | "events"`** — default `summary`; an unknown value is a
+  typed `omp_config_error` at the existing fail-closed gate, in both lanes. It maps to omp's RPC
+  subscription (`summary → progress`, `events → events`, `off → off`) and is re-sent on every run, after
+  session open and before `prompt`, so a warm worker cannot inherit a previous run's level. A failed
+  subscription warns and fails safe to `off`.
+- **`omp.subagent` run events** — bounded payload only (`id`, `index`, `agent`, `status`, `description`,
+  `parentToolCallId`, `lastUpdate`, and at `events` level a truncated event summary). No prompt text, tool
+  arguments, tokens or transcripts; strings are capped and the per-run frame count is capped.
+- **Settlement snapshot** — `resultJson.subagents` = `{ total, completed, failed, cancelled, running,
+  items }` (items capped at 50), present only when the run observed subagent activity or the config asked
+  for observability. Evidence is scoped to the run's own observations, not the session's history.
+
+Honest limits: there is no Paperclip UI contract for subagent trees yet, so this ships data and events
+only; cancelling or steering an individual subagent is still a follow-up; engine mode has no subagent
+surface and reports the config key as inert.
+
 ## 0.12.0 — 2026-10-30
 
 The managed lane. A per-instance host supervisor now owns `omp` processes, sessions and evidence; the

@@ -30,7 +30,7 @@ v1.0 cut**.
 |---|---|---|
 | v0.11 | **shipped in 0.11.0**: four behaviour-preserving cuts (ACP client extraction, side-channel port, one overlay writer, executor split) | identical behaviour, cycles 0, largest file ≤300 |
 | v0.12 | **shipped in 0.12.0** (opt-in): supervisor, RPC worker with warm reuse, host-tool delivery, run ledger + run lease, steering flag; `engine` remains the default | two heartbeats → one worker, one `open_session`; `kill -9` leaves no orphan |
-| v0.13 | steering, subagent surface, engine lane demoted (deprecation event), compensations deleted | `acpx-engine` confined to one file |
+| v0.13 | **shipped in 0.13.0**: subagent observability on the managed lane (bounded events + settlement snapshot); engine lane untouched | redaction fixture proves no credential or prompt text; engine mode emits nothing |
 | v0.14 | adapter-utils reduced to `server-utils` + types, conformance harness in CI, capability probes replace the version pin | `grep acpx-engine src/` empty on the default path |
 
 Non-negotiables: `executionMode: "engine"` reproduces v0.10 byte-for-byte and is the rollback; the
@@ -306,6 +306,12 @@ covered by tests.
 *Historical entries are preserved as written. Where an entry states a blocker that the
 2026-10-30 assessment resolved (for example the "resume fingerprint instability"), the
 assessment above supersedes it.*
+
+- **2026-10-30 — v0.13.0 (Subagent observability).** `subagentObservability` (`off|summary|events`,
+  default `summary`, typed refusal for typos) maps to omp's RPC subscription, is re-sent per run so a
+  warm worker cannot inherit a level, streams bounded `omp.subagent` events and writes a capped
+  `resultJson.subagents` snapshot scoped to the run's own observations. Redaction proven by a fixture
+  carrying a real JWT. 776 tests + the opt-in 60 s warm test (36/36).
 
 - **2026-10-30 — v0.12.0 (Managed lane).** Per-instance `omp-host` supervisor (Unix-socket JSONL v1,
   ledger, run lease, capacity, reconciliation, CLI + `dist/omp-host.js`), RPC run worker with warm reuse
