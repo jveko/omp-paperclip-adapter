@@ -14,15 +14,6 @@ export interface OmpProjectInfo {
   lastActivityAt: string | null;
   lastTitle: string | null;
 }
-export interface OmpSubagentInfo {
-  id: string;
-  index: number | null;
-  agent: string;
-  status: string | null;
-  description: string | null;
-  parentToolCallId: string | null;
-  lastUpdate: number | null;
-}
 /**
  * The session landscape for ONE workspace. Every read that produced it is
  * scoped to the run's cwd, so this type can never carry another tenant's
@@ -36,15 +27,6 @@ export interface OmpSessionsSnapshot {
   total: number | null;
   /** omp paged the listing (session/list page size 50): more sessions exist. */
   truncated: boolean;
-  /**
-   * Subagents spawned by this run's session, present when omp answers
-   * `_omp/subagents` — the probe rides every query, not the diagnostic switch,
-   * because it describes this run rather than the host. omp's ACP mode has no
-   * subagent bridge today (see docs/upstream/omp-acp-subagent-bridge.md), so in
-   * practice this is absent; an empty array means the method answered and the
-   * tree is empty.
-   */
-  subagents?: OmpSubagentInfo[];
 }
 /**
  * What the operator-gated diagnostic is allowed to publish: counts, never ids,
@@ -116,34 +98,6 @@ function projectBuckets(sessions: OmpSessionInfo[]): OmpProjectInfo[] {
 }
 
 /**
- * Mirror of omp's `RpcSubagentSnapshot` (modes/rpc/rpc-types.ts), reduced to the
- * fields a board summary needs. Unknown/omitted fields become null rather than
- * being passed through, so the work product shape stays stable across omp
- * versions. Entries without an id carry no observable meaning and are dropped.
- */
-function parseSubagent(raw: unknown): OmpSubagentInfo | null {
-  if (typeof raw !== "object" || raw === null) return null;
-  const r = raw as Record<string, unknown>;
-  const id = typeof r.id === "string" ? r.id : null;
-  if (!id) return null;
-  return {
-    id,
-    index: typeof r.index === "number" ? r.index : null,
-    agent: typeof r.agent === "string" ? r.agent : "",
-    status: typeof r.status === "string" ? r.status : null,
-    description: typeof r.description === "string" ? r.description : null,
-    parentToolCallId: typeof r.parentToolCallId === "string" ? r.parentToolCallId : null,
-    lastUpdate: typeof r.lastUpdate === "number" ? r.lastUpdate : null,
-  };
-}
-
-function parseSubagents(value: unknown): OmpSubagentInfo[] {
-  return Array.isArray(value)
-    ? value.map(parseSubagent).filter((s): s is OmpSubagentInfo => s !== null)
-    : [];
-}
-
-/**
  * Read the run's own session landscape over an initialize-only ACP side
  * channel. Never sends session/new: session/list reads persisted state and
  * needs no session, while session/new always persists a new record that would
@@ -169,12 +123,6 @@ export async function queryOmpSessions(
 ): Promise<OmpQueryResult> {
   const requests: AcpFrameRequest[] = [
     { method: "session/list", params: { cwd: opts.cwd } },
-    // A capability probe for THIS run's own session, not a listing: it is what
-    // the snapshot card reports as the subagent tree, so it stays on the default
-    // path. omp answers it only on versions that implement it (an unimplemented
-    // `_omp/*` method is an immediate JSON-RPC error, never a hang), which
-    // costs one round-trip and cannot starve the required read.
-    { method: "_omp/subagents", params: {} },
   ];
   if (opts.diagnostic) {
     // Host-wide reads, gated behind the operator switch. Their results are
@@ -203,12 +151,6 @@ export async function queryOmpSessions(
     total: truncated ? null : sessions.length,
     truncated,
   };
-  // The subagent frame is a capability probe, never a requirement: an omp that
-  // does not implement it leaves the snapshot exactly as it was.
-  const subagentsResponse = byMethod.get("_omp/subagents");
-  if (!subagentsResponse?.error && Array.isArray(subagentsResponse?.result?.subagents)) {
-    snapshot.subagents = parseSubagents(subagentsResponse.result.subagents);
-  }
   if (!opts.diagnostic) return { ok: true, snapshot };
   const listAll = byMethod.get("_omp/sessions/listAll");
   const projects = byMethod.get("_omp/projects/list");

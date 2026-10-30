@@ -788,52 +788,6 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     }
   });
 
-  it("re-posts the snapshot card when only the subagent tree changed", async () => {
-    const posts: Array<{ url: string; body: unknown }> = [];
-    const server = http.createServer((req, res) => {
-      let body = "";
-      req.on("data", (c) => { body += c; });
-      req.on("end", () => {
-        posts.push({ url: req.url ?? "", body: JSON.parse(body) });
-        res.end(JSON.stringify({ id: "wp" }));
-      });
-    });
-    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
-    const addr = server.address();
-    const port = typeof addr === "object" && addr !== null && "port" in addr ? addr.port : 0;
-    try {
-      fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "sess-b", sessionKey: "sk" } });
-      const run = createOmpAcpExecutor();
-      const ctx = baseCtx({
-        authToken: "jwt",
-        config: { command: `${process.execPath} ${fakeAcp}`, usageReport: false },
-      });
-      ctx.context.taskId = ISSUE_ID;
-      vi.stubEnv("PAPERCLIP_API_URL", `http://127.0.0.1:${port}`);
-      await run(ctx);
-      expect(posts).toHaveLength(1);
-      // Same projects, same sessions, same current id: only `_omp/subagents`
-      // now answers. The card renders that tree, so it must be re-posted.
-      vi.stubEnv("FAKE_ACP_MODE", "subagents");
-      await run(ctx);
-      expect(posts).toHaveLength(2);
-      expect(posts[1].body).toMatchObject({
-        metadata: {
-          subagents: expect.arrayContaining([
-            expect.objectContaining({ id: "sub-1", agent: "scout", status: "running" }),
-          ]),
-        },
-      });
-      // An unchanged tree is suppressed again: the key is stable, not noisy.
-      await run(ctx);
-      expect(posts).toHaveLength(2);
-    } finally {
-      server.close();
-      server.closeAllConnections();
-      vi.unstubAllEnvs();
-    }
-  });
-
   it("snapshot query failure: run succeeds, warn emitted, no work product POST", async () => {
     const posts: Array<{ url: string; body: unknown }> = [];
     const server = http.createServer((req, res) => {

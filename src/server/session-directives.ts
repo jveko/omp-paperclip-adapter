@@ -245,10 +245,6 @@ export function buildSessionSnapshotWorkProduct(
       sessions: snapshot.sessions,
       total: snapshot.total,
       truncated: snapshot.truncated,
-      // Omitted, not empty, when omp's ACP mode has no subagent surface, so a
-      // card from an older/newer omp is byte-identical to one from before the
-      // field existed.
-      ...(snapshot.subagents ? { subagents: snapshot.subagents } : {}),
       currentSessionId: context.currentSessionId,
       capturedAt: context.capturedAt,
       runId: context.runId,
@@ -258,26 +254,17 @@ export function buildSessionSnapshotWorkProduct(
 
 /**
  * The landscape the session-snapshot card dedups on: exactly what the card
- * renders, so a change the board would see can never compare equal.
- *
- * `subagents` is part of it because the card carries the tree — an update to it
- * with an otherwise identical session list is still new information. When omp
- * answers no `_omp/subagents` the value is `undefined`, which `JSON.stringify`
- * drops, so today's engines (no subagent bridge) hash to the same bytes they
- * did before the field existed and no card is re-posted for it. Key order is
- * fixed by the projection, never by omp's payload.
+ * renders, so a change the board would see can never compare equal. Key order
+ * is fixed by this projection, never by omp's payload.
  */
 export function sessionSnapshotDigestInput(
-  snapshot: Pick<OmpSessionsSnapshot, "projects" | "sessions" | "subagents">,
+  snapshot: Pick<OmpSessionsSnapshot, "projects" | "sessions">,
   current: string | null,
 ): Record<string, unknown> {
   return {
     projects: snapshot.projects,
     ids: snapshot.sessions.map((s) => [s.sessionId, s.updatedAt]),
     current,
-    subagents: snapshot.subagents?.map((s) => [
-      s.id, s.index, s.agent, s.status, s.description, s.parentToolCallId, s.lastUpdate,
-    ]),
   };
 }
 export function paperclipApiBase(env: NodeJS.ProcessEnv = process.env): string {

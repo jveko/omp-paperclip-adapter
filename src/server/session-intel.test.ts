@@ -60,8 +60,8 @@ describe("queryOmpSessions", () => {
     expect(snapshot.projects).toEqual([
       { cwd: "/workspace", sessionCount: 2, lastActivityAt: "2026-08-28T01:00:00Z", lastTitle: "Second" },
     ]);
-    // session/list plus the run-scoped subagent probe; no host-wide frame.
-    expect(seen).toEqual(["initialize", "session/list", "_omp/subagents"]);
+    // The cwd-scoped listing is the whole read; no other ACP frame is paid for.
+    expect(seen).toEqual(["initialize", "session/list"]);
     expect(seen.some((m) => m === "_omp/sessions/listAll" || m === "_omp/projects/list")).toBe(false);
   }, 15_000);
 
@@ -98,37 +98,6 @@ describe("queryOmpSessions", () => {
     expect(snapshot.sessions).toHaveLength(2);
     if (!out.ok) throw new Error("expected a snapshot");
     expect(out.hostDiagnostic?.error).toContain("ext boom");
-  }, 15_000);
-
-  it("parses a subagent summary when omp implements _omp/subagents", async () => {
-    const { out } = await queryWithSeen({ cwd: "/w", diagnostic: true }, "subagents");
-    expect(okSnapshot(out).subagents).toEqual([
-      {
-        id: "sub-1", index: 0, agent: "scout", status: "running",
-        description: "map the repo", parentToolCallId: "tool-call-1", lastUpdate: 1756368000000,
-      },
-      {
-        id: "sub-2", index: 1, agent: "task", status: "completed",
-        description: null, parentToolCallId: "tool-call-2", lastUpdate: 1756368060000,
-      },
-    ]);
-  }, 15_000);
-
-  it("keeps an empty subagent list as evidence the run has no subagents", async () => {
-    const { out } = await queryWithSeen({ cwd: "/w", diagnostic: true }, "subagentsnone");
-    expect(okSnapshot(out).subagents).toEqual([]);
-  }, 15_000);
-
-  it("treats a non-array subagent payload as absent rather than an error", async () => {
-    const { out } = await queryWithSeen({ cwd: "/w", diagnostic: true }, "subagentsjunk");
-    expect("subagents" in okSnapshot(out)).toBe(false);
-  }, 15_000);
-
-  it("still reports the run's own subagent tree without the diagnostic switch", async () => {
-    // The subagent probe describes THIS run's session, not the host, so the
-    // containment switch does not gate it.
-    const { out } = await queryWithSeen({ cwd: "/w" }, "subagents");
-    expect(okSnapshot(out).subagents?.[0]).toMatchObject({ id: "sub-1", agent: "scout" });
   }, 15_000);
 });
 

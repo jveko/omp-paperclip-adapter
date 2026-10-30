@@ -204,25 +204,6 @@ describe("buildSessionSnapshotWorkProduct", () => {
     expect(wp.summary).toContain("sess-a");
     expect(wp.metadata).toMatchObject({ currentSessionId: "sess-b", runId: "run-1" });
   });
-  it("carries subagents into metadata only when the snapshot has them", () => {
-    const base = {
-      projects: [], sessions: [], total: 0, truncated: false,
-    };
-    const context = { currentSessionId: null, runId: "run-1", capturedAt: "2026-08-28T02:00:00Z" };
-    const withSubagents = buildSessionSnapshotWorkProduct(
-      {
-        ...base,
-        subagents: [{
-          id: "sub-1", index: 0, agent: "scout", status: "running",
-          description: "map the repo", parentToolCallId: "tool-call-1", lastUpdate: 1,
-        }],
-      },
-      context,
-    );
-    expect(withSubagents.metadata).toMatchObject({ subagents: [{ id: "sub-1", agent: "scout" }] });
-    const without = buildSessionSnapshotWorkProduct(base, context);
-    expect("subagents" in without.metadata).toBe(false);
-  });
   it("does not throw on an unparseable updatedAt and reports unknown time", () => {
     const wp = buildSessionSnapshotWorkProduct(
       {
@@ -356,20 +337,15 @@ describe("resolveWorkProductIssueId", () => {
 });
 
 describe("sessionSnapshotDigestInput", () => {
-  // P2-4 (v0.8 final review): the emission key hashed projects, session ids and
-  // the current session only. Once omp answers `_omp/subagents`, a subagent tree
-  // or status change with an otherwise untouched landscape compared equal, so
-  // the updated card was never posted and the board kept stale subagents.
   const projects = [{ cwd: "/w", sessionCount: 1, lastActivityAt: "u1", lastTitle: "T" }];
   const sessions = [{
     sessionId: "s1", cwd: "/w", title: "T", updatedAt: "u1", messageCount: 1, size: 1,
   }];
-  const subagent = {
-    id: "sub-1", index: 0, agent: "scout", status: "running",
-    description: "map the repo", parentToolCallId: "call-1", lastUpdate: 1,
-  };
 
-  it("hashes a snapshot with no subagents exactly as before the field existed", () => {
+  // The persisted `lastSnapshotDigest` values are the contract: a state file
+  // written by an earlier release must still compare equal after the dead
+  // subagent field was removed, so the projection stays exactly these keys.
+  it("hashes a snapshot exactly as the pre-subagent projection did", () => {
     const legacy = {
       projects,
       ids: sessions.map((s) => [s.sessionId, s.updatedAt]),
@@ -379,33 +355,13 @@ describe("sessionSnapshotDigestInput", () => {
       .toBe(createHash("sha256").update(JSON.stringify(legacy)).digest("hex").slice(0, 16));
   });
 
-  it("re-emits when only the subagent tree changes", () => {
-    const running = sessionSnapshotDigestInput({ projects, sessions, subagents: [subagent] }, "s1");
-    const done = sessionSnapshotDigestInput(
-      { projects, sessions, subagents: [{ ...subagent, status: "completed" }] },
+  it("re-emits when the session landscape changes", () => {
+    const before = sessionSnapshotDigestInput({ projects, sessions }, "s1");
+    const after = sessionSnapshotDigestInput(
+      { projects, sessions: [{ ...sessions[0], updatedAt: "u2" }] },
       "s1",
     );
-    expect(snapshotDigest(running)).not.toBe(snapshotDigest(done));
-  });
-
-  it("treats an answered-but-empty tree as a change from no answer, then dedups", () => {
-    const unanswered = sessionSnapshotDigestInput({ projects, sessions }, "s1");
-    const empty = sessionSnapshotDigestInput({ projects, sessions, subagents: [] }, "s1");
-    expect(snapshotDigest(unanswered)).not.toBe(snapshotDigest(empty));
-    expect(snapshotDigest(empty)).toBe(snapshotDigest({ ...empty }));
-  });
-
-  it("is insensitive to the payload's key order", () => {
-    const a = sessionSnapshotDigestInput({ projects, sessions, subagents: [subagent] }, "s1");
-    const b = sessionSnapshotDigestInput({
-      projects,
-      sessions,
-      subagents: [{
-        lastUpdate: 1, parentToolCallId: "call-1", description: "map the repo",
-        status: "running", agent: "scout", index: 0, id: "sub-1",
-      }],
-    }, "s1");
-    expect(snapshotDigest(a)).toBe(snapshotDigest(b));
+    expect(snapshotDigest(before)).not.toBe(snapshotDigest(after));
   });
 });
 
