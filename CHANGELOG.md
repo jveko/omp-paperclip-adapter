@@ -24,7 +24,8 @@ probe lane (`session/list`, `_omp/*`, `session/fork`, model discovery, environme
 
 | Metric | 0.14.1 | 0.15.0 |
 |---|---|---|
-| product LOC (`src/`, non-test) | ~10.4k | ~8.7k |
+| product LOC (`src/`, non-test) | 13,769 | 13,243 |
+| total `src/` TypeScript LOC (incl. tests) | 26,495 | 25,189 |
 | imports of `acpx-engine/execute` | 1 | **0** |
 | `executionMode` references | 20+ | **0** |
 | unit tests | 813 | 754 |
