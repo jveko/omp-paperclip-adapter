@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.15.0 — 2026-10-31
+
+One lane. The adapter has never been deployed, so the engine rollback had no user to protect and the
+split is gone: **every run goes through the `omp-host` supervisor over RPC**. ACP survives only as the
+probe lane (`session/list`, `_omp/*`, `session/fork`, model discovery, environment probe).
+
+- **Deleted:** `adapters/acp/engine.ts` (the lazy `createAcpxEngineExecutor` loader), the engine branch
+  of the run plan, `buildOmpAcpConfig` and the `DEFAULT_ACP_ENGINE_*` translation, `executionMode` from
+  the schema/docs, the adapter-side lease wrapper (the supervisor owns the session lease; a second
+  holder made every run refuse its own lease), and `retry.ts` with its `acpx_*` error taxonomy (managed
+  runs already disabled it — `run.begin` is idempotent and the supervisor falls back to a fresh
+  session).
+- **Engine-only tests removed** with their fixtures: warm-handle settlement, the engine conformance
+  lane and its golden. Tests that guarded live contracts through the engine stub were repointed at the
+  transport seam, not deleted: side-channel env threading, failover degradation, capability-cache
+  parity.
+- **Result shape change:** `retryChain` and `sessionRuntime.mcpServerCount` can no longer be produced
+  (neither could occur on the managed lane); `run.begin.cell.approval` is `null` when `permissionMode`
+  is unset instead of the engine's injected `approve-all`. Everything else in the result, usage and
+  cost attribution is unchanged.
+- **Docs:** `executionMode` is gone; the supervisor is the run path.
+
+| Metric | 0.14.1 | 0.15.0 |
+|---|---|---|
+| product LOC (`src/`, non-test) | ~10.4k | ~8.7k |
+| imports of `acpx-engine/execute` | 1 | **0** |
+| `executionMode` references | 20+ | **0** |
+| unit tests | 813 | 754 |
+| conformance tests | 9 (two lanes) | 3 (one lane) |
+
+Gates: typecheck, unit, conformance, build (`dist/omp-host.js` 110 KB), the opt-in 60 s warm test
+(36/36), and a clean-clone `npm ci` → tests.
+
 ## 0.14.1 — 2026-10-30
 
 Install fix for 0.14.0. `@paperclipai/adapter-utils@2026.1023.0` carries a nested `esbuild@0.28.2`

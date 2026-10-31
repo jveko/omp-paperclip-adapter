@@ -23,19 +23,19 @@ The product is an **employee runtime**, not an adapter: a thin Paperclip adapter
 **host supervisor** that owns omp processes, sessions, leases, credential placement and a run ledger.
 The run lane moves to `omp --mode rpc` (warm workers, `set_host_tools`, explicit settlement,
 `get_session_stats`); ACP stays as the probe lane for `session/list`, `_omp/*`, `session/fork` and
-model discovery. The engine lane is demoted and then removed inside the v0.x line — **there is no
-v1.0 cut**.
+model discovery. The engine lane was removed inside the v0.x line — **there is no v1.0 cut**.
 
 | Release | Lands | Gate |
 |---|---|---|
 | v0.11 | **shipped in 0.11.0**: four behaviour-preserving cuts (ACP client extraction, side-channel port, one overlay writer, executor split) | identical behaviour, cycles 0, largest file ≤300 |
-| v0.12 | **shipped in 0.12.0** (opt-in): supervisor, RPC worker with warm reuse, host-tool delivery, run ledger + run lease, steering flag; `engine` remains the default | two heartbeats → one worker, one `open_session`; `kill -9` leaves no orphan |
-| v0.13 | **shipped in 0.13.0**: subagent observability on the managed lane (bounded events + settlement snapshot); engine lane untouched | redaction fixture proves no credential or prompt text; engine mode emits nothing |
-| v0.14 | **shipped in 0.14.0**: pin bump, three shim deletions, `errorFamily`/`retryNotBefore`, capability probes replace the minor gate, conformance project in CI | probe a capability-less fake → warn not crash; `acpx-engine` confined to `adapters/acp/` |
+| v0.12 | **shipped in 0.12.0**, superseded by 0.15.0: supervisor, RPC worker with warm reuse, host-tool delivery, run ledger + run lease, steering flag | two heartbeats → one worker, one `open_session`; `kill -9` leaves no orphan |
+| v0.13 | **shipped in 0.13.0**: subagent observability on the managed lane (bounded events + settlement snapshot) | redaction fixture proves no credential or prompt text |
+| v0.14 | **shipped in 0.14.0**: pin bump, three shim deletions, `errorFamily`/`retryNotBefore`, capability probes replace the minor gate, conformance project in CI | probe a capability-less fake → warn not crash |
+| v0.15 | **shipped in 0.15.0**: engine run path deleted; the supervisor is the only lane; `executionMode` gone | `acpx-engine/execute` and `executionMode` both unreachable from `src/` |
 
-Non-negotiables: `executionMode: "engine"` remains the rollback for the managed lane (it is no longer
-byte-identical to v0.10 as of 0.14.0, whose engine prompt template changed upstream); the bridge stays
-one self-contained bundle; no credential ever enters a warm worker's environment.
+Non-negotiables: one run path (the supervisor); rollback means reinstalling the previous release, not
+flipping a config key; the bridge stays one self-contained bundle; no credential ever enters a warm
+worker's environment.
 
 ---
 
@@ -307,6 +307,11 @@ covered by tests.
 *Historical entries are preserved as written. Where an entry states a blocker that the
 2026-10-30 assessment resolved (for example the "resume fingerprint instability"), the
 assessment above supersedes it.*
+
+- **2026-10-31 — v0.15.0 (Single lane).** Engine run path deleted: `adapters/acp/engine.ts`, the engine
+  branch of the run plan, `buildOmpAcpConfig`/`DEFAULT_ACP_ENGINE_*`, `executionMode`, the adapter-side
+  lease wrapper and `retry.ts` (engine error taxonomy). The supervisor is the only run path; ACP remains
+  the probe lane. −2,553 lines, 754 unit tests, 3 conformance tests on one lane, 60 s warm test green.
 
 - **2026-10-30 — v0.14.0 (Pin bump, probes, conformance).** `adapter-utils` 2026.1023.0; the
   `runtimeToolDelivery` and `RunCostFields` shims deleted; `errorFamily`/`retryNotBefore` first in retry
