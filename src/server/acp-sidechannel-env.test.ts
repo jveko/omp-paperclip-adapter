@@ -22,7 +22,7 @@ const mocks = vi.hoisted(() => ({
     ok: true,
     snapshot: { projects: [], sessions: [], total: 0, truncated: false },
   })),
-  createAcpxEngineExecutor: vi.fn(),
+  transport: vi.fn(),
 }));
 
 // The chain legs are provider-qualified, so the run resolves them against the
@@ -45,9 +45,11 @@ vi.mock("./session-intel.js", () => ({
   queryOmpSessions: mocks.queryOmpSessions,
 }));
 
-// Mocked at this package's loader seam, not the dependency's module id.
-vi.mock("./adapters/acp/engine.js", () => ({
-  loadAcpxEngineExecutor: async () => mocks.createAcpxEngineExecutor(),
+// Mocked at the composition root's transport seam, so the plan runs for real
+// and no supervisor is spawned.
+vi.mock("./run/host-transport.js", () => ({
+  createHostTransport: () => mocks.transport(),
+  lookupHostSessionCwd: async () => null,
 }));
 
 /** Paperclip issue ids are UUIDs; only those runs may post work products. */
@@ -84,7 +86,7 @@ describe("side-channel env threading", () => {
     await rm(tmpRoot, { recursive: true, force: true });
   });
   beforeEach(async () => {
-    mocks.createAcpxEngineExecutor.mockReset();
+    mocks.transport.mockReset();
     mocks.forkOmpSession.mockClear();
     mocks.queryOmpSessions.mockClear();
     vi.stubEnv("PAPERCLIP_HOME", tmpRoot);
@@ -94,7 +96,7 @@ describe("side-channel env threading", () => {
 
   it("forwards broker env into the fork side channel", async () => {
     const executor = vi.fn(async () => ({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } }));
-    mocks.createAcpxEngineExecutor.mockReturnValue(executor);
+    mocks.transport.mockReturnValue(executor);
     const run = createOmpAcpExecutor();
     await run(baseCtx({
       config: { command: "omp", sessionForkSourceId: "sess-a", sessionForkToken: "t1", ...BROKER_ENV },
@@ -107,7 +109,7 @@ describe("side-channel env threading", () => {
 
   it("forwards broker env into the session-query side channel", async () => {
     const executor = vi.fn(async () => ({ exitCode: 0, sessionParams: { acpSessionId: "s1", sessionKey: "sk" } }));
-    mocks.createAcpxEngineExecutor.mockReturnValue(executor);
+    mocks.transport.mockReturnValue(executor);
     const run = createOmpAcpExecutor();
     const ctx = baseCtx({
       config: { command: "omp", sessionBrowser: true, ...BROKER_ENV },
@@ -122,7 +124,7 @@ describe("side-channel env threading", () => {
 
   it("forwards the failover overlay (PI_CONFIG_FILES) into the fork side channel when fallbackChain is set", async () => {
     const executor = vi.fn(async () => ({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } }));
-    mocks.createAcpxEngineExecutor.mockReturnValue(executor);
+    mocks.transport.mockReturnValue(executor);
     const run = createOmpAcpExecutor();
     await run(baseCtx({
       config: { command: "omp", sessionForkSourceId: "sess-a", sessionForkToken: "t-overlay", fallbackChain: "brokerco/main\nbrokerco/fast" },
@@ -138,7 +140,7 @@ describe("side-channel env threading", () => {
     // channel would filter the model list the next run's complement is built
     // from. The run child still receives both overlays.
     const executor = vi.fn(async () => ({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } }));
-    mocks.createAcpxEngineExecutor.mockReturnValue(executor);
+    mocks.transport.mockReturnValue(executor);
     await createOmpAcpExecutor()(baseCtx({
       config: {
         command: "omp",
@@ -167,7 +169,7 @@ describe("side-channel env threading", () => {
 
   it("points both side channels at the fenced agent dir under sessionScope isolated", async () => {
     const executor = vi.fn(async () => ({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } }));
-    mocks.createAcpxEngineExecutor.mockReturnValue(executor);
+    mocks.transport.mockReturnValue(executor);
     const ctx = baseCtx({
       config: {
         command: "omp", sessionForkSourceId: "sess-a", sessionForkToken: "t-fence",

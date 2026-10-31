@@ -2,18 +2,13 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
-import {
-  DEFAULT_ACP_ENGINE_MODE,
-  DEFAULT_ACP_ENGINE_NON_INTERACTIVE_PERMISSIONS,
-  DEFAULT_ACP_ENGINE_PERMISSION_MODE,
-} from "@paperclipai/adapter-utils/acpx-engine/constants";
 import { isFreeCost, type OmpModelCost } from "../../models.js";
 import { validThinkingLevel } from "../../thinking-levels.js";
 
 /**
  * ACP launch vocabulary: the command line an omp child is started with, the
- * extension artifact that rides it, and the engine config derived from the run
- * plan. Pure decisions only — nothing here spawns, writes or reads run state.
+ * extension artifact that rides it, and the run-child config derived from the
+ * run plan. Pure decisions only — nothing here spawns, writes or reads run state.
  *
  * `acp.ts` re-exports this module's public names unchanged, so it stays the
  * package's public surface while `run/` can depend on the launch rules without
@@ -103,7 +98,7 @@ export function isGovernanceArmed(manifestPath: string | null, bridgePath: strin
  * assert: the file the child will be told to load (`--extension <file>`) exists
  * and can be opened. Whether omp's module loader then accepts it, and whether
  * the extension's `session_start` handler arms, is inside the child and is not
- * observable here — nothing in the ACP stream, the bridge, or the engine
+ * observable here — nothing in the run stream, the bridge, or the worker
  * reports a load result (the bridge registers handlers and never speaks).
  *
  * A miss here is fail-closed by design: the governance manifest was written,
@@ -144,8 +139,8 @@ export function resolveOmpAgentCommand(
     : "";
   // Every thinking level except `off` rides the run's settings overlay
   // (thinking-overlay.ts) as omp's `defaultThinkingLevel`. The flag is part of
-  // agentCommand, which the engine hashes into the session key, so a level
-  // there rotated the session on every edit. `off` is the exception: omp's
+  // agentCommand, which the worker's argv hash records, so keeping a level
+  // there would churn the worker identity on every edit. `off` is the exception: omp's
   // setting has no `off` value (it discards one and reads `high`), and the CLI
   // flag's `off` is the only way to ask for no thinking. Applies to the
   // explicit agentCommand too (skipped only when it already carries
@@ -156,12 +151,11 @@ export function resolveOmpAgentCommand(
 }
 
 /**
- * Resolve the cwd that session side channels (fork / query) must use, mirroring
- * the engine's precedence (execute.js:838-842). Side channels must query the
- * run's ACTUAL cwd: storedParams.cwd is the PREVIOUS run's persisted cwd and
- * goes stale on a workspace move (e.g. adopting git_worktree), whereas the
- * current run's authoritative cwd is resolved by the engine from
- * ctx.context.paperclipWorkspace + ctx.config.cwd.
+ * Resolve the cwd the run and its session side channels (fork / query) use.
+ * Side channels must query the run's ACTUAL cwd: storedParams.cwd is the
+ * PREVIOUS run's persisted cwd and goes stale on a workspace move (e.g.
+ * adopting git_worktree), whereas the current run's authoritative cwd comes
+ * from ctx.context.paperclipWorkspace + ctx.config.cwd.
  */
 
 export function resolveSessionCwd(
@@ -170,7 +164,7 @@ export function resolveSessionCwd(
 ): string {
   const ws = (ctx.context?.paperclipWorkspace ?? {}) as { cwd?: string; source?: string };
   const configuredCwd = firstNonEmptyString(ctx.config.cwd) ?? "";
-  // engine: agent_home + a configured cwd overrides the workspace cwd
+  // agent_home: a configured cwd overrides the workspace cwd
   const effectiveWsCwd = ws.source === "agent_home" && configuredCwd ? "" : (ws.cwd ?? "");
   return effectiveWsCwd || configuredCwd
     || (typeof storedParams.cwd === "string" && storedParams.cwd)
@@ -178,8 +172,8 @@ export function resolveSessionCwd(
 }
 /**
  * Free/zero-cost preview tiers need long horizons (measured: >20 min for a
- * 45k-token context); priced models get the engine's default (no timeout,
- * sandbox 4h cap applies).
+ * 45k-token context); priced models carry no derived bound. The supervisor
+ * enforces the resulting deadline and sizes the session lease from it.
  */
 export function deriveDefaultTimeoutSec(cost: OmpModelCost | null | undefined): number {
   if (!cost) return 0;
@@ -187,77 +181,40 @@ export function deriveDefaultTimeoutSec(cost: OmpModelCost | null | undefined): 
 }
 
 /**
- * This adapter declares `supportsLocalAgentJwt: true` (../index.ts), so every
- * run carries a run-scoped Paperclip token, injected as `PAPERCLIP_API_KEY`.
- *
- * A reused child keeps the token of the run that spawned it (the engine writes
- * it into the environment only at spawn), so reusing a handle under run
- * identity would authenticate this run's work products and approval requests
- * as an EARLIER run — an audit-attribution error, not a slowdown.
- *
- * The engine no longer needs this adapter to prevent that. From 2026.1023.0 the
- * settlement sequence makes the reuse decision itself: the host-lane candidate
- * carries `liveRunScopedCredentials: ["paperclip-run-scoped-api-key"]` and
- * `decideReuse` answers `{ kind: "discard", reason: "run-scoped credential
- * still valid" }` (`acpx-engine/settlement-sequence.js`), so a clean turn
- * close-and-relaunches rather than transferring the warm handle. The sandbox
- * lane saves only its staged files, which carry no credential.
- *
- * `buildOmpAcpConfig` therefore passes the operator's `warmHandleIdleMs`
- * through instead of overwriting it: the setting is honoured by the engine, and
- * the gate — not this adapter — is what keeps a credential-carrying handle from
- * being reused. `adapters/acp/warm-handle-settlement.test.ts` asserts the
- * discard against the real engine. The fork branch still re-pins 50 ms for its
- * own single run, which is what makes that run's handle savable at all.
+ * This adapter declares `supportsLocalAgentJwt: true` (../../index.ts), so every
+ * run carries a run-scoped Paperclip token. It travels to the supervisor in the
+ * run's `credentials` frame and from there into the run-context file; it is
+ * never placed in a live worker's environment (`buildWorkerEnv` strips it), so a
+ * warm worker cannot speak for an earlier run. The flag is what mints the token
+ * the session-snapshot and usage work products and the bridge's approval
+ * round-trip authenticate with.
  */
 export const RUN_IDENTITY_ENABLED = true;
 
 /**
- * The operator's warm-handle idle window. `warmHandleIdleMs` is the engine's
- * own key; `acpWarmHandleIdleMs` is this adapter's alias. Anything that is not
- * a positive finite number means "close each turn", which is also the engine's
- * default.
+ * Derive the run-child config the supervisor launches: the command line the
+ * worker runs (already carrying `--extension` and, for `off`, `--thinking`), the
+ * model as the catalog spells it, the run's deadline, and the env the worker may
+ * inherit.
+ *
+ * `resolveModel` normalizes the raw model ref (the raw value passes through when
+ * it returns null); `resolveCost` receives the NORMALIZED model id and feeds the
+ * deadline derivation when no timeout is configured. The broker env is stripped
+ * unless `credentialMode` selects the broker: binding the env alone must not
+ * switch a run child into broker mode, and the side channels (`ompEnv`) apply
+ * the same gate.
  */
-export function configuredWarmHandleIdleMs(config: Record<string, unknown>): number {
-  const raw = config.warmHandleIdleMs ?? config.acpWarmHandleIdleMs;
-  const value = typeof raw === "number"
-    ? raw
-    : typeof raw === "string" && raw.trim() !== ""
-      ? Number(raw)
-      : 0;
-  return Number.isFinite(value) && value > 0 ? value : 0;
-}
-
-/**
- * Build the ACP engine config for a run. `resolveModel` normalizes the raw
- * model ref (the raw value passes through when it returns null).
- * `resolveCost` receives the NORMALIZED model id and returns its cost card
- * (or null); it feeds timeout derivation when none is configured.
- */
-export function buildOmpAcpConfig(
+export function buildRunChildConfig(
   config: Record<string, unknown>,
+  bridge: string = bridgePath,
   resolveModel: (model: string) => string | null = () => null,
   resolveCost: (model: string) => OmpModelCost | null = () => null,
-  bridge: string = bridgePath,
 ): Record<string, unknown> {
   const rawModel = firstNonEmptyString(config.model);
   const model = rawModel ? (resolveModel(rawModel) ?? rawModel) : undefined;
   const next: Record<string, unknown> = {
     ...config,
-    agent: "custom",
     agentCommand: resolveOmpAgentCommand(config, bridge),
-    mode: firstNonEmptyString(config.mode, config.acpMode) ?? DEFAULT_ACP_ENGINE_MODE,
-    permissionMode:
-      firstNonEmptyString(config.permissionMode, config.acpPermissionMode) ??
-      DEFAULT_ACP_ENGINE_PERMISSION_MODE,
-    nonInteractivePermissions:
-      firstNonEmptyString(config.nonInteractivePermissions, config.acpNonInteractivePermissions) ??
-      DEFAULT_ACP_ENGINE_NON_INTERACTIVE_PERMISSIONS,
-    // Passed through, not pinned: the engine's settlement gate discards a
-    // handle that still carries this run's credential (see
-    // RUN_IDENTITY_ENABLED above). Normalized so the alias and string forms
-    // reach the engine as one number.
-    warmHandleIdleMs: configuredWarmHandleIdleMs(config),
   };
   if (model) next.model = model;
   // timeoutSec is numeric — firstNonEmptyString would drop it. Coerce once:
@@ -276,21 +233,6 @@ export function buildOmpAcpConfig(
   } else if (timeoutSec !== undefined) {
     next.timeoutSec = timeoutSec;
   }
-  const stateDir = firstNonEmptyString(config.stateDir, config.acpStateDir);
-  if (stateDir) next.stateDir = stateDir;
-  // omp exposes `thinking` via its own ACP session option; the shared engine's
-  // effort control-key wiring is unverified for custom agents, so never send it.
-  // The engine reads all four of these keys (execute.js:613-618) and forwards any
-  // value as `key: "effort"`, which omp rejects — strip every one of them.
-  delete next.effort;
-  delete next.thinkingEffort;
-  delete next.reasoningEffort;
-  delete next.modelReasoningEffort;
-  // credentialMode is the single switch that decides whether the auth broker is
-  // in play: binding broker env without selecting broker mode does NOT silently
-  // enable broker for the run child. The run's ACP child (this config.env) must
-  // agree with the ompEnv-gated side channels, which forward broker env only in
-  // broker mode — so strip it here (on a copy, never mutating ctx.config.env).
   if (config.credentialMode !== "broker") {
     const srcEnv = (config.env ?? {}) as Record<string, unknown>;
     if (typeof srcEnv.OMP_AUTH_BROKER_URL === "string" || typeof srcEnv.OMP_AUTH_BROKER_TOKEN === "string") {

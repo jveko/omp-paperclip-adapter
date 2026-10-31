@@ -86,7 +86,6 @@ async function managedConfig(rpcMode: string, statsFile: string, logFile: string
     expectedDiagnostics: [],
   });
   return {
-    executionMode: "managed",
     command: build.script,
     env: { FAKE_RPC_MODE: rpcMode, FAKE_RPC_STATS: statsFile, FAKE_RPC_LOG: logFile },
   };

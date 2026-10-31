@@ -2,7 +2,7 @@ import type { AdapterExecutionResult, UsageSummary } from "@paperclipai/adapter-
 import type { OmpPricingStatus } from "./models.js";
 
 /**
- * The accounting fields this module fills are the engine result's own fields
+ * The accounting fields this module fills are the transport result's own fields
  * (picked, never re-declared): Paperclip's run-completion whitelist-copies
  * these names into the run's usage receipt, an unknown name would be dropped,
  * and a `usageByModel` whose sums do not match the run totals is discarded by

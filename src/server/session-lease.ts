@@ -5,19 +5,18 @@ import { createHash, randomUUID } from "node:crypto";
 /**
  * Per-session, cross-process exclusion for a run.
  *
- * The engine refuses to reuse a warm handle for a run that carries a
- * run-scoped credential (and this adapter pins reuse off), so consecutive
- * heartbeats are close-and-relaunch. Two overlapping runs of the SAME omp
- * session are then two processes writing one session file. omp does not
+ * Consecutive heartbeats for one session are serialized by this lease: two
+ * overlapping runs of the SAME omp session would be two processes writing one
+ * session file. omp does not
  * corrupt that file — the non-owner silently moves the session to a fresh
  * sibling id on its first write (`session/session-manager.ts` `#claimSession`)
  * — which is worse for an employee: the transcript forks invisibly and the
  * later writes land in a session the next heartbeat never resumes.
  *
- * The lease is the adapter's own mutual exclusion, under the agent's state dir
- * so every adapter process on the host sees it. A held lease fails the run
- * closed with `omp_session_lease_held`; there is no queue, because a heartbeat
- * that waits is a heartbeat that reports late.
+ * The lease is the supervisor's mutual exclusion, under the agent's state dir
+ * so every process on the host sees it. A held lease fails the run closed with
+ * `omp_session_lease_held`; there is no queue, because a heartbeat that waits
+ * is a heartbeat that reports late.
  */
 
 export const SESSION_LEASE_DIR = "leases";
@@ -53,6 +52,7 @@ export type SessionLease =
  * The key a run's lease is filed under: the engine's `sessionKey` when the run
  * resumes a persisted session (identical for every overlapping run of that
  * session), else an agent-scoped key so two first-ever runs still serialize.
+ * The supervisor and the transport derive it the same way.
  */
 export function sessionLeaseKey(
   agent: { companyId: string; id: string },

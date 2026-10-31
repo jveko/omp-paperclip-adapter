@@ -748,12 +748,12 @@ const DEGRADATION: Record<CapabilityId, {
     absent: {
       level: "info",
       code: "omp_cli_session_lease_missing",
-      message: "this omp build has no `session lease` verb; the adapter's own pid/TTL lease remains the only one-run-per-session guard (unchanged)",
+      message: "this omp build has no `session lease` verb; the supervisor's per-session lease remains the only one-run-per-session guard (unchanged)",
     },
     unknown: {
       level: "info",
       code: "omp_capability_unknown",
-      message: "`session lease` could not be probed; the adapter's own lease is unaffected",
+      message: "`session lease` could not be probed; the supervisor's lease is unaffected",
     },
   },
   "cli.gc": {

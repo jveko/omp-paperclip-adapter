@@ -16,7 +16,7 @@ import { buildWorkerArgv } from "../host/worker.js";
 import { ompEnv } from "./omp-env.js";
 import { listOmpModels, type OmpModelInfo } from "./models.js";
 import { providerQualifiedSelectors, validateProviderQualifiedSelectors } from "./failover-config.js";
-import { resolveExecutionMode, resolveSessionScope, validateSessionScope } from "./session-directives.js";
+import { resolveSessionScope, validateSessionScope } from "./session-directives.js";
 
 function run(command: string, args: string[], timeoutMs: number, env?: Record<string, string>): Promise<string> {
   return new Promise<string>((resolve) => {
@@ -258,11 +258,10 @@ export async function testEnvironment(
   // 4. What this build actually supports (one cached, bounded probe pass).
   // The ACP handshake is part of it, so this replaces the separate probe and
   // its one-per-test throwaway session is now paid once per (command, env).
-  const mode = resolveExecutionMode(config) ?? "engine";
   const capabilities = await loadCapabilities({
     acp: { command: bin, args: acpArgs, env: spawnEnv },
-    mode,
-    ...(mode === "managed" ? { worker: buildWorkerArgv(config, bridgePath) } : {}),
+    mode: "managed",
+    worker: buildWorkerArgv(config, bridgePath),
     version: parsedVersion === null
       ? null
       : `${parsedVersion.major}.${parsedVersion.minor}.${parsedVersion.patch}`,

@@ -593,9 +593,9 @@ export function governancePolicyActive(config: Record<string, unknown>): boolean
  * Reject `permissionMode: deny-all` on top of a policy that scopes or rewrites
  * tool calls.
  *
- * `deny-all` lives in the ACP engine's permission proxy, not in omp: every
- * request omp still raises — a critical bash command, a restricted folder, and
- * every gated tool when omp's own approval mode is in force — is refused by the
+ * `deny-all` lives in omp's permission proxy, not in the bridge: every request
+ * omp still raises — a critical bash command, a restricted folder, and every
+ * gated tool when omp's own approval mode is in force — is refused by the
  * proxy before the bridge's handler can allow the call. A policy whose
  * `pathScopes`/`argRevisions` presume those calls run therefore describes a run
  * that cannot happen, and the operator sees a governed-looking config that

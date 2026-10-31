@@ -648,15 +648,14 @@ function canonicalJson(value: unknown): string {
 /**
  * The run's Paperclip credentials, read FRESH on every call.
  *
- * On the managed lane the host sets `PAPERCLIP_RUN_CONTEXT` to a stable path
- * whose contents it rebinds before each prompt (`run-context/<runId>.json`
- * behind `current.json`); the run JWT deliberately never enters this process's
- * env, because a warm worker's env cannot change between runs. Engine mode has
- * no such variable, so the env fallback stays exactly as it was.
+ * The supervisor sets `PAPERCLIP_RUN_CONTEXT` to a stable path whose contents
+ * it rebinds before each prompt (`run-context/<runId>.json` behind
+ * `current.json`); the run JWT deliberately never enters this process's env,
+ * because a warm worker's env cannot change between runs.
  *
  * A missing or unparseable record falls back to env: a broken pointer must not
- * silently turn every approval into "credentials unavailable" when the engine
- * lane's env is right there.
+ * silently turn every approval into "credentials unavailable" when the env
+ * carries the same values (a bridge loaded outside the supervisor, a test).
  */
 function runContextCredentials(): { apiUrl: string; companyId: string; taskId: string; token: string } {
   const file = (process.env.PAPERCLIP_RUN_CONTEXT ?? "").trim();
@@ -672,7 +671,7 @@ function runContextCredentials(): { apiUrl: string; companyId: string; taskId: s
         if (apiUrl !== "" && token !== "") return { apiUrl, companyId, taskId, token };
       }
     } catch {
-      // Unreadable record: fall through to the env the engine lane uses.
+      // Unreadable record: fall through to the env fallback.
     }
   }
   return {

@@ -6,10 +6,11 @@ import { materializeFailoverOverlay } from "./failover-config.js";
 
 // Force the overlay write-failure branch and assert the executor warns via onEvent
 // and still runs (regression guard for the spec §4 "warn, don't fail" contract).
-const engineMocks = vi.hoisted(() => ({ createAcpxEngineExecutor: vi.fn() }));
+const engineMocks = vi.hoisted(() => ({ transport: vi.fn() }));
 // Mocked at this package's loader seam, not the dependency's module id.
-vi.mock("./adapters/acp/engine.js", () => ({
-  loadAcpxEngineExecutor: async () => engineMocks.createAcpxEngineExecutor(),
+vi.mock("./run/host-transport.js", () => ({
+  createHostTransport: () => engineMocks.transport(),
+  lookupHostSessionCwd: async () => null,
 }));
 vi.mock("./failover-config.js", async (importOriginal) => {
   // Vitest types `importOriginal` as returning `unknown`; the module namespace
@@ -32,8 +33,8 @@ function ctxWith(onEvent: (e: unknown) => Promise<void>): AdapterExecutionContex
 
 describe("failover overlay write-failure degradation", () => {
   beforeEach(() => {
-    engineMocks.createAcpxEngineExecutor.mockReset();
-    engineMocks.createAcpxEngineExecutor.mockReturnValue(vi.fn(async () => ({ exitCode: 0, sessionParams: { acpSessionId: "s", sessionKey: "sk" } })));
+    engineMocks.transport.mockReset();
+    engineMocks.transport.mockReturnValue(vi.fn(async () => ({ exitCode: 0, sessionParams: { acpSessionId: "s", sessionKey: "sk" } })));
     vi.mocked(materializeFailoverOverlay).mockReset();
   });
 

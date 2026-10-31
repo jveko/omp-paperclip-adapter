@@ -1,6 +1,5 @@
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { attributeRunCost } from "../cost-truth.js";
-import { runWithFreshSessionRetry, withRetryChain, type RetryChainEntry } from "../retry.js";
 import {
   bumpRunCounter, consumeToken, rotateIfTripped, snapshotDigest,
 } from "../session-state.js";
@@ -17,31 +16,27 @@ import { firstNonEmptyString, resolveOmpAgentCommand } from "../adapters/acp/lau
 import type { RunPlan } from "./run-plan.js";
 
 /**
- * Execution, and only execution: the one place a run calls a transport, and
+ * Execution, and only execution: the one place a run calls its transport, and
  * the one place its outcome is booked (session consumption, rotation counters,
  * usage/snapshot work products, cost attribution).
  *
  * The transport is a function, not a protocol: whatever starts the child is
- * handed the merged context and the plan's engine config. A second transport
- * plugs in here without touching the plan.
+ * handed the merged context and reads the plan's run-child config. A second
+ * transport plugs in here without touching the plan.
  */
 
-/** Starts a run child. The ACP lane supplies the acpx engine. */
+/** Starts a run child. The supervisor transport is the only implementation. */
 export type RunTransport = (ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>;
 
 export async function executePlan(
   plan: RunPlan,
   transport: RunTransport,
 ): Promise<AdapterExecutionResult> {
-  const { result, chain } = await runWithFreshSessionRetry(
-    (runCtx) => {
-      const merged = { ...plan.ctx, ...runCtx } as typeof plan.ctx;
-      if (plan.runtimeOverride) merged.runtime = plan.runtimeOverride;
-      return transport(merged);
-    },
-    plan.retry,
-    plan.engineConfig,
-  );
+  // The transport sees the run's effective config: the plan's context with the
+  // run-child config this run resolved (session fence, manifests, overlays).
+  const merged = { ...plan.ctx, config: plan.runChildConfig } as typeof plan.ctx;
+  if (plan.runtimeOverride) merged.runtime = plan.runtimeOverride;
+  const result = await transport(merged);
   const resultParams = (result.sessionParams ?? {}) as Record<string, unknown>;
   const usedSessionId = typeof resultParams.acpSessionId === "string" ? resultParams.acpSessionId : null;
   const nowIso = new Date().toISOString();
@@ -56,7 +51,7 @@ export async function executePlan(
   if (plan.intel.browser && issueId) {
     await emitSessionSnapshot(plan, { issueId, usedSessionId, nowIso });
   }
-  return composeResult(plan, { result, chain, usedSessionId });
+  return composeResult(plan, { result, usedSessionId });
 }
 
 /**
@@ -102,7 +97,7 @@ async function recordRunOutcome(
     intelState.pendingRotate = null;
   }
   // Record the level this session was started with. Adopted whenever the
-  // session id changed under us (a rotation, a fork, or an engine-side fresh
+  // session id changed under us (a rotation, a fork, or a supervisor-side fresh
   // start). A fork is the exception: it rewrites the source transcript
   // wholesale, so the new session keeps the SOURCE's stored level and the run
   // child's overlay never reaches the fork side channel. Claiming the
@@ -234,14 +229,14 @@ async function emitSessionSnapshot(
 }
 
 /**
- * Fold the run's evidence into the result: session-runtime cards, the retry
- * chain, and cost attribution.
+ * Fold the run's evidence into the result: session-runtime cards and cost
+ * attribution.
  */
 async function composeResult(
   plan: RunPlan,
-  input: { result: AdapterExecutionResult; chain: RetryChainEntry[]; usedSessionId: string | null },
+  input: { result: AdapterExecutionResult; usedSessionId: string | null },
 ): Promise<AdapterExecutionResult> {
-  const { result, chain } = input;
+  const { result } = input;
   // Surface session-runtime events in resultJson -> heartbeat_runs (the
   // authoritative evidence table; see spec 3.8).
   const sessionRuntime: Record<string, unknown> = {};
@@ -253,18 +248,13 @@ async function composeResult(
     };
   }
   if (plan.intelState.lastRotation) sessionRuntime.lastRotation = plan.intelState.lastRotation;
-  // MCP servers forwarded to session/new are http-only (AdapterRuntimeMcpAccess has no
-  // stdio/command discriminator), so a 0 count means "no http MCP servers", not "no MCP".
-  // Uses the list resolved at run start, so the evidence matches what the
-  // engine received rather than a second read of the accessor.
-  if (plan.runtimeMcpServerCount > 0) sessionRuntime.mcpServerCount = plan.runtimeMcpServerCount;
   const resultJson = Object.keys(sessionRuntime).length > 0
     ? { ...(result.resultJson ?? {}), sessionRuntime }
     : result.resultJson;
   // Cost truth: omp's catalog status decides whether the reported amount is
-  // an estimate, a declared zero, or unpriced. `result.model` is the model
-  // the engine asked for; the configured (normalized) value is the same in
-  // practice and the fallback keeps a receipt when the engine omits it.
+  // an estimate, a declared zero, or unpriced. `result.model` is the model the
+  // worker routed to; the configured (normalized) value is the same in
+  // practice and the fallback keeps a receipt when the worker omits it.
   const attributedModel = result.model ?? (plan.rawModel ? (plan.resolveModel(plan.rawModel) ?? plan.rawModel) : null);
   const attribution = attributeRunCost({
     pricingStatus: plan.models.find((m) => m.id === attributedModel)?.pricingStatus ?? null,
@@ -278,7 +268,7 @@ async function composeResult(
     await plan.ctx.onEvent?.({ eventType: "run.system", stream: "system", level: "info", message: warning });
   }
   const final: AdapterExecutionResult = {
-    ...withRetryChain(resultJson ? { ...result, resultJson } : result, chain),
+    ...(resultJson ? { ...result, resultJson } : result),
     ...attribution.fields,
   };
   return final;

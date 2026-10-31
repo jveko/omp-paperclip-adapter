@@ -3,12 +3,14 @@ export const type = "omp_local";
 export const agentConfigurationDoc = `
 ## oh-my-pi (omp_local)
 
-Runs oh-my-pi (omp) locally on the Paperclip host as an employee agent over the
-ACP stdio transport.
+Runs oh-my-pi (omp) locally on the Paperclip host as an employee agent through
+the per-instance \`omp-host\` supervisor, which drives an \`omp --mode rpc\` worker
+and keeps the run ledger. ACP remains the probe lane only (session listing and
+fork, \`_omp/*\`, model discovery, the environment probe).
 
 ### Use when
 - You want to drive oh-my-pi locally as a Paperclip employee.
-- You need sessions that resume and fork across heartbeats over ACP.
+- You need sessions that resume and fork across heartbeats.
 - You want custom providers from your local omp registry exposed to Paperclip.
 
 ### Don't use when
@@ -28,17 +30,17 @@ ACP stdio transport.
 | \`nonInteractivePermissions\` | \`deny\` | fail-closed headless turns |
 | \`timeoutSec\` / \`graceSec\` | 0 / 20 | unlimited run; SIGTERM grace |
 | \`env\` | \`{}\` | incl. \`OMP_PAPERCLIP_BILLING_TYPE\` (\`api\` or \`subscription\`) |
-| \`stateDir\`, \`instructionsFilePath\`, \`cwd\` | unset | passed through to engine |
+| \`stateDir\`, \`instructionsFilePath\`, \`cwd\` | unset | passed through to the run child |
 | \`sessionScope\` | \`shared\` | \`shared\` = the host's one omp agent dir; \`isolated\` = this agent's own (requires \`credentialMode: broker\`) |
 | \`sessionSnapshotDiagnostic\` | \`false\` | log counts from omp's host-wide \`_omp/*\` listing (never ids, cwds or titles) |
-| \`subagentObservability\` | \`summary\` | managed lane only: \`off\` / \`summary\` / \`events\`; engine mode ignores it |
-| \`warmHandleIdleMs\` | \`0\` | engine warm-handle window, passed through as configured. No reuse happens under run identity: the engine's settlement gate discards a handle that still carries this run's credential (see below) |
+| \`subagentObservability\` | \`summary\` | \`off\` / \`summary\` / \`events\` |
 
 ### One run per session
-- Every \`execute()\` holds a per-\`sessionKey\` lease under the agent state dir
-  (\`omp-session-intel/leases/<hash>.json\`) for the whole run. A second heartbeat
-  for the same session is refused with \`omp_session_lease_held\` instead of
-  being queued (a queued heartbeat reports late). Two processes on one session
+- The supervisor holds a per-\`sessionKey\` lease under the agent state dir
+  (\`omp-session-intel/leases/<hash>.json\`) for the whole run; it is the only
+  holder, and the adapter acquires none. A second heartbeat for the same
+  session is refused with \`omp_session_lease_held\` instead of being queued (a
+  queued heartbeat reports late). Two processes on one session
   file do not corrupt it — omp moves the non-owner's session to a fresh id on
   its first write — but the employee's transcript forks invisibly and the next
   run resumes only one branch.
@@ -49,17 +51,16 @@ ACP stdio transport.
   \`session/list\` by id), not the current run's: omp rejects the fork when they
   differ, and the source may live under another workspace. If the source is not
   in this agent dir's listing, the run warns and forks with the run's cwd.
-- A resumed session whose recorded model no longer exists (\`Could not restore
-  model <provider/id>\`, omp >= 18.6.3) is retried once on a fresh session
-  instead of failing the employee; every other session-init failure stays
-  terminal.
+- A stored session omp cannot open — a removed model (\`Could not restore model
+  <provider/id>\`), a moved directory — starts a fresh session instead of
+  failing the employee, and the run warns which id it dropped.
 
 ### Governance: the single gate, honestly
 - With \`governancePolicy\` set, the run child gets \`tools.approvalMode: yolo\`
   through its own config overlay, so the bridge extension's \`tool_call\` handler
   is the only deterministic gate. A CONFIGURED yolo makes omp skip the
-  permission request for edit/delete/move and allow bash directly, so the
-  engine's ACP permission proxy sees almost none of it. The requests it still
+  permission request for edit/delete/move and allow bash directly, so omp's
+  permission proxy sees almost none of it. The requests it still
   sees — a critical bash command, a restricted folder, any tool under omp's
   default approval mode — are answered purely by \`permissionMode\`; this lane
   has no human prompt, so \`approve-all\` (the default) auto-allows them and
@@ -77,7 +78,7 @@ ACP stdio transport.
   \`omp_governance_unavailable\` instead of taking \`yolo\` with no extension to
   replace omp's gate. That is file presence and readability only — whether
   omp's loader accepts the extension is not observable from the parent, and
-  nothing on the ACP stream reports it.
+  nothing in the run stream reports it.
 - Plan mode is deliberately unavailable. \`plan\`, \`planMode\`, \`planEnabled\`,
   \`mode: plan\` and a \`--plan\` flag are config errors (\`omp_config_error\`):
   omp auto-approves a plan when the ACP client has no elicitation/form support,
@@ -125,12 +126,8 @@ ACP stdio transport.
 ### Thinking level and model failover, without a rotating fingerprint
 - \`thinking\` is forwarded as omp's own \`defaultThinkingLevel\` through a
   run-scoped settings overlay (fixed filename, run child only), not as a
-  \`--thinking\` flag on the agent command. The engine hashes the command line
-  into the session key, so the flag made every level edit start a fresh
-  session; the overlay path is stable and only its content changes. Setting the
-  first level (or clearing the last) adds or removes that path, which the
-  engine does fingerprint: one fresh session when the level first appears,
-  never on a later edit of its value.
+  \`--thinking\` flag on the agent command: the overlay path is stable, so an
+  edit never changes the worker's argv.
 - The setting is not the strongest source. omp resolves a run's level as:
   CLI flag, then the level stored in the session's transcript
   (\`thinking_level_change\`), then a model-selector suffix, then the model
@@ -144,10 +141,9 @@ ACP stdio transport.
   instead of silently frozen. An agent whose level is unchanged never rotates,
   and neither does a run that merely re-lists or re-reads that session. \`off\` stays a CLI flag because omp's
   setting has no \`off\` value (it discards one and reads \`high\`).
-- Live switching mid-session is not available on this lane: omp's ACP accepts
-  \`session/set_config_option {configId:"thinking"}\`, but the Paperclip engine
-  only sends \`model\`, \`effort\` and \`service_tier\` (and omp rejects \`effort\`);
-  that is an upstream ask, not a knob here.
+- Live switching mid-session is not available: the supervisor opens the session
+  with the run's level and sends no per-turn level request. That is an upstream
+  ask, not a knob here.
 - The quota-aware retry knobs ride the same overlay as the fallback chain
   (\`retry.fallbackOn\`, \`retry.fallbackRevertPolicy\`,
   \`retry.waitForUsageReset\`, \`retry.maxDelayMs\`). \`fallbackChain\` is written
@@ -157,7 +153,7 @@ ACP stdio transport.
   file omp would silently discard — an unknown \`fallbackOn\` reads back as
   \`any\`, so a warn would be a knob that does nothing.
 
-### Subagent observability (managed lane)
+### Subagent observability
 - \`subagentObservability\` decides how much of omp's subagent tree this run
   subscribes to. \`summary\` (the default) sends \`set_subagent_subscription\`
   at omp's \`progress\` level before the prompt and relays each
@@ -181,7 +177,6 @@ ACP stdio transport.
   holds. A run with no subagent activity adds no \`subagents\` field, and a
   detached subagent from an earlier run on the same warm worker is never
   attributed to a later run.
-- Engine mode has no subagent surface and ignores the key.
 - Cancelling or timing out a run kills the worker's process group, so its
   children die with it. A per-subagent \`cancel_subagent\`/\`steer_subagent\`
   control path is deliberately not exposed: the board contract for it does
@@ -189,7 +184,8 @@ ACP stdio transport.
 
 ### Run identity and control plane
 - Paperclip mints a per-run token for this adapter (\`supportsLocalAgentJwt\`)
-  and the engine injects it into the omp child as \`PAPERCLIP_API_KEY\`. That is
+  and the supervisor writes it into the run-context file the run child reads;
+  it is never placed in a live worker's environment. That is
   a company-scoped API bearer for the employee's run: it is what makes the
   session-snapshot and usage work products and the bridge's board-approval
   round-trip possible, and it also lets the agent call any Paperclip API its
@@ -197,32 +193,22 @@ ACP stdio transport.
 - Control tools arrive as MCP servers (\`runtimeToolDelivery: native_mcp\`):
   "Paperclip connections" whenever the run has a responsible user, plus
   "Paperclip projects" when the run is tied to an issue and an API base is
-  configured. They reach the agent as \`mcp__*\` tools. A Paperclip build that
-  ignores the flag delivers none of them; the run logs a \`connection tools are
-  unavailable\` warning and continues.
+  configured. They reach the agent as omp host tools. A Paperclip build that
+  ignores the flag delivers none of them, and the run has no connection tools.
 - A managed AGENTS.md bundle is supported through \`instructionsFilePath\`: the
-  engine renders that file into the run prompt and the ephemeral skills file
-  merges the same path, so the bundle and \`skillsAsTools\` compose.
-- Warm reuse never happens under run identity, and the engine enforces it. The
-  engine injects \`PAPERCLIP_API_KEY\` into the child environment only when it
-  spawns that child, so a reused process would speak with the token of the run
-  that spawned it — later heartbeats' work products and approval requests would
-  authenticate as that earlier run (wrong attribution, not just a failure).
-  From \`@paperclipai/adapter-utils\` 2026.1023.0 the settlement gate makes the
-  decision: the host-lane save candidate carries
-  \`liveRunScopedCredentials: ["paperclip-run-scoped-api-key"]\`, so
-  \`decideReuse\` answers \`discard / "run-scoped credential still valid"\` and the
-  run closes and relaunches instead of transferring the handle. The adapter
-  therefore passes \`warmHandleIdleMs\` through instead of overwriting it, and
-  logs one \`warm-handle idle window ... is honoured\` note when an operator
-  sets it. The fork run's own single-run 50 ms pin stays: it is what makes that
-  run's handle savable at all before it is closed.
+  supervisor renders that file into the run prompt and the ephemeral skills
+  file merges the same path, so the bundle and \`skillsAsTools\` compose.
+- A warm worker is reused across heartbeats only for the same session key, argv,
+  bridge, agent dir, cwd and omp version; a run-scoped credential never enters
+  the worker's environment, so a reused process cannot speak for an earlier
+  run. The token travels in the per-run context file instead, which the
+  supervisor rewrites before each prompt.
 - No provider quota windows are reported. \`getQuotaWindows\` receives no adapter
   config, so it could only report the Paperclip host's omp login rather than the
   employee's; the subscription-quota card stays empty for this adapter.
 
 ### Notes
-- Permissions are owned by the engine knobs \`permissionMode\` +
+- Permissions are owned by the omp knobs \`permissionMode\` +
   \`nonInteractivePermissions\`. The adapter never passes \`--auto-approve\` on the
   command line; unattended employees keep the default approve posture only as a
   conscious operator choice at hire time.
@@ -258,12 +244,12 @@ ACP stdio transport.
   \`_session/steering\`, \`_omp/extensions\`, the \`mode|model|thinking\` config
   ids, the \`session.maxCost\` / \`tools.restrictedFolders\` /
   \`defaultThinkingLevel\` settings keys, the \`models refresh\` /
-  \`session lease\` / \`gc\` verbs, and (managed lane only) the
+  \`session lease\` / \`gc\` verbs, and the
   \`get_session_stats\` / \`set_host_tools\` / \`set_subagent_subscription\`
   worker frames — and names the feature each absent surface disables. A build
   outside the tested minors is a **warning** that points at those checks; only
-  a different major is an error, because the ACP lane itself is not covered by
-  a capability probe. Wrapper commands report their own version, so they are
+  a different major is an error. The worker-frame group is what the run needs;
+  the ACP group describes the probe lane. Wrapper commands report their own version, so they are
   reported as unverified rather than failed. The probe is cached per command
   and environment; the run path only reads that cache and never spawns a probe
   of its own. \`omp models ls --json\` is unversioned; the catalog is parsed by

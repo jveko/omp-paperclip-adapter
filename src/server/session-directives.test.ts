@@ -81,30 +81,22 @@ describe("getSessionConfigSchema", () => {
       "sessionForkToken", "sessionMaxRuns", "sessionMaxAgeHours",
       "credentialMode", "thinking", "fallbackChain",
       "fallbackOn", "fallbackRevertPolicy", "waitForUsageReset", "maxDelayMs",
-      "usageReport", "skillsAsTools", "steering", "subagentObservability", "executionMode", "governancePolicy",
+      "usageReport", "skillsAsTools", "steering", "subagentObservability", "governancePolicy",
     ]);
     for (const field of schema.fields) expect(field.hint).toContain("next run");
   });
-  it("exposes subagentObservability as a summary-defaulted managed-lane select", () => {
+  it("exposes subagentObservability as a summary-defaulted select", () => {
     const byKey = Object.fromEntries(getSessionConfigSchema().fields.map((f) => [f.key, f]));
     const field = byKey.subagentObservability;
     expect(field.type).toBe("select");
     expect(field.default).toBe("summary");
     expect(field.options.map((o: { value: string }) => o.value)).toEqual(["off", "summary", "events"]);
-    expect(field.hint).toMatch(/engine mode/i);
-    expect(field.hint).toMatch(/managed/i);
   });
   it("exposes steering as an off-by-default managed-lane toggle", () => {
     const byKey = Object.fromEntries(getSessionConfigSchema().fields.map((f) => [f.key, f]));
     expect(byKey.steering.type).toBe("select");
     expect(byKey.steering.default).toBe("off");
     expect(byKey.steering.options.map((o: { value: string }) => o.value)).toEqual(["off", "on"]);
-  });
-  it("exposes executionMode as an engine-defaulted lane selector", () => {
-    const byKey = Object.fromEntries(getSessionConfigSchema().fields.map((f) => [f.key, f]));
-    expect(byKey.executionMode.type).toBe("select");
-    expect(byKey.executionMode.default).toBe("engine");
-    expect(byKey.executionMode.options.map((o: { value: string }) => o.value)).toEqual(["engine", "managed"]);
   });
   it("exposes the v0.5 fields with correct types/defaults", () => {
     const byKey = Object.fromEntries(getSessionConfigSchema().fields.map((f) => [f.key, f]));

@@ -4,11 +4,11 @@ import { createInterface } from "node:readline";
 /**
  * The ACP side-channel client: a hand-written, initialize-only JSON-RPC driver.
  *
- * It exists beside the acpx engine because the engine is the run lane, not a
- * read lane: these reads (`session/list`, `session/fork`, `_omp/*`) must not
- * call `session/new` — that always persists a new session record and would
- * pollute the listings they read — so they drive the same `omp acp` binary
- * directly. Nothing here knows about runs, overlays or Paperclip.
+ * ACP is the probe lane, not the run lane: these reads (`session/list`,
+ * `session/fork`, `_omp/*`) must not call `session/new` — that always persists
+ * a new session record and would pollute the listings they read — so they
+ * drive the same `omp acp` binary directly. Nothing here knows about runs,
+ * overlays or Paperclip.
  */
 
 export interface OmpAcpProbeResult {

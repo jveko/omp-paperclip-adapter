@@ -8,10 +8,9 @@ import {
 } from "vitest";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import {
-  buildOmpAcpConfig,
+  buildRunChildConfig,
   bridgePath,
   createOmpAcpExecutor,
-  deriveDefaultTimeoutSec,
   driveAcpSession,
   parseOmpVersion,
   probeOmpAcpSession,
@@ -19,13 +18,10 @@ import {
   resolveOmpAgentCommand,
   resolveOmpBillingIdentity,
   resolveSessionCwd,
+  deriveDefaultTimeoutSec,
   shouldAppendBridgeExtension, isGovernanceArmed,
 } from "./acp.js";
-import { runWithFreshSessionRetry, withRetryChain } from "./retry.js";
-import { startHost } from "../host/server.js";
 import { buildRunPlan } from "./run/run-plan.js";
-import { steerManagedRun } from "./run/host-transport.js";
-import { readLedgerRecords } from "../host/ledger.js";
 import * as sessionState from "./session-state.js";
 import { loadState, ompAgentDir, saveState, sessionIntelDir } from "./session-state.js";
 import { FAILOVER_CONFIG_FILE } from "./failover-config.js";
@@ -33,9 +29,10 @@ import { GOVERNANCE_MANIFEST_FILE } from "./governance-manifest.js";
 import { GOVERNANCE_CONFIG_FILE } from "./governance-overlay.js";
 import { BUDGET_CONFIG_FILE } from "./budget-overlay.js";
 import { THINKING_CONFIG_FILE } from "./thinking-overlay.js";
-const engineMocks = vi.hoisted(() => ({
-  createAcpxEngineExecutor: vi.fn(),
-}));
+// The supervisor transport is replaced at this package's own seam: the
+// composition root's lazy `createHostTransport` is the only place a run child
+// is started, so stubbing it covers every call without spawning a supervisor.
+const transportMocks = vi.hoisted(() => ({ transport: vi.fn() }));
 
 const modelsMocks = vi.hoisted(() => ({
   defaultModels: [
@@ -81,17 +78,16 @@ vi.mock("./models.js", async (importOriginal) => {
   return { ...actual, listOmpModels: modelsMocks.listOmpModels };
 });
 
-// The engine is replaced at this package's own loader seam rather than at the
-// dependency's module id: the lane's lazy `loadAcpxEngineExecutor` is the only
-// place the engine is constructed, so mocking it covers every engine call.
-vi.mock("./adapters/acp/engine.js", () => ({
-  loadAcpxEngineExecutor: async () => engineMocks.createAcpxEngineExecutor(),
+vi.mock("./run/host-transport.js", () => ({
+  createHostTransport: () => transportMocks.transport,
+  lookupHostSessionCwd: async () => null,
+  steerManagedRun: vi.fn(),
 }));
 
-function fakeEngine(result: Record<string, unknown>) {
-  const executor = vi.fn(async (ctx: AdapterExecutionContext) => result);
-  engineMocks.createAcpxEngineExecutor.mockReturnValue(executor);
-  return executor;
+function fakeTransport(result: Record<string, unknown>) {
+  const transport = vi.fn(async (_ctx: AdapterExecutionContext, _plan: unknown) => result);
+  transportMocks.transport.mockImplementation(transport);
+  return transport;
 }
 
 /** Paperclip issue ids are UUIDs; a run's taskId is only postable when it is one. */
@@ -140,22 +136,6 @@ async function readAcpFrames(file: string): Promise<AcpFrame[]> {
   });
 }
 
-/** Run-scoped control-tool access as Paperclip hands it to an adapter. */
-function runtimeToolsAccess(mcpEndpoint: string, bearerToken: string): Record<string, unknown> {
-  return {
-    version: 1,
-    guidance: "Connection tools:",
-    mcpEndpoint,
-    rest: {
-      connectionsSearch: "http://paperclip.test/runtime-tools/connections/search",
-      connectionRequest: "http://paperclip.test/runtime-tools/connections/request",
-    },
-    bearerToken,
-    expiresAt: new Date(Date.now() + 60_000).toISOString(),
-    tools: ["connections_search", "connection_request"],
-  };
-}
-
 describe("createOmpAcpExecutor session runtime wiring", () => {
   let tmpRoot: string;
   beforeAll(async () => {
@@ -165,7 +145,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     await rm(tmpRoot, { recursive: true, force: true });
   });
   beforeEach(async () => {
-    engineMocks.createAcpxEngineExecutor.mockReset();
+    transportMocks.transport.mockReset();
     serverUtilsMocks.readPaperclipSkillSyncPreference.mockReset();
     serverUtilsMocks.readPaperclipRuntimeSkillEntries.mockReset();
     serverUtilsMocks.resolvePaperclipDesiredSkillNames.mockReset();
@@ -189,21 +169,20 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
   afterEach(() => vi.unstubAllEnvs());
 
-  it("fork run: overrides acpSessionId, injects warmHandleIdleMs 50, keeps env clean", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
+  it("fork run: overrides acpSessionId and keeps the env clean", async () => {
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
     await run(baseCtx({
       config: { command: `${process.execPath} ${fakeAcp}`, sessionForkSourceId: "sess-a", sessionForkToken: "t1" },
     }));
     const merged = executorFn.mock.calls[0][0];
     expect(merged.runtime.sessionParams).toMatchObject({ acpSessionId: "fork-1" });
-    expect(merged.config.warmHandleIdleMs).toBe(50);
     expect(merged.config.env?.OMP_PAPERCLIP_FRESH).toBeUndefined();
     expect(merged.config.env?.OMP_PAPERCLIP_RETRY).toBeUndefined();
   });
 
-  it("refuses an unknown subagentObservability before any engine work", async () => {
-    const executorFn = fakeEngine({ exitCode: 0 });
+  it("refuses an unknown subagentObservability before any transport work", async () => {
+    const executorFn = fakeTransport({ exitCode: 0 });
     const run = createOmpAcpExecutor();
     const result = await run(baseCtx({
       config: { command: `${process.execPath} ${fakeAcp}`, subagentObservability: "verbose" },
@@ -213,31 +192,12 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     expect(executorFn).not.toHaveBeenCalled();
   });
 
-  it("leaves the engine lane without subagent evidence even when the knob is set", async () => {
-    const executorFn = fakeEngine({
-      exitCode: 0, signal: null, timedOut: false, resultJson: { status: "completed" },
-    });
-    const eventTypes: string[] = [];
-    const run = createOmpAcpExecutor();
-    const result = await run(baseCtx({
-      config: {
-        command: `${process.execPath} ${fakeAcp}`,
-        executionMode: "engine",
-        subagentObservability: "events",
-      },
-      onEvent: async (event) => { eventTypes.push(event.eventType); },
-    }));
-    expect(executorFn).toHaveBeenCalledTimes(1);
-    expect(eventTypes).not.toContain("omp.subagent");
-    expect(result.resultJson).not.toHaveProperty("subagents");
-  });
-
   it("forks at the source session's own cwd, not this run's workspace", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "omp-fork-cwd-"));
     try {
       const frameFile = path.join(dir, "frames.log");
       vi.stubEnv("FAKE_ACP_FRAME_LOG", frameFile);
-      const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
+      const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
       const run = createOmpAcpExecutor();
       await run(baseCtx({
         config: { command: `${process.execPath} ${fakeAcp}`, sessionForkSourceId: "sess-a", sessionForkToken: "t1" },
@@ -254,47 +214,8 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     }
   }, 20_000);
 
-  it("passes the operator's warm-handle window through and notes the settlement discard", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
-    const events: Array<{ level?: string; message?: string }> = [];
-    const run = createOmpAcpExecutor();
-    await run(baseCtx({
-      config: { command: `${process.execPath} ${fakeAcp}`, warmHandleIdleMs: 300_000 },
-      authToken: "run-jwt-SENTINEL",
-      onEvent: async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); },
-    }));
-    // The operator's value is no longer overwritten: the engine's settlement
-    // gate is what refuses to carry this run's credential into a reused child
-    // (proved against the real engine in adapters/acp/warm-handle-settlement.test.ts).
-    expect(executorFn.mock.calls[0][0].config.warmHandleIdleMs).toBe(300_000);
-    const notes = events.filter((e) => e.level === "info" && /warm-handle/i.test(e.message ?? ""));
-    expect(notes).toHaveLength(1);
-    expect(JSON.stringify(events)).not.toContain("SENTINEL");
-
-    // Default config (never opted in) is the engine's own default: no note noise
-    // per heartbeat.
-    const quiet: Array<{ level?: string; message?: string }> = [];
-    const run2 = createOmpAcpExecutor();
-    await run2(baseCtx({
-      config: { command: `${process.execPath} ${fakeAcp}` },
-      authToken: "run-jwt-SENTINEL",
-      onEvent: async (ev: unknown) => { quiet.push(ev as { level?: string; message?: string }); },
-    }));
-    expect(quiet.some((e) => /warm-handle/i.test(e.message ?? ""))).toBe(false);
-    expect(JSON.stringify(quiet)).not.toContain("SENTINEL");
-  });
-
-  it("honours the acpWarmHandleIdleMs alias and coerces a numeric string", async () => {
-    const executorFn = fakeEngine({ exitCode: 0 });
-    const run = createOmpAcpExecutor();
-    await run(baseCtx({
-      config: { command: `${process.execPath} ${fakeAcp}`, acpWarmHandleIdleMs: "120000" },
-    }));
-    expect(executorFn.mock.calls[0][0].config.warmHandleIdleMs).toBe(120_000);
-  });
-
   it("fork still applies with broker env threaded to the side channel", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
     await run(baseCtx({ config: {
       command: `${process.execPath} ${fakeAcp}`,
@@ -303,24 +224,20 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     } }));
     expect(executorFn.mock.calls[0][0].runtime.sessionParams).toMatchObject({ acpSessionId: "fork-1" });
   });
-  it("fork run with fallbackChain still carries PI_CONFIG_FILES (overlay folded into config before engineConfig)", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
+  it("fork run with fallbackChain still carries PI_CONFIG_FILES", async () => {
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
     await run(baseCtx({
       config: { command: `${process.execPath} ${fakeAcp}`, sessionForkSourceId: "sess-a", sessionForkToken: "t1", fallbackChain: "brokerco/main\nbrokerco/fast" },
     }));
     const merged = executorFn.mock.calls[0][0];
-    expect(merged.config.warmHandleIdleMs).toBe(50); // fork override applied
-    // The fork branch rebuilds engineConfig as { ...config, warmHandleIdleMs: 50 };
-    // PI_CONFIG_FILES must ride on config (not be added to engineConfig after),
-    // so it survives the fork spread.
     expect(merged.config.env?.PI_CONFIG_FILES).toBe(
       path.join(sessionIntelDir("co-1", "agent-1"), FAILOVER_CONFIG_FILE),
     );
   });
 
   it("rides the thinking level in the run's settings overlay, not the fingerprint", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
     await run(baseCtx({ config: { command: `${process.execPath} ${fakeAcp}`, thinking: "high" } }));
     const merged = executorFn.mock.calls[0][0];
@@ -333,7 +250,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("sends off as a CLI flag and writes no thinking overlay", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
     await run(baseCtx({ config: { command: `${process.execPath} ${fakeAcp}`, thinking: "off" } }));
     const merged = executorFn.mock.calls[0][0];
@@ -344,7 +261,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("pins the operator PI_CONFIG_FILES ahead of the overlay (fold, not overwrite)", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
     await run(baseCtx({
       config: {
@@ -363,7 +280,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("governancePolicy set: folds manifest env, single-gate overlay, and --extension", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
     await run(baseCtx({
       config: {
@@ -398,7 +315,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
       { id: "chainco/backup", label: "Chain Backup", priced: false },
       { id: "axon-compat/q", label: "Q", priced: false },
     ]);
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     const events: { level?: string; message?: string }[] = [];
     await createOmpAcpExecutor()(baseCtx({
       config: {
@@ -432,7 +349,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("routes nothing without a catalog: gate stays armed, routing warns", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     const events: { level?: string; message?: string }[] = [];
     await createOmpAcpExecutor()(baseCtx({
       config: {
@@ -453,7 +370,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("without governancePolicy the run keeps its v0.7 shape (no manifest, no yolo)", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
     await run(baseCtx({
       config: { command: `${process.execPath} ${fakeAcp}`, fallbackChain: "brokerco/main" },
@@ -469,7 +386,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
 
   it("governance folds in alongside the skills manifest instead of clobbering it", async () => {
     skillManifestMocks.materializeSkillManifest.mockResolvedValue("/tmp/skills-manifest.json");
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
     await run(baseCtx({
       config: {
@@ -485,7 +402,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("forwards budgetCapUsd as omp's session cost cap in its own run-child overlay", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     await createOmpAcpExecutor()(baseCtx({
       config: {
         command: `${process.execPath} ${fakeAcp}`,
@@ -505,7 +422,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("keeps the overlay path stable when only the cap changes (no session rotation)", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
     await run(baseCtx({ config: { command: `${process.execPath} ${fakeAcp}`, governancePolicy: "budgetCapUsd: 2" } }));
     await run(baseCtx({ config: { command: `${process.execPath} ${fakeAcp}`, governancePolicy: "budgetCapUsd: 3" } }));
@@ -517,7 +434,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("writes no budget overlay without a usable cap", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     await createOmpAcpExecutor()(baseCtx({
       config: { command: `${process.execPath} ${fakeAcp}`, governancePolicy: "approvedEndpoints:\n  - prov" },
     }));
@@ -527,7 +444,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
 
   it("malformed governancePolicy warns and runs ungoverned instead of crashing", async () => {
     const events: { level?: string; message?: string }[] = [];
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
     await run(baseCtx({
       config: {
@@ -561,7 +478,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     // A DIRECTORY where governance.json must be written: the manifest write
     // fails (EISDIR) while the routing overlay in the same dir still lands.
     await mkdir(path.join(intel, GOVERNANCE_MANIFEST_FILE), { recursive: true });
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     const events: { level?: string; message?: string }[] = [];
     await createOmpAcpExecutor()(baseCtx({
       config: {
@@ -586,7 +503,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   it("unarmed governance with no routing folds no overlay at all", async () => {
     const intel = sessionIntelDir("co-1", "agent-1");
     await mkdir(path.join(intel, GOVERNANCE_MANIFEST_FILE), { recursive: true });
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     await createOmpAcpExecutor()(baseCtx({
       config: {
         command: `${process.execPath} ${fakeAcp}`,
@@ -599,7 +516,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
 
   it("fails closed when an active governance policy has no bridge extension", async () => {
     const badBridge = "/nonexistent/paperclip-bridge.js";
-    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     const res = await createOmpAcpExecutor({ bridgePath: badBridge })(baseCtx({
       config: {
         command: `${process.execPath} ${fakeAcp}`,
@@ -610,7 +527,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     // would report a governed run with no guardrail, budget or approval rule.
     expect(res).toMatchObject({ exitCode: 1, errorCode: "omp_governance_unavailable" });
     expect(res.errorMessage).toContain(badBridge);
-    expect(engineMocks.createAcpxEngineExecutor).not.toHaveBeenCalled();
+    expect(transportMocks.transport).not.toHaveBeenCalled();
   }, 15_000);
 
   it("runs under governance when the configured bridge extension exists", async () => {
@@ -618,7 +535,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     try {
       const bridge = path.join(dir, "paperclip-bridge.js");
       await writeFile(bridge, "// test bridge\n");
-      const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+      const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
       const res = await createOmpAcpExecutor({ bridgePath: bridge })(baseCtx({
         config: {
           command: `${process.execPath} ${fakeAcp}`,
@@ -636,7 +553,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
 
   it("a policy whose guardrails normalize to nothing never arms the bridge", async () => {
     const events: { level?: string; message?: string }[] = [];
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     await createOmpAcpExecutor()(baseCtx({
       config: {
         command: `${process.execPath} ${fakeAcp}`,
@@ -661,7 +578,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
       { id: "omi/r", label: "R", priced: false },
       { id: "axon-compat/q", label: "Q", priced: false },
     ]);
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     await createOmpAcpExecutor()(baseCtx({
       config: {
         command: `${process.execPath} ${fakeAcp}`,
@@ -681,8 +598,8 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     expect(merged.config.agentCommand).not.toContain("--extension");
   });
 
-  it("fails the run before the engine when a retry knob is outside its enum", async () => {
-    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "x", sessionKey: "sk" } });
+  it("fails the run before the transport when a retry knob is outside its enum", async () => {
+    fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "x", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
     const res = await run(baseCtx({
       config: { command: `${process.execPath} ${fakeAcp}`, fallbackOn: "sometimes" },
@@ -691,12 +608,12 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     expect(res.errorMessage).toContain("fallbackOn");
     // omp discards an unknown enum and reads the default, so a warn would be a
     // knob that silently does nothing: refuse before any engine work instead.
-    expect(engineMocks.createAcpxEngineExecutor.mock.calls.length).toBe(0);
+    expect(transportMocks.transport.mock.calls.length).toBe(0);
   });
 
-  it("fails the run before the engine when a provider-qualified model is not an exact catalog id", async () => {
+  it("fails the run before the transport when a provider-qualified model is not an exact catalog id", async () => {
     modelsMocks.listOmpModels.mockImplementation(async () => modelsMocks.defaultModels);
-    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "x", sessionKey: "sk" } });
+    fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "x", sessionKey: "sk" } });
     const res = await createOmpAcpExecutor()(baseCtx({
       config: { command: `${process.execPath} ${fakeAcp}`, model: "prov/m-old" },
     }));
@@ -705,7 +622,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     expect(res.errorMessage).toContain("18.14");
     // omp would fail the explicit --model outright; refusing here keeps the
     // message actionable instead of a model miss mid-run.
-    expect(engineMocks.createAcpxEngineExecutor.mock.calls.length).toBe(0);
+    expect(transportMocks.transport.mock.calls.length).toBe(0);
   });
 
   it("fails the run when a fallbackChain leg is a provider-qualified near match", async () => {
@@ -713,21 +630,21 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
       { id: "prov/m", label: "M" },
       { id: "prov/backup-v2", label: "Backup v2" },
     ]);
-    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "x", sessionKey: "sk" } });
+    fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "x", sessionKey: "sk" } });
     const res = await createOmpAcpExecutor()(baseCtx({
       config: { command: `${process.execPath} ${fakeAcp}`, model: "prov/m", fallbackChain: "prov/backup" },
     }));
     expect(res.errorCode).toBe("omp_config_error");
     expect(res.errorMessage).toContain("fallbackChain");
     expect(res.errorMessage).toContain("prov/backup");
-    expect(engineMocks.createAcpxEngineExecutor.mock.calls.length).toBe(0);
+    expect(transportMocks.transport.mock.calls.length).toBe(0);
   });
 
   it("canonicalizes a raw aggregator id for the ACP model option", async () => {
     modelsMocks.listOmpModels.mockImplementation(async () => [
       { id: "openrouter/meta-llama/llama-3.3-70b", label: "Llama 3.3" },
     ]);
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
     await createOmpAcpExecutor()(baseCtx({
       config: { command: `${process.execPath} ${fakeAcp}`, model: "meta-llama/llama-3.3-70b" },
     }));
@@ -741,7 +658,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     modelsMocks.listOmpModels.mockImplementation(async () => [
       { id: "zai/glm-5.2", label: "GLM 5.2" },
     ]);
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
     await createOmpAcpExecutor()(baseCtx({
       config: { command: `${process.execPath} ${fakeAcp}`, model: "ZAI/GLM-5.2" },
     }));
@@ -751,7 +668,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
 
   it("passes provider-qualified selectors through with a warning when the catalog is unavailable", async () => {
     modelsMocks.listOmpModels.mockImplementation(async () => []);
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "x", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "x", sessionKey: "sk" } });
     const events: Array<{ level?: string; message?: string }> = [];
     await createOmpAcpExecutor()(baseCtx({
       config: { command: `${process.execPath} ${fakeAcp}`, model: "prov/m", fallbackChain: "prov/backup" },
@@ -765,16 +682,16 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("fails the run early when broker mode lacks env", async () => {
-    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "x", sessionKey: "sk" } });
+    fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "x", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
     const res = await run(baseCtx({ config: { command: `${process.execPath} ${fakeAcp}`, credentialMode: "broker", env: {} } }));
     expect(res.errorCode).toBe("omp_config_error");
     expect(res.errorMessage).toMatch(/OMP_AUTH_BROKER_URL/);
-    expect(engineMocks.createAcpxEngineExecutor.mock.calls.length).toBe(0); // engine never invoked
+    expect(transportMocks.transport.mock.calls.length).toBe(0); // engine never invoked
   });
 
   it("marks the fork token consumed only when the fork id round-trips", async () => {
-    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
     await run(baseCtx({
       config: { command: `${process.execPath} ${fakeAcp}`, sessionForkSourceId: "sess-a", sessionForkToken: "t1" },
@@ -782,7 +699,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     const state = await loadState(sessionIntelDir("co-1", "agent-1"));
     expect(state.forkConsumed).not.toContain("t1"); // warm handle won -> stays armed
 
-    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
+    fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
     // NOTE: a fresh executor per run — createOmpAcpExecutor memoizes the engine
     // executor in its closure, so reusing `run` would ignore the new fake result.
     const run2 = createOmpAcpExecutor();
@@ -794,7 +711,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("fork run with terminal failure: single attempt, no retry env bust, token consumed", async () => {
-    const executorFn = fakeEngine({
+    const executorFn = fakeTransport({
       exitCode: 1, errorCode: "acpx_turn_failed",
       sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" },
     });
@@ -818,7 +735,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("fork failure: engine still invoked, warn event emitted, run does not throw", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "s1", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "s1", sessionKey: "sk" } });
     const events: Array<{ level?: string; message: string }> = [];
     vi.stubEnv("FAKE_ACP_MODE", "forkerror");
     const run = createOmpAcpExecutor();
@@ -835,7 +752,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("force-fresh clears sessionParams (fingerprint-clean) exactly once", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "brand-new", sessionKey: "sk2" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "brand-new", sessionKey: "sk2" } });
     const run = createOmpAcpExecutor();
     await run(baseCtx({ config: { command: `${process.execPath} ${fakeAcp}`, sessionForceFreshToken: "ff1" } }));
     // First run: runtimeOverride forces fresh — sessionParams empty (no
@@ -855,7 +772,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("force-fresh consumption resets runCounters and clears a pending rotation", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "brand-new", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "brand-new", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
     // Seed a long-lived session's run history plus a tripped rotation.
     const dir = sessionIntelDir("co-1", "agent-1");
@@ -873,7 +790,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("rotates once when the operator's thinking level differs from the running session's", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "brand-new", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "brand-new", sessionKey: "sk" } });
     const dir = sessionIntelDir("co-1", "agent-1");
     const seeded = await loadState(dir);
     seeded.lastThinking = { sessionId: "old", level: "low" };
@@ -894,7 +811,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("keeps the session when the operator's level matches the one it started with", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     const dir = sessionIntelDir("co-1", "agent-1");
     const seeded = await loadState(dir);
     seeded.lastThinking = { sessionId: "old", level: "high" };
@@ -910,7 +827,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("adopts the level on the first run after upgrade instead of resetting the session", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     const dir = sessionIntelDir("co-1", "agent-1");
     await createOmpAcpExecutor()(baseCtx({
       config: { command: `${process.execPath} ${fakeAcp}`, thinking: "max" },
@@ -922,7 +839,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("records the source's level, not the requested one, for a fork session", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
     const dir = sessionIntelDir("co-1", "agent-1");
     const seeded = await loadState(dir);
     seeded.lastThinking = { sessionId: "sess-a", level: "low" };
@@ -941,7 +858,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     // later run match and the operator's edit would never apply.
     expect((await loadState(dir)).lastThinking).toEqual({ sessionId: "fork-1", level: "low" });
     // The mismatch is still visible: the next run rotates to apply it.
-    const next = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fresh-2", sessionKey: "sk" } });
+    const next = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "fresh-2", sessionKey: "sk" } });
     await createOmpAcpExecutor()(baseCtx({
       config: {
         command: `${process.execPath} ${fakeAcp}`,
@@ -957,7 +874,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("does not lose a level change that coincides with a fork of the running session", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
     const dir = sessionIntelDir("co-1", "agent-1");
     const seeded = await loadState(dir);
     // The level edit is detected against the RUNNING session (old) and a fork of
@@ -973,7 +890,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     // The fork wins and keeps the source's level, so the pending rotation is
     // consumed — but the mismatch survives in the record instead of vanishing.
     expect((await loadState(dir)).lastThinking).toEqual({ sessionId: "fork-1", level: "low" });
-    const next = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fresh-5", sessionKey: "sk" } });
+    const next = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "fresh-5", sessionKey: "sk" } });
     const events: Array<{ level?: string; message?: string }> = [];
     await createOmpAcpExecutor()(baseCtx({
       config: { command: `${process.execPath} ${fakeAcp}`, thinking: "high" },
@@ -990,7 +907,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("leaves a fork's level unknown when the record names another session", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
     const dir = sessionIntelDir("co-1", "agent-1");
     const seeded = await loadState(dir);
     seeded.lastThinking = { sessionId: "someone-else", level: "low" };
@@ -1006,7 +923,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     expect((await loadState(dir)).lastThinking).toEqual({ sessionId: "fork-1", level: null });
     // ...and the next run re-establishes it instead of leaving every later edit
     // inert: one fresh session converts "unknown" into "certainly configured".
-    const next = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fresh-4", sessionKey: "sk" } });
+    const next = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "fresh-4", sessionKey: "sk" } });
     const events: Array<{ level?: string; message?: string }> = [];
     await createOmpAcpExecutor()(baseCtx({
       config: { command: `${process.execPath} ${fakeAcp}`, thinking: "high" },
@@ -1022,7 +939,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("lets an already-armed threshold rotation keep its own reason", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fresh-3", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "fresh-3", sessionKey: "sk" } });
     const dir = sessionIntelDir("co-1", "agent-1");
     const seeded = await loadState(dir);
     seeded.lastThinking = { sessionId: "old", level: "low" };
@@ -1041,7 +958,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("successful fork supersedes a pending rotation and restarts the run count", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "fork-1", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
     const dir = sessionIntelDir("co-1", "agent-1");
     const seeded = await loadState(dir);
@@ -1060,7 +977,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("compaction: pendingRotate from state forces fresh via sessionParams (fingerprint-clean)", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "brand-new", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "brand-new", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
     // Seed: a completed run that tripped the threshold leaves pendingRotate.
     const dir = sessionIntelDir("co-1", "agent-1");
@@ -1077,98 +994,8 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     expect(state.pendingRotate).toBeNull();
   });
 
-  it("reports the runtime MCP server count in sessionRuntime on the run path", async () => {
-    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
-    const run = createOmpAcpExecutor();
-    const res = await run(baseCtx({
-      config: { command: `${process.execPath} ${fakeAcp}` },
-      runtimeMcp: {
-        getServers: () => [
-          { name: "mcp-1", url: "http://mcp:1", token: "t1", connectionId: "c1" },
-        ],
-      },
-    }));
-    // The MCP count rides on the run path (ctx.runtimeMcp is only real on
-    // AdapterExecutionContext, never on the environment-test context).
-    const sessionRuntime = res.resultJson?.sessionRuntime;
-    expect(
-      sessionRuntime && typeof sessionRuntime === "object" && "mcpServerCount" in sessionRuntime
-        ? sessionRuntime.mcpServerCount
-        : undefined,
-    ).toBe(1);
-  });
-
-  it("omits mcpServerCount from sessionRuntime when no MCP servers are present", async () => {
-    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
-    const run = createOmpAcpExecutor();
-    const res = await run(baseCtx({
-      config: { command: `${process.execPath} ${fakeAcp}` },
-      runtimeMcp: { getServers: () => [] },
-    }));
-    // No fork/rotation/MCP servers -> sessionRuntime stays empty and is not
-    // attached to resultJson at all.
-    const sessionRuntime = res.resultJson?.sessionRuntime;
-    expect(
-      sessionRuntime && typeof sessionRuntime === "object" && "mcpServerCount" in sessionRuntime
-        ? sessionRuntime.mcpServerCount
-        : undefined,
-    ).toBeUndefined();
-    expect(res.resultJson?.sessionRuntime).toBeUndefined();
-  });
-
-  it("warns when connection tools arrive outside the declared native_mcp channel", async () => {
-    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
-    const events: Array<{ level?: string; message?: string }> = [];
-    const run = createOmpAcpExecutor();
-    const res = await run(baseCtx({
-      config: { command: `${process.execPath} ${fakeAcp}` },
-      // invocation_context delivery: the tools exist as data, no MCP server
-      // carries them, and the adapter has no way to serve them itself.
-      runtimeTools: runtimeToolsAccess("http://paperclip.test/mcp/runtime-tools", "run-tools-bearer-SENTINEL"),
-      runtimeMcp: { getServers: () => [] },
-      onEvent: async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); },
-    }));
-    const warnings = events.filter(
-      (e) => e.level === "warn" && /connection tools/i.test(e.message ?? ""),
-    );
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0]?.message).toContain("native_mcp");
-    // The run-scoped bearer is a credential: it must never reach events or
-    // the heartbeat evidence blob.
-    expect(JSON.stringify(events)).not.toContain("SENTINEL");
-    expect(JSON.stringify(res.resultJson ?? {})).not.toContain("SENTINEL");
-  });
-
-  it("stays quiet when the connections server is delivered over ACP", async () => {
-    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
-    const events: Array<{ level?: string; message?: string }> = [];
-    const run = createOmpAcpExecutor();
-    const res = await run(baseCtx({
-      config: { command: `${process.execPath} ${fakeAcp}` },
-      runtimeTools: runtimeToolsAccess("http://paperclip.test/mcp/runtime-tools", "run-tools-bearer-SENTINEL"),
-      runtimeMcp: {
-        getServers: () => [{
-          name: "Paperclip connections",
-          url: "http://paperclip.test/mcp/runtime-tools",
-          token: "mcp-token-SENTINEL",
-          connectionId: "paperclip-runtime-tools",
-        }],
-      },
-      onEvent: async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); },
-    }));
-    expect(events.some((e) => /connection tools/i.test(e.message ?? ""))).toBe(false);
-    const sessionRuntime = res.resultJson?.sessionRuntime;
-    expect(
-      sessionRuntime && typeof sessionRuntime === "object" && "mcpServerCount" in sessionRuntime
-        ? sessionRuntime.mcpServerCount
-        : undefined,
-    ).toBe(1);
-    expect(JSON.stringify(events)).not.toContain("SENTINEL");
-    expect(JSON.stringify(res.resultJson ?? {})).not.toContain("SENTINEL");
-  });
-
   it("records lastRotation into sessionRuntime when compaction trips", async () => {
-    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+    fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
     const res = await run(baseCtx({
       config: { command: `${process.execPath} ${fakeAcp}`, sessionMaxRuns: 1 },
@@ -1184,7 +1011,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("saveState failure: warn emitted, run still returns the engine result", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "brand-new", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "brand-new", sessionKey: "sk" } });
     const events: Array<{ level?: string; message: string }> = [];
     const run = createOmpAcpExecutor();
     const saveSpy = vi.spyOn(sessionState, "saveState").mockRejectedValue(new Error("simulated disk full"));
@@ -1220,7 +1047,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     const addr = server.address();
     const port = typeof addr === "object" && addr !== null && "port" in addr ? addr.port : 0;
     try {
-      fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "sess-b", sessionKey: "sk" } });
+      fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "sess-b", sessionKey: "sk" } });
       const run = createOmpAcpExecutor();
       const ctx = baseCtx({
         authToken: "jwt",
@@ -1256,7 +1083,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     const addr = server.address();
     const port = typeof addr === "object" && addr !== null && "port" in addr ? addr.port : 0;
     try {
-      const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "sess-b", sessionKey: "sk" } });
+      const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "sess-b", sessionKey: "sk" } });
       const events: Array<{ message: string }> = [];
       const run = createOmpAcpExecutor();
       const ctx = baseCtx({
@@ -1301,7 +1128,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     const addr = server.address();
     const port = typeof addr === "object" && addr !== null && "port" in addr ? addr.port : 0;
     try {
-      const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "sess-b", sessionKey: "sk" } });
+      const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "sess-b", sessionKey: "sk" } });
       const events: Array<{ message: string }> = [];
       const run = createOmpAcpExecutor();
       const ctx = baseCtx({
@@ -1350,7 +1177,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     try {
       // local mode (no broker): reports=[], cost from result.usage (via recentRuns mean);
       // two runs with identical usage -> the digest bucket is unchanged -> one post.
-      fakeEngine({ exitCode: 0, usage: { inputTokens: 1000, outputTokens: 100 }, usageBasis: "per_run", sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+      fakeTransport({ exitCode: 0, usage: { inputTokens: 1000, outputTokens: 100 }, usageBasis: "per_run", sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
       const run = createOmpAcpExecutor();
       const ctx = baseCtx({
         authToken: "jwt",
@@ -1385,7 +1212,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     const addr = server.address();
     const port = typeof addr === "object" && addr !== null && "port" in addr ? addr.port : 0;
     try {
-      fakeEngine({ exitCode: 0, usage: { inputTokens: 1000, outputTokens: 100 }, usageBasis: "per_run", sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+      fakeTransport({ exitCode: 0, usage: { inputTokens: 1000, outputTokens: 100 }, usageBasis: "per_run", sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
       const run = createOmpAcpExecutor();
       const ctx = baseCtx({
         authToken: "jwt",
@@ -1427,7 +1254,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     const addr = server.address();
     const port = typeof addr === "object" && addr !== null && "port" in addr ? addr.port : 0;
     try {
-      const executorFn = fakeEngine({ exitCode: 0, usage: { inputTokens: 1000, outputTokens: 100, cachedInputTokens: 0 }, usageBasis: "per_run", sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+      const executorFn = fakeTransport({ exitCode: 0, usage: { inputTokens: 1000, outputTokens: 100, cachedInputTokens: 0 }, usageBasis: "per_run", sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
       const events: Array<{ message: string }> = [];
       const run = createOmpAcpExecutor();
       const ctx = baseCtx({
@@ -1479,23 +1306,23 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
       ctx.context.taskId = ISSUE_ID;
       vi.stubEnv("PAPERCLIP_API_URL", `http://127.0.0.1:${port}`);
       // run 1: emits a cost card ($ + /heartbeat est.)
-      fakeEngine({ exitCode: 0, usage: { inputTokens: 1000, outputTokens: 100, cachedInputTokens: 500 }, usageBasis: "per_run", sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+      fakeTransport({ exitCode: 0, usage: { inputTokens: 1000, outputTokens: 100, cachedInputTokens: 500 }, usageBasis: "per_run", sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
       await createOmpAcpExecutor()(ctx);
       expect(usagePosts()).toHaveLength(1);
       const summary = (usagePosts()[0].body as { summary?: string }).summary ?? "";
       expect(summary).toContain("$");
       expect(summary).toContain("/heartbeat est.");
       // run 2: identical usage -> digest unchanged -> suppressed
-      fakeEngine({ exitCode: 0, usage: { inputTokens: 1000, outputTokens: 100, cachedInputTokens: 500 }, usageBasis: "per_run", sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+      fakeTransport({ exitCode: 0, usage: { inputTokens: 1000, outputTokens: 100, cachedInputTokens: 500 }, usageBasis: "per_run", sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
       await createOmpAcpExecutor()(ctx);
       expect(usagePosts()).toHaveLength(1);
       // run 3: DIFFERENT usage -> digest changes -> second card
-      fakeEngine({ exitCode: 0, usage: { inputTokens: 9000, outputTokens: 900, cachedInputTokens: 500 }, usageBasis: "per_run", sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+      fakeTransport({ exitCode: 0, usage: { inputTokens: 9000, outputTokens: 900, cachedInputTokens: 500 }, usageBasis: "per_run", sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
       await createOmpAcpExecutor()(ctx);
       expect(usagePosts()).toHaveLength(2);
       // session_cumulative run: does NOT append to recentRuns
       const before = (await loadState(sessionIntelDir("co-1", "agent-1"))).recentRuns.length;
-      fakeEngine({ exitCode: 0, usage: { inputTokens: 99999, outputTokens: 9999, cachedInputTokens: 9999 }, usageBasis: "session_cumulative", sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+      fakeTransport({ exitCode: 0, usage: { inputTokens: 99999, outputTokens: 9999, cachedInputTokens: 9999 }, usageBasis: "session_cumulative", sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
       await createOmpAcpExecutor()(ctx);
       const after = (await loadState(sessionIntelDir("co-1", "agent-1"))).recentRuns.length;
       expect(after).toBe(before);
@@ -1526,7 +1353,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
       // A chat wake: taskId is not an issue id, so no board endpoint exists.
       ctx.context.taskId = "chat-1";
       vi.stubEnv("PAPERCLIP_API_URL", `http://127.0.0.1:${port}`);
-      fakeEngine({
+      fakeTransport({
         exitCode: 0, usage: { inputTokens: 1000, outputTokens: 100 }, usageBasis: "per_run",
         sessionParams: { acpSessionId: "s", sessionKey: "sk" },
       });
@@ -1541,7 +1368,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("catalog probe strips trailing flags from agentCommand (thinking:off → base 'omp')", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
     modelsMocks.listOmpModels.mockClear();
     await run(baseCtx({ config: { command: "omp", model: "prov/m", thinking: "off" } }));
@@ -1555,7 +1382,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("warns (not aborts) for an invalid thinking level", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "s", sessionKey: "sk" } });
     const events: Array<{ eventType?: string; level?: string; message?: string }> = [];
     const ctx = baseCtx({
       config: { command: "omp", thinking: "bogus" },
@@ -1574,7 +1401,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     modelsMocks.listOmpModels.mockImplementation(async () => [
       { id: "prov/m", label: "M", pricingStatus: "unknown" },
     ]);
-    fakeEngine({
+    fakeTransport({
       exitCode: 0, model: "prov/m", costUsd: 0,
       usage: { inputTokens: 10, outputTokens: 5 }, usageBasis: "per_run",
       sessionParams: { acpSessionId: "s", sessionKey: "sk" },
@@ -1591,7 +1418,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     modelsMocks.listOmpModels.mockImplementation(async () => [
       { id: "prov/m", label: "M", pricingStatus: "free" },
     ]);
-    fakeEngine({
+    fakeTransport({
       exitCode: 0, model: "prov/m", costUsd: null,
       usage: { inputTokens: 10, outputTokens: 5 }, usageBasis: "per_run",
       sessionParams: { acpSessionId: "s", sessionKey: "sk" },
@@ -1605,7 +1432,7 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
   });
 
   it("refuses to name a billed model when a fallback chain could have switched", async () => {
-    fakeEngine({
+    fakeTransport({
       exitCode: 0, model: "prov/m", costUsd: 0.5,
       usage: { inputTokens: 10, outputTokens: 5 }, usageBasis: "per_run",
       sessionParams: { acpSessionId: "s", sessionKey: "sk" },
@@ -1660,7 +1487,7 @@ describe("resolveOmpAgentCommand", () => {
     ]);
     serverUtilsMocks.resolvePaperclipDesiredSkillNames.mockReturnValue(["paperclipai/echo"]);
     serverUtilsMocks.readPaperclipSkillMarkdown.mockResolvedValue("# Echo skill");
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
     await run(baseCtx({
       config: { command: `${process.execPath} ${fakeAcp}`, skillsAsTools: true },
@@ -1683,7 +1510,7 @@ describe("resolveOmpAgentCommand", () => {
     ]);
     serverUtilsMocks.resolvePaperclipDesiredSkillNames.mockReturnValue(["paperclipai/echo"]);
     serverUtilsMocks.readPaperclipSkillMarkdown.mockResolvedValue("# Echo skill");
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
     await run(baseCtx({
       config: { command: `${process.execPath} ${fakeAcp}`, skillsAsTools: false },
@@ -1703,7 +1530,7 @@ describe("resolveOmpAgentCommand", () => {
     ]);
     serverUtilsMocks.resolvePaperclipDesiredSkillNames.mockReturnValue(["paperclipai/echo"]);
     serverUtilsMocks.readPaperclipSkillMarkdown.mockResolvedValue("# Echo skill");
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     const run = createOmpAcpExecutor();
     await run(baseCtx({
       config: { command: `${process.execPath} ${fakeAcp}`, skillsAsTools: "false" },
@@ -1867,82 +1694,64 @@ describe("resolveSessionCwd", () => {
   });
 });
 
-describe("buildOmpAcpConfig", () => {
-  it("sets agent custom and derived agentCommand, passes engine knobs through", () => {
-    const out = buildOmpAcpConfig({ model: "openrouter/glm-5.2", mode: "oneshot" });
-    expect(out.agent).toBe("custom");
+describe("buildRunChildConfig", () => {
+  it("derives the run command and passes operator knobs through", () => {
+    const out = buildRunChildConfig({ model: "openrouter/glm-5.2", mode: "oneshot" });
     expect(out.agentCommand).toBe("omp acp");
     expect(out.mode).toBe("oneshot");
-    expect(out.permissionMode).toBe("approve-all");
-    expect(out.nonInteractivePermissions).toBe("deny");
     expect(out.model).toBe("openrouter/glm-5.2");
   });
-  it("strips effort/thinkingEffort (unverified ACP control wiring)", () => {
-    const out = buildOmpAcpConfig({ effort: "high", thinkingEffort: "high" });
-    expect(out.effort).toBeUndefined();
-    expect(out.thinkingEffort).toBeUndefined();
-  });
-  it("strips reasoningEffort/modelReasoningEffort (the engine's other effort keys)", () => {
-    const out = buildOmpAcpConfig({
-      reasoningEffort: "high", modelReasoningEffort: "high",
-    });
-    expect(out.reasoningEffort).toBeUndefined();
-    expect(out.modelReasoningEffort).toBeUndefined();
-  });
-  it("keeps the thinking level out of agentCommand (the run fingerprint input)", () => {
-    // The level rides the run's settings overlay instead; a flag here would make
-    // every level edit a fresh-session trigger (the v0.9 behaviour).
-    expect(buildOmpAcpConfig({ thinking: "medium" }).agentCommand).toBe("omp acp");
-  });
-  it("keeps stateDir only when set", () => {
-    expect(buildOmpAcpConfig({}).stateDir).toBeUndefined();
-    expect(buildOmpAcpConfig({ stateDir: "/tmp/s" }).stateDir).toBe("/tmp/s");
+  it("keeps the thinking level out of agentCommand except the off flag", () => {
+    // The level rides the run's settings overlay instead; only `off`, which the
+    // setting cannot express, stays on the command line.
+    expect(buildRunChildConfig({ thinking: "medium" }).agentCommand).toBe("omp acp");
+    expect(buildRunChildConfig({ thinking: "off" }).agentCommand).toBe("omp acp --thinking off");
   });
   it("normalizes the model through resolveModel", () => {
-    const out = buildOmpAcpConfig(
+    const out = buildRunChildConfig(
       { model: "glm-5.2" },
+      bridgePath,
       (m) => (m === "glm-5.2" ? "zai/glm-5.2" : null),
-      () => null,
     );
     expect(out.model).toBe("zai/glm-5.2");
   });
   it("keeps the raw model when resolveModel returns null", () => {
-    expect(buildOmpAcpConfig({ model: "glm-5.2" }, () => null).model).toBe("glm-5.2");
+    expect(buildRunChildConfig({ model: "glm-5.2" }, bridgePath, () => null).model).toBe("glm-5.2");
   });
   it("honors an explicit timeoutSec, including 0 and numeric strings", () => {
     // resolveCost returns a FREE cost (would derive 1800) so an explicit 0
     // can only come from the explicit-timeout branch, not derivation.
     const free = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
-    expect(buildOmpAcpConfig({ model: "m", timeoutSec: 0 }, () => "m", free).timeoutSec).toBe(0);
-    expect(buildOmpAcpConfig({ model: "m", timeoutSec: 60 }, () => "m", free).timeoutSec).toBe(60);
-    expect(buildOmpAcpConfig({ model: "m", timeoutSec: "300" }, () => "m", free).timeoutSec).toBe(300);
+    expect(buildRunChildConfig({ model: "m", timeoutSec: 0 }, bridgePath, () => "m", free).timeoutSec).toBe(0);
+    expect(buildRunChildConfig({ model: "m", timeoutSec: 60 }, bridgePath, () => "m", free).timeoutSec).toBe(60);
+    expect(buildRunChildConfig({ model: "m", timeoutSec: "300" }, bridgePath, () => "m", free).timeoutSec).toBe(300);
   });
-  it("prefers timeoutSec over acpTimeoutSec", () => {
-    expect(buildOmpAcpConfig({ model: "m", timeoutSec: 60, acpTimeoutSec: 123 }).timeoutSec).toBe(60);
+  it("prefers timeoutSec over acpTimeoutSec and falls back to the alias", () => {
+    expect(buildRunChildConfig({ model: "m", timeoutSec: 60, acpTimeoutSec: 123 }).timeoutSec).toBe(60);
+    expect(buildRunChildConfig({ model: "m", acpTimeoutSec: 123 }).timeoutSec).toBe(123);
   });
-  it("falls back to acpTimeoutSec when timeoutSec is absent", () => {
-    expect(buildOmpAcpConfig({ model: "m", acpTimeoutSec: 123 }).timeoutSec).toBe(123);
-  });
-  it("derives timeoutSec from the resolved model cost when both are absent", () => {
-    const free = buildOmpAcpConfig(
+  it("derives timeoutSec from the resolved model cost when neither is configured", () => {
+    const free = buildRunChildConfig(
       { model: "m" },
+      bridgePath,
       () => "m",
       () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }),
     );
     expect(free.timeoutSec).toBe(1800);
-    const priced = buildOmpAcpConfig(
+    const priced = buildRunChildConfig(
       { model: "m" },
+      bridgePath,
       () => "m",
       () => ({ input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 }),
     );
     expect(priced.timeoutSec).toBe(0);
   });
-  it("strips OMP_AUTH_BROKER_* from output env when credentialMode is not broker (authoritative switch)", () => {
+  it("strips OMP_AUTH_BROKER_* from the run child env when credentialMode is not broker (authoritative switch)", () => {
     const input = {
       credentialMode: "local",
       env: { OMP_AUTH_BROKER_URL: "http://b:8765", OMP_AUTH_BROKER_TOKEN: "tok", KEEP: "x" },
     };
-    const out = buildOmpAcpConfig(input);
+    const out = buildRunChildConfig(input);
     const env = out.env as Record<string, unknown>;
     expect(env.OMP_AUTH_BROKER_URL).toBeUndefined();
     expect(env.OMP_AUTH_BROKER_TOKEN).toBeUndefined();
@@ -1951,7 +1760,7 @@ describe("buildOmpAcpConfig", () => {
     expect((input.env as Record<string, unknown>).OMP_AUTH_BROKER_URL).toBe("http://b:8765");
   });
   it("preserves OMP_AUTH_BROKER_* in broker mode", () => {
-    const out = buildOmpAcpConfig({
+    const out = buildRunChildConfig({
       credentialMode: "broker",
       env: { OMP_AUTH_BROKER_URL: "http://b:8765", OMP_AUTH_BROKER_TOKEN: "tok" },
     });
@@ -1964,11 +1773,9 @@ describe("deriveDefaultTimeoutSec", () => {
   it("returns 1800 for a free/zero-cost model", () => {
     expect(deriveDefaultTimeoutSec({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 })).toBe(1800);
   });
-
   it("returns 0 for a priced model", () => {
     expect(deriveDefaultTimeoutSec({ input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 })).toBe(0);
   });
-
   it("returns 0 when cost is absent/unavailable", () => {
     expect(deriveDefaultTimeoutSec(null)).toBe(0);
     expect(deriveDefaultTimeoutSec(undefined)).toBe(0);
@@ -2114,23 +1921,6 @@ describe("driveAcpSession", () => {
     expect(out.error).toContain("no session");
   }, 15_000);
 });
-describe("omp-local executor retry composition", () => {
-  it("attaches retryChain only when a retry actually occurred", async () => {
-    const failOnce = async (): Promise<AdapterExecutionResult> => ({
-      exitCode: 0, signal: null, timedOut: false,
-      errorCode: "acpx_turn_failed", errorMeta: { retryable: true },
-    });
-    const ok = async (): Promise<AdapterExecutionResult> => ({
-      exitCode: 0, signal: null, timedOut: false, errorCode: null,
-    });
-    const retried = await runWithFreshSessionRetry(failOnce, { enabled: true, freshRetries: 1 }, {});
-    const normal = await runWithFreshSessionRetry(ok, { enabled: true, freshRetries: 1 }, {});
-    expect(withRetryChain(retried.result, retried.chain).resultJson?.retryChain).toHaveLength(2);
-    // Normal runs carry no retryChain noise.
-    expect(withRetryChain(normal.result, normal.chain).resultJson).toBeUndefined();
-  });
-});
-
 describe("session scope fence", () => {
   let tmpRoot: string;
   beforeAll(async () => {
@@ -2140,7 +1930,7 @@ describe("session scope fence", () => {
     await rm(tmpRoot, { recursive: true, force: true });
   });
   beforeEach(async () => {
-    engineMocks.createAcpxEngineExecutor.mockReset();
+    transportMocks.transport.mockReset();
     serverUtilsMocks.readPaperclipSkillSyncPreference.mockReturnValue({
       explicit: false, desiredSkills: [], desiredSkillEntries: [],
     });
@@ -2172,7 +1962,7 @@ describe("session scope fence", () => {
   }
 
   it("fails closed before any engine work when isolated runs without broker credentials", async () => {
-    const executorFn = fakeEngine({ exitCode: 0 });
+    const executorFn = fakeTransport({ exitCode: 0 });
     const run = createOmpAcpExecutor();
     const result = await run(baseCtx({
       config: { command: `${process.execPath} ${fakeAcp}`, sessionScope: "isolated" },
@@ -2183,7 +1973,7 @@ describe("session scope fence", () => {
   });
 
   it("points the run child at the per-agent dir", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     await createOmpAcpExecutor()(scopedCtx());
     const merged = executorFn.mock.calls[0][0] as { config: { env?: Record<string, string> } };
     expect(merged.config.env?.PI_CODING_AGENT_DIR).toBe(ompAgentDir("co-1", "agent-1"));
@@ -2192,7 +1982,7 @@ describe("session scope fence", () => {
   });
 
   it("leaves a shared run on the host agent dir", async () => {
-    const executorFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    const executorFn = fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     await createOmpAcpExecutor()(baseCtx({ config: { command: `${process.execPath} ${fakeAcp}` } }));
     const merged = executorFn.mock.calls[0][0] as { config: { env?: Record<string, string> } };
     expect(merged.config.env?.PI_CODING_AGENT_DIR).toBeUndefined();
@@ -2201,13 +1991,13 @@ describe("session scope fence", () => {
   it("warns once when the scope flips away from the previous run's session", async () => {
     const events: Array<{ level?: string; message?: string }> = [];
     const onEvent = async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); };
-    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     await createOmpAcpExecutor()(baseCtx({
       config: { command: `${process.execPath} ${fakeAcp}` }, onEvent,
     }));
     expect(events.some((e) => e.message?.includes("sessionScope"))).toBe(false);
 
-    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "new", sessionKey: "sk-new" } });
+    fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "new", sessionKey: "sk-new" } });
     const result = await createOmpAcpExecutor()(scopedCtx({ onEvent }));
     // Guard the assertion below: an early omp_config_error return would also
     // produce zero warnings, and would make "warns once" untestable.
@@ -2224,14 +2014,14 @@ describe("session scope fence", () => {
   it("does not warn again on the next isolated run", async () => {
     const events: Array<{ level?: string; message?: string }> = [];
     const onEvent = async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); };
-    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     await createOmpAcpExecutor()(baseCtx({ config: { command: `${process.execPath} ${fakeAcp}` } }));
-    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "new", sessionKey: "sk-new" } });
+    fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "new", sessionKey: "sk-new" } });
     await createOmpAcpExecutor()(scopedCtx({ onEvent }));
     const first = events.filter((e) => e.message?.includes("sessionScope switched")).length;
     expect(first).toBe(1);
     events.length = 0;
-    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "new", sessionKey: "sk-new" } });
+    fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "new", sessionKey: "sk-new" } });
     await createOmpAcpExecutor()(scopedCtx({ onEvent }));
     expect(events.filter((e) => e.message?.includes("sessionScope switched"))).toHaveLength(0);
   });
@@ -2240,7 +2030,7 @@ describe("session scope fence", () => {
     const events: Array<{ level?: string; message?: string }> = [];
     const onEvent = async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); };
     const browserConfig = { sessionBrowser: "true" } as Record<string, unknown>;
-    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     await createOmpAcpExecutor()(baseCtx({
       config: { command: `${process.execPath} ${fakeAcp}`, sessionSnapshotDiagnostic: true, ...browserConfig },
       onEvent,
@@ -2255,7 +2045,7 @@ describe("session scope fence", () => {
   it("emits no host-wide diagnostic by default", async () => {
     const events: Array<{ level?: string; message?: string }> = [];
     const onEvent = async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); };
-    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     await createOmpAcpExecutor()(baseCtx({
       config: { command: `${process.execPath} ${fakeAcp}` }, onEvent,
     }));
@@ -2265,12 +2055,12 @@ describe("session scope fence", () => {
   it("warns once when the scope flips back to shared", async () => {
     const events: Array<{ level?: string; message?: string }> = [];
     const onEvent = async (ev: unknown) => { events.push(ev as { level?: string; message?: string }); };
-    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
+    fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } });
     await createOmpAcpExecutor()(baseCtx({ config: { command: `${process.execPath} ${fakeAcp}` } }));
-    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "new", sessionKey: "sk-new" } });
+    fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "new", sessionKey: "sk-new" } });
     await createOmpAcpExecutor()(scopedCtx({ onEvent }));
     events.length = 0;
-    fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "newer", sessionKey: "sk-newer" } });
+    fakeTransport({ exitCode: 0, sessionParams: { acpSessionId: "newer", sessionKey: "sk-newer" } });
     const result = await createOmpAcpExecutor()(baseCtx({
       config: { command: `${process.execPath} ${fakeAcp}` }, onEvent,
     }));
@@ -2337,205 +2127,3 @@ describe("managed fork cwd precondition", () => {
   }, 20_000);
 });
 
-const fakeRpc = path.resolve(
-  path.dirname(fileURLToPath(import.meta.url)), "../../test-fixtures/fake-rpc.mjs",
-);
-
-describe("managed lane (executionMode)", () => {
-  let tmpRoot: string;
-  let host: Awaited<ReturnType<typeof startHost>> | null;
-
-  beforeAll(async () => {
-    tmpRoot = await mkdtemp(path.join(os.tmpdir(), "omp-managed-test-"));
-  });
-  afterAll(async () => {
-    await rm(tmpRoot, { recursive: true, force: true });
-  });
-  beforeEach(async () => {
-    await rm(path.join(tmpRoot, "instances"), { recursive: true, force: true });
-    vi.stubEnv("PAPERCLIP_HOME", tmpRoot);
-    vi.stubEnv("PAPERCLIP_INSTANCE_ID", "test-managed");
-    engineMocks.createAcpxEngineExecutor.mockReset();
-    modelsMocks.listOmpModels.mockImplementation(async () => modelsMocks.defaultModels);
-    serverUtilsMocks.readPaperclipSkillSyncPreference.mockReturnValue({
-      explicit: false, desiredSkills: [], desiredSkillEntries: [],
-    });
-    serverUtilsMocks.readPaperclipRuntimeSkillEntries.mockResolvedValue([]);
-    serverUtilsMocks.resolvePaperclipDesiredSkillNames.mockReturnValue([]);
-    serverUtilsMocks.readPaperclipSkillMarkdown.mockResolvedValue(null);
-    skillManifestMocks.materializeSkillManifest.mockReset();
-    host = await startHost({
-      rootDir: path.join(tmpRoot, "instances", "test-managed", "omp-host"),
-      hostIdleMs: 50,
-      workerIdleMs: 50,
-    });
-  });
-  afterEach(async () => {
-    if (host !== null) await host.close("test").catch(() => {});
-    host = null;
-    vi.unstubAllEnvs();
-  });
-
-  it("runs through the supervisor, maps events, reports the worker and never builds the engine", async () => {
-    const engineFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "never", sessionKey: "never" } });
-    const events: Array<{ eventType?: string; level?: string; message?: string }> = [];
-    const spawns: Array<{ pid: number; processGroupId: number | null; startedAt: string }> = [];
-    const usages: Array<Record<string, unknown>> = [];
-    const run = createOmpAcpExecutor();
-    const result = await run(baseCtx({
-      config: {
-        executionMode: "managed",
-        agentCommand: `${process.execPath} ${fakeRpc}`,
-      },
-      authToken: "run-jwt",
-      onEvent: async (event: unknown) => { events.push(event as { eventType?: string }); },
-      onSpawn: async (meta: { pid: number; processGroupId: number | null; startedAt: string }) => { spawns.push(meta); },
-      onUsage: async (receipt: Record<string, unknown>) => { usages.push(receipt); },
-      runtimeMcp: { getServers: () => [] },
-    }));
-    expect(engineFn).not.toHaveBeenCalled();
-    expect(result.exitCode).toBe(0);
-    expect(result.sessionParams?.acpSessionId).toBe("sess-1");
-    expect(result.usage).toEqual({ inputTokens: 110, outputTokens: 20, cachedInputTokens: 40 });
-    expect(result.usageBasis).toBe("per_run");
-    expect(result.model).toBe("prov/m");
-    expect(spawns).toHaveLength(1);
-    expect(spawns[0].pid).toBeGreaterThan(0);
-    expect(spawns[0].processGroupId).toBe(spawns[0].pid);
-    expect(events.some((event) => event.eventType === "omp.turn")).toBe(true);
-    expect(usages).toHaveLength(1);
-    expect(usages[0]).toMatchObject({ usageBasis: "per_run", complete: true });
-    expect(JSON.stringify(events)).not.toContain("run-jwt");
-    const ledger = await readLedgerRecords(path.join(tmpRoot, "instances", "test-managed", "omp-host"));
-    expect(ledger.map((record) => record.state)).toEqual([
-      "leased", "worker_ready", "session_open", "prompting", "settled", "closed",
-    ]);
-    expect(JSON.stringify(ledger)).not.toContain("run-jwt");
-  }, 30_000);
-
-  it("steers a running managed turn only when steering is enabled", async () => {
-    for (const steering of ["on", "off"] as const) {
-      const controller = new AbortController();
-      const spawned = Promise.withResolvers<void>();
-      const ctx = baseCtx({
-        runId: `run-steer-${steering}`,
-        config: {
-          executionMode: "managed",
-          agentCommand: `${process.execPath} ${fakeRpc}`,
-          env: { FAKE_RPC_MODE: "hang" },
-          steering,
-        },
-        onSpawn: async () => spawned.resolve(),
-        signal: controller.signal,
-      } as never);
-      const running = createOmpAcpExecutor()(ctx);
-      await spawned.promise;
-      const steered = await steerManagedRun({ runId: ctx.runId, message: "look at the failing test" });
-      if (steering === "on") {
-        expect(steered).toEqual({ ok: true });
-      } else {
-        expect(steered.ok).toBe(false);
-        expect(steered.error).toContain("steering is disabled");
-      }
-      controller.abort();
-      const result = await running;
-      expect(result.resultJson).toMatchObject({ status: "aborted" });
-    }
-  }, 30_000);
-
-  it("cancels an already-aborted run after the begin reaches the supervisor", async () => {
-    const controller = new AbortController();
-    controller.abort();
-    const result = await createOmpAcpExecutor()(baseCtx({
-      config: {
-        executionMode: "managed",
-        agentCommand: `${process.execPath} ${fakeRpc}`,
-        env: { FAKE_RPC_MODE: "hang" },
-      },
-      signal: controller.signal,
-    } as never));
-    expect(result.resultJson).toMatchObject({ status: "aborted" });
-    const ledger = await readLedgerRecords(path.join(tmpRoot, "instances", "test-managed", "omp-host"));
-    expect(ledger.some((record) => record.state === "settled" && record.cause === "cancel")).toBe(true);
-  }, 30_000);
-
-  it("answers the fork cwd from the host session index without an ACP list probe", async () => {
-    const work = path.join(tmpRoot, "work-fork");
-    const other = path.join(tmpRoot, "work-fork-other");
-    await mkdir(work, { recursive: true });
-    await mkdir(other, { recursive: true });
-    // One wrapper serves both lanes: `acp` for the probe lane, everything else
-    // (--mode rpc) for the worker.
-    const wrapper = path.join(tmpRoot, "fake-omp.sh");
-    await writeFile(
-      wrapper,
-      `#!/bin/sh\nfor a in "$@"; do if [ "$a" = "acp" ]; then exec "${process.execPath}" "${fakeAcp}"; fi; done\nexec "${process.execPath}" "${fakeRpc}" "$@"\n`,
-      { mode: 0o755 },
-    );
-    const frameFile = path.join(tmpRoot, "fork-frames.log");
-    vi.stubEnv("FAKE_ACP_FRAME_LOG", frameFile);
-    const first = await createOmpAcpExecutor()(baseCtx({
-      runId: "run-fork-1",
-      config: { executionMode: "managed", command: wrapper, cwd: work, sessionBrowser: false },
-      runtime: {
-        sessionId: null,
-        sessionParams: { sessionKey: "sk-fork-1", cwd: work },
-        sessionDisplayId: null,
-        taskKey: "task",
-      },
-    }));
-    expect(first.exitCode).toBe(0);
-    const second = await createOmpAcpExecutor()(baseCtx({
-      runId: "run-fork-2",
-      config: {
-        executionMode: "managed", command: wrapper, cwd: other, sessionBrowser: false,
-        sessionForkSourceId: "sess-new-1", sessionForkToken: "t1",
-      },
-      runtime: {
-        sessionId: null,
-        sessionParams: { acpSessionId: "sess-new-1", sessionKey: "sk-fork-2", cwd: work },
-        sessionDisplayId: null,
-        taskKey: "task",
-      },
-    }));
-    // Managed fork finds the source cwd without the ACP list probe, but the
-    // forked transcript lives in omp's agent-dir storage while the worker
-    // resumes by directory: the run must refuse rather than silently continue
-    // the source session under the fork's id (v0.12 limitation, documented).
-    expect(second.errorCode).toBe("omp_host_run_failed");
-    expect(second.errorMessage).toContain("refusing to continue another session");
-    const frames = await readAcpFrames(frameFile);
-    const fork = frames.find((frame) => frame.method === "session/fork");
-    expect(fork?.params.cwd).toBe(work);
-    expect(frames.some((frame) => frame.method === "session/list")).toBe(false);
-  }, 30_000);
-
-  it("does not warn about a missing MCP server in managed mode", async () => {
-    const events: Array<{ message?: string }> = [];
-    const result = await createOmpAcpExecutor()(baseCtx({
-      config: { executionMode: "managed", agentCommand: `${process.execPath} ${fakeRpc}` },
-      runtimeTools: { mcpEndpoint: "http://paperclip.test/runtime-tools/mcp", bearerToken: "ct-x" },
-      runtimeMcp: { getServers: () => [] },
-      onEvent: async (event: unknown) => { events.push(event as { message?: string }); },
-    } as never));
-    expect(result.exitCode).toBe(0);
-    expect(events.some((event) => (event.message ?? "").includes("connection tools are unavailable this run: Paperclip delivered no MCP server"))).toBe(false);
-  }, 30_000);
-
-  it("refuses an unknown executionMode before any lane is constructed", async () => {
-    const engineFn = fakeEngine({ exitCode: 0 });
-    const result = await createOmpAcpExecutor()(baseCtx({ config: { executionMode: "managd" } }));
-    expect(result.errorCode).toBe("omp_config_error");
-    expect(result.errorMessage).toContain("executionMode is 'managd'");
-    expect(engineFn).not.toHaveBeenCalled();
-  });
-
-  it("stays on the engine lane when executionMode is absent", async () => {
-    const engineFn = fakeEngine({ exitCode: 0, sessionParams: { acpSessionId: "e-1", sessionKey: "sk" } });
-    const result = await createOmpAcpExecutor()(baseCtx({
-      config: { command: `${process.execPath} ${fakeAcp}` },
-    }));
-    expect(engineFn).toHaveBeenCalledOnce();
-    expect(result.exitCode).toBe(0);
-  });
-});

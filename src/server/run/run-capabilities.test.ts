@@ -11,8 +11,8 @@ import type { CapabilityId, CapabilitySet } from "../capabilities.js";
 /**
  * The run path reads the capability cache (it never probes) and reports the
  * features THIS run depends on that the build lacks. This pins that wiring:
- * a run that asks for a thinking level on a build without the `thinking`
- * config option gets one named warning and still plans normally.
+ * a run on a build whose worker cannot answer `get_session_stats` gets one
+ * named warning and still plans normally.
  */
 
 const capabilityMocks = vi.hoisted(() => ({ snapshot: { value: null as unknown } }));
@@ -40,7 +40,7 @@ function capabilitySet(lacking: CapabilityId[]): CapabilitySet {
     key: "test-key",
     observedAt,
     version: null,
-    mode: "engine",
+    mode: "managed",
     acp: { ok: true, configOptionIds: ["mode", "model", "thinking"] },
     capabilities: Object.fromEntries(ids.map((id) => [id, {
       state: lacking.includes(id) ? "no" : "yes",
@@ -84,31 +84,31 @@ function ctx(config: Record<string, unknown>): AdapterExecutionContext {
 
 describe("run-path capability diagnostics", () => {
   it("names the feature the build cannot serve and still plans the run", async () => {
-    capabilityMocks.snapshot.value = capabilitySet(["acp.config.thinking"]);
+    capabilityMocks.snapshot.value = capabilitySet(["rpc.get_session_stats"]);
     const events: Array<{ level?: string; message?: string }> = [];
     const planned = await buildRunPlan(
-      { ...ctx({ command: ompCommand, thinking: "high" }), onEvent: async (event) => {
+      { ...ctx({ command: ompCommand }), onEvent: async (event) => {
         events.push(event as { level?: string; message?: string });
       } },
       { bridge: bridgePath, moduleDir },
     );
     expect(planned.kind).toBe("ready");
-    const thinking = events.filter((event) => /thinking/i.test(event.message ?? ""));
-    expect(thinking).toHaveLength(1);
-    expect(thinking[0].level).toBe("warn");
-    expect(thinking[0].message).toContain("thinking level reaches omp only through its settings overlay");
+    const usage = events.filter((event) => /get_session_stats/.test(event.message ?? ""));
+    expect(usage).toHaveLength(1);
+    expect(usage[0].level).toBe("warn");
+    expect(usage[0].message).toContain("usage receipt");
   });
 
   it("stays silent when the build has every surface the run needs", async () => {
     capabilityMocks.snapshot.value = capabilitySet([]);
     const events: Array<{ level?: string; message?: string }> = [];
     await buildRunPlan(
-      { ...ctx({ command: ompCommand, thinking: "high" }), onEvent: async (event) => {
+      { ...ctx({ command: ompCommand }), onEvent: async (event) => {
         events.push(event as { level?: string; message?: string });
       } },
       { bridge: bridgePath, moduleDir },
     );
-    expect(events.some((event) => /capability|thinking/i.test(event.message ?? ""))).toBe(false);
+    expect(events.some((event) => /capability|get_session_stats/i.test(event.message ?? ""))).toBe(false);
   });
 
   it("never refuses or crashes the run when the capability read itself fails", async () => {
@@ -119,7 +119,7 @@ describe("run-path capability diagnostics", () => {
     const spy = vi.spyOn(actual, "loadCapabilities").mockRejectedValueOnce(new Error("instance root unavailable"));
     const events: Array<{ level?: string; message?: string }> = [];
     const planned = await buildRunPlan(
-      { ...ctx({ command: ompCommand, thinking: "high" }), onEvent: async (event) => {
+      { ...ctx({ command: ompCommand }), onEvent: async (event) => {
         events.push(event as { level?: string; message?: string });
       } },
       { bridge: bridgePath, moduleDir },
@@ -133,12 +133,12 @@ describe("run-path capability diagnostics", () => {
     capabilityMocks.snapshot.value = null;
     const events: Array<{ level?: string; message?: string }> = [];
     const planned = await buildRunPlan(
-      { ...ctx({ command: ompCommand, thinking: "high" }), onEvent: async (event) => {
+      { ...ctx({ command: ompCommand }), onEvent: async (event) => {
         events.push(event as { level?: string; message?: string });
       } },
       { bridge: bridgePath, moduleDir },
     );
     expect(planned.kind).toBe("ready");
-    expect(events.some((event) => /capability/i.test(event.message ?? ""))).toBe(false);
+    expect(events.some((event) => /capability|get_session_stats/i.test(event.message ?? ""))).toBe(false);
   });
 });

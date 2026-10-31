@@ -5,10 +5,10 @@ import path from "node:path";
  * The four run-child settings overlays, written by one writer.
  *
  * Each kind owns a FIXED filename and is overwritten in place every run. That
- * is the fingerprint rule, and it is why the rule lives here once instead of in
- * four writers: `PI_CONFIG_FILES` is part of the engine's session fingerprint,
- * so a path that changed with the content (or with a value) would rotate the
- * session on every edit. Only the bytes change; the path never does.
+ * is why the rule lives here once instead of in four writers: a path that
+ * changed with the content (or with a value) would make every run inherit a
+ * different `PI_CONFIG_FILES` for no gain. Only the bytes change; the path
+ * never does.
  *
  * The order of `OverlayKind` is the precedence order `PI_CONFIG_FILES` merges
  * in — omp reads the list left to right, so a later file wins.

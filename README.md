@@ -2,21 +2,23 @@
 
 A [Paperclip](https://github.com/paperclipai/paperclip) external adapter that runs
 [oh-my-pi](https://github.com/can1357/oh-my-pi) (`omp`) as managed agent employees —
-registered as adapter type `omp_local`, executed through Paperclip's ACPX engine over the
-Agent Client Protocol.
+registered as adapter type `omp_local`, executed by the per-instance `omp-host`
+supervisor, which drives an `omp --mode rpc` worker over the run ledger.
 
 ## How it works
 
 ```
-Paperclip heartbeat ──▶ omp_local adapter ──▶ ACPX engine (custom lane)
-                                              └─ spawns `omp acp` (ACP v1 over stdio)
-                                                  ├─ session/new · resume · fork
-                                                  ├─ tool calls ⇄ Paperclip permissions
-                                                  └─ usage_update ──▶ cost attribution
+Paperclip heartbeat ──▶ omp_local adapter ──▶ omp-host supervisor (unix socket)
+                                              └─ spawns `omp --mode rpc` (JSONL over stdio)
+                                                  ├─ session open · resume · fork
+                                                  ├─ tool calls ⇄ Paperclip host tools
+                                                  └─ worker stats ──▶ cost attribution
 ```
 
-One execution lane (ACP), zero Paperclip source modifications. Model discovery shells out to
-`omp models ls --json` (live registry incl. custom providers, with rate cards).
+One execution lane, zero Paperclip source modifications. The Agent Client Protocol remains
+the probe lane only (`session/list`, `_omp/*`, `session/fork`, model discovery, the
+environment probe). Model discovery shells out to `omp models ls --json` (live registry incl.
+custom providers, with rate cards).
 
 ## Requirements
 
@@ -52,23 +54,21 @@ Hot-registers — no service restart needed (`requiresRestart` only on reinstall
 | `mode` | `persistent` | `persistent` \| `oneshot` |
 | `permissionMode` | `approve-all` | `approve-reads` / `deny-all` to tighten |
 | `nonInteractivePermissions` | `deny` | fail-closed headless turns |
-| `warmHandleIdleMs` | `0` | pinned to `0` for every run: a reused child keeps the spawning run's `PAPERCLIP_API_KEY`, so a warm hit would act as an earlier run. An operator value > 0 is dropped with a run warning |
-| `timeoutSec` / `graceSec` | `0` / `15` | run timeout / SIGTERM grace (the engine default; the adapter forwards an explicit value) |
-| `stateDir`, `instructionsFilePath`, `cwd`, `env` | unset | passed through to the engine |
+| `timeoutSec` / `graceSec` | `0` / `15` | run timeout / SIGTERM grace (the adapter forwards an explicit value) |
+| `stateDir`, `instructionsFilePath`, `cwd`, `env` | unset | passed through to the run child |
 | `sessionScope` | `"shared"` | `shared` = omp's host agent dir (every employee on the host shares sessions). `isolated` requires `credentialMode: broker`, fences the agent dir per employee, and fails fast otherwise |
-| `executionMode` | `"engine"` | `engine` = today's ACPX-engine path. `managed` = the per-instance `omp-host` supervisor runs an RPC worker (warm reuse, host tools, ledger). Opt-in; `engine` is the rollback |
-| `subagentObservability` | `"summary"` | `off` / `summary` / `events`; managed lane only. Streams bounded `omp.subagent` events and a `resultJson.subagents` snapshot; inert in engine mode |
+| `subagentObservability` | `"summary"` | `off` / `summary` / `events`. Streams bounded `omp.subagent` events and a `resultJson.subagents` snapshot |
 | `thinking` | *(omp default)* | `off`, `auto`, `minimal`…`max`; applied through a settings overlay. Changing it on an existing session costs one rotation (omp keeps a resumed transcript's stored level) |
 | `fallbackChain` | unset | per-agent model fallback chain (`retry.fallbackChains.default`) |
 | `fallbackOn` / `fallbackRevertPolicy` / `waitForUsageReset` / `maxDelayMs` | `any` / `cooldown-expiry` / `false` / unset | failover trigger, revert policy, authorize long usage-reset waits, backoff ceiling |
 
-Permissions are owned by these engine knobs — the adapter never passes `--auto-approve`.
+Permissions are owned by these omp knobs — the adapter never passes `--auto-approve`.
 
 ## Cost transparency
 
 Cost originates from the model's rate card (`omp models ls --json`), parsed into
 `OmpModelInfo.cost` (**USD per 1M tokens**: input, output, cacheRead, cacheWrite).
-The engine accumulates cost through `usage_update` heartbeats; the adapter maps
+The supervisor accumulates cost from the worker's run stats; the adapter maps
 omp's own `pricingStatus` onto the receipt instead of guessing from a zero card:
 
 | omp `pricingStatus` | `costStatus` | `pricingProvenance` |

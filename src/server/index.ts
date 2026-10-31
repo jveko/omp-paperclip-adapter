@@ -64,20 +64,21 @@ export function createServerAdapter(): ServerAdapterModule {
     // a next-run directive (the adapter owns no live connection).
     getConfigSchema: () => getSessionConfigSchema(),
     // Run identity: Paperclip mints the per-run JWT only for adapters that
-    // declare this (runtime-execution.ts:249-260), and the engine turns the
-    // token into PAPERCLIP_API_KEY in the run child (execute.js:1014-1015).
-    // That key is the single source for the session-snapshot and usage work
-    // products and for the bridge's approval round-trip; a missing token keeps
-    // failing closed with the existing explicit errors. Blast radius
-    // (company-scoped API access for the run) is stated in
-    // agentConfigurationDoc.
+    // declare this (runtime-execution.ts:249-260). The adapter forwards it to
+    // the supervisor, which writes it into the run-context file the bridge
+    // reads; it never enters a worker's environment. That token is the single
+    // source for the session-snapshot and usage work products and for the
+    // bridge's approval round-trip; a missing token keeps failing closed with
+    // the existing explicit errors. Blast radius (company-scoped API access for
+    // the run) is stated in agentConfigurationDoc.
     supportsLocalAgentJwt: RUN_IDENTITY_ENABLED,
-    // omp consumes ACP `mcpServers` on session/new|load|resume|fork, so the
-    // Paperclip connections/project servers must be delivered there.
-    // `invocation_context` would hand this adapter a token it cannot serve.
+    // The supervisor serves Paperclip's connection tools to the agent as omp
+    // host tools, so the adapter declares the native delivery channel and reads
+    // the run-scoped access object; `invocation_context` would hand it a token
+    // nothing in this process can serve.
     runtimeToolDelivery: "native_mcp",
-    // Managed AGENTS.md bundle: the engine renders instructionsFilePath into the
-    // run prompt, and the ephemeral skills file merges the same path, so the
+    // Managed AGENTS.md bundle: the supervisor renders instructionsFilePath into
+    // the run prompt, and the ephemeral skills file merges the same path, so the
     // bundle composes with skills-as-tools instead of replacing it.
     supportsInstructionsBundle: true,
     instructionsPathKey: "instructionsFilePath",

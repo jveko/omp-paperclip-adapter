@@ -10,18 +10,17 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 
 /**
- * The managed lane's prompt.
+ * The run's prompt.
  *
- * The acpx engine builds this prompt internally; on the host lane the adapter
- * must send the text over the socket, so the same shape is reproduced here from
- * the same exported building blocks (template, wake prompt, task markdown,
- * session handoff). Order and joining are the engine's (`execute.js`
- * `buildPrompt`); anything that changes here changes what an employee sees.
+ * The supervisor sends the text over the socket, so the shape is built here
+ * from Paperclip's own exported building blocks (template, wake prompt, task
+ * markdown, session handoff). The order and joining mirror what an ACP client
+ * builds; anything that changes here changes what an employee sees.
  *
- * The engine's "Paperclip API access" note is deliberately absent: managed mode
- * keeps the run JWT out of the worker env, so teaching curl with
- * `$PAPERCLIP_API_KEY` would describe a variable that is not there. Only the
- * runtime note listing the PAPERCLIP_* keys actually present is rendered.
+ * A "Paperclip API access" note is deliberately absent: the run JWT stays out
+ * of the worker env, so teaching curl with `$PAPERCLIP_API_KEY` would describe
+ * a variable that is not there. Only the runtime note listing the PAPERCLIP_*
+ * keys actually present is rendered.
  */
 
 export interface ManagedPromptInput {

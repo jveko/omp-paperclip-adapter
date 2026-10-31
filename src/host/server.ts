@@ -821,7 +821,7 @@ class Supervisor {
           // An error response (not a `cancelled` one) is still a failed resume:
           // omp answers `success:false` when the stored session cannot be
           // switched (e.g. a cwd change). Fall back to a fresh session instead
-          // of failing a run the engine lane would have completed.
+          // of failing a run over a stale session.
           this.emitEvent(run, "run.system", {
             level: "warn",
             message: `omp could not open the stored session ${named} (${err instanceof Error ? err.message : String(err)}); starting a fresh session`,
@@ -1036,8 +1036,8 @@ class Supervisor {
         this.onSubagentFrame(run, frame);
         return;
       default:
-        // Token deltas and UI frames never reach the board: the engine lane only
-        // ever emitted turn-level activity, and a per-token event is not one.
+        // Token deltas and UI frames never reach the board: the board only ever
+        // saw turn-level activity, and a per-token event is not one.
         return;
     }
   }
@@ -1131,8 +1131,8 @@ class Supervisor {
    * endpoint. A warm worker is rebound on every run (set_host_tools replaces
    * the handler set), so the token rotates without a respawn.
    *
-   * Failure is a warning, not a failed run: the engine lane also degrades when
-   * connection tools cannot be delivered, and a run without them is ordinary.
+   * Failure is a warning, not a failed run: a run without connection tools is
+   * ordinary.
    */
   private async installHostTools(
     run: RunState,
@@ -1335,8 +1335,8 @@ class Supervisor {
     const model = this.singleModel(used.routedModels) ?? run.begin.cell.model;
     const status = run.outcome?.status ?? (outcome.kind === "settled" ? "completed" : "error");
     const agentInvoked = run.outcome?.agentInvoked ?? false;
-    // Same convention as the engine lane: cache-write tokens are prompt tokens
-    // the provider billed to create cache entries, so they count as input.
+    // Cache-write tokens are prompt tokens the provider billed to create cache
+    // entries, so they count as input.
     const inputTokens = used.input + used.cacheWrite;
     const usage: LedgerUsage = {
       inputTokens,

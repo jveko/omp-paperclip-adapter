@@ -11,7 +11,6 @@ import {
   exactOmpModelId, listOmpModels, normalizeOmpModelId, type OmpModelCost, type OmpModelInfo,
 } from "../models.js";
 import { buildSkillsInstructions, skillsDir, type SkillMarkdownSource } from "../skills.js";
-import { readRetryConfig, type RetryConfig } from "../retry.js";
 import {
   materializeFailoverOverlay, providerQualifiedSelectors, validateProviderQualifiedSelectors,
   validateRetryFallbackConfig,
@@ -29,28 +28,28 @@ import { materializeBudgetOverlay } from "../budget-overlay.js";
 import { materializeThinkingOverlay, requestedThinkingLevel } from "../thinking-overlay.js";
 import { mergePiConfigFiles, type OverlayEntry } from "./overlays.js";
 import { loadState, saveState, sessionIntelDir, type SessionIntelState } from "../session-state.js";
-import { buildOmpAcpConfig, bridgeArtifactError, configuredWarmHandleIdleMs, firstNonEmptyString, isGovernanceArmed, resolveBridgeRunMode, resolveOmpAgentCommand, resolveSessionCwd } from "../adapters/acp/launch.js";
+import { buildRunChildConfig, bridgeArtifactError, firstNonEmptyString, isGovernanceArmed, resolveBridgeRunMode, resolveOmpAgentCommand, resolveSessionCwd } from "../adapters/acp/launch.js";
 import {
   capabilityCacheDir, capabilityDiagnostics, loadCapabilities,
   type CapabilityFeature, type CapabilitySet,
 } from "../capabilities.js";
 import { buildWorkerArgv } from "../../host/worker.js";
 import {
-  readSessionIntelConfig, resolveExecutionMode, resolveRunDirective, thinkingLevelChanged,
-  validateCredentialMode, validateExecutionMode, validatePlanMode, validateSessionScope,
+  readSessionIntelConfig, resolveRunDirective, thinkingLevelChanged,
+  validateCredentialMode, validatePlanMode, validateSessionScope,
   validateSteering, validateSubagentObservability, validateThinkingLevel,
   type RunDirective, type SessionIntelConfig, type SessionScope,
 } from "../session-directives.js";
 
 /**
- * The run plan: every decision a run takes BEFORE the engine is touched —
+ * The run plan: every decision a run takes BEFORE the supervisor is touched —
  * config gates, session scope, overlays, the model catalog, the manifests, the
  * run-child argv/env, the session directive — sequenced in one place, with no
  * transport in sight.
  *
  * Each step below emits its own diagnostics in the order the run has always
  * emitted them, so splitting the sequence changes structure, never behaviour.
- * A refusal returns before any engine work; `executePlan` only ever sees a
+ * A refusal returns before any transport work; `executePlan` only ever sees a
  * ready plan.
  */
 
@@ -65,21 +64,19 @@ export interface RunPlanDeps {
   /** `dist/server`: where the adapter resolves bundled skill content from. */
   moduleDir: string;
   /**
-   * The managed lane's session index: the cwd a session this supervisor ran
+   * The supervisor's session index: the cwd a session this supervisor ran
    * recorded. Null means "ask the ACP probe lane", which is the fallback for a
-   * source the host never ran (and for engine mode, which passes no function).
+   * source the host never ran.
    */
   hostSessionCwd?: (sessionId: string) => Promise<string | null>;
 }
 
 export interface RunPlan {
   ctx: AdapterExecutionContext;
-  /** The config handed to the engine (a fork run re-pins its warm handle here). */
-  engineConfig: Record<string, unknown>;
-  /** Runtime override applied to each engine attempt (fork resume / fresh). */
+  /** The config the supervisor launches the worker with (argv, env, model). */
+  runChildConfig: Record<string, unknown>;
+  /** Runtime override applied to the attempt (fork resume / fresh). */
   runtimeOverride: AdapterExecutionContext["runtime"] | null;
-  /** Fresh-session retry policy for the engine call. */
-  retry: RetryConfig;
   /** Run-child overlays that landed, in PI_CONFIG_FILES precedence order. */
   overlays: OverlayEntry[];
   directive: RunDirective;
@@ -95,7 +92,6 @@ export interface RunPlan {
   resolveCost: (model: string) => OmpModelCost | null;
   sideChannelEnv: Record<string, string>;
   bridge: string;
-  runtimeMcpServerCount: number;
   forkTokenUsed: string | null;
   forkedSessionId: string | null;
   freshTokenUsed: string | null;
@@ -108,35 +104,20 @@ export type RunPlanResult =
 
 
 /**
- * Endpoint of the run-scoped connection-tools MCP server Paperclip offered this
- * run, or null when it offered none. A server that never sets `runtimeTools`
- * reads as null. Only the endpoint is read; the bearer token in the same object
- * must never enter a log, an event or a work product.
- */
-function connectionToolsEndpoint(ctx: AdapterExecutionContext): string | null {
-  const endpoint = ctx.runtimeTools?.mcpEndpoint;
-  return typeof endpoint === "string" && endpoint.trim() !== "" ? endpoint.trim() : null;
-}
-
-/**
  * The fail-closed config gates, in the order the run has always applied them.
  * Each returns a `omp_config_error` refusal; the thinking-level warning is the
  * one diagnostic that does NOT abort (the append is fail-open).
  */
 async function gateRunConfig(ctx: AdapterExecutionContext): Promise<RunRefusal | null> {
-  // Lane selection comes first: the two lanes differ in credential placement and
-  // settlement semantics, so a typo must be a config error, never a fallback.
-  const modeErr = validateExecutionMode(ctx.config);
-  if (modeErr) return { errorCode: "omp_config_error", errorMessage: modeErr };
   const steeringErr = validateSteering(ctx.config);
   if (steeringErr) return { errorCode: "omp_config_error", errorMessage: steeringErr };
-  // A typo here would pick a different amount of subagent metadata on the
-  // managed lane, so it is a config error like the lane and steering keys.
+  // A typo here would pick a different amount of subagent metadata, so it is
+  // a config error like the steering key.
   const subagentErr = validateSubagentObservability(ctx.config);
   if (subagentErr) return { errorCode: "omp_config_error", errorMessage: subagentErr };
   // Fail closed: broker credentialMode demands a resolved broker url+token.
-  // Return before any engine work so a misconfigured agent never runs a
-  // half-configured session.
+  // Return before the supervisor is touched so a misconfigured agent never
+  // runs a half-configured session.
   const credErr = validateCredentialMode(ctx.config);
   if (credErr) return { errorCode: "omp_config_error", errorMessage: credErr };
   // v0.6 thinking validation: a bad value emits a warn but does NOT abort
@@ -149,7 +130,7 @@ async function gateRunConfig(ctx: AdapterExecutionContext): Promise<RunRefusal |
     });
   }
   // Session scope (item 18) is a containment control, so it fails closed
-  // BEFORE any engine work: `isolated` points omp at this agent's own agent
+  // BEFORE the supervisor is touched: `isolated` points omp at this agent's own agent
   // dir, which holds no credential store (agent.db) and no operator config,
   // so only broker credentials can authenticate a fenced run.
   const scopeErr = validateSessionScope(ctx.config);
@@ -159,7 +140,7 @@ async function gateRunConfig(ctx: AdapterExecutionContext): Promise<RunRefusal |
   // approval step plan mode exists for would be gone (see validatePlanMode).
   const planErr = validatePlanMode(ctx.config);
   if (planErr) return { errorCode: "omp_config_error", errorMessage: planErr };
-  // deny-all is answered by the engine's permission proxy, which the bridge
+  // deny-all is answered by omp's permission proxy, which the bridge
   // cannot override; pairing it with scoped/rewritten tool rules describes a
   // run that cannot happen. Fail at config time (see validateGovernanceGate).
   const gateErr = validateGovernanceGate(ctx.config);
@@ -197,27 +178,15 @@ function ompAcpCommand(
   return { command: tokens[0], args: tokens.slice(1) };
 }
 
-/** The capabilities THIS run leans on, given its lane and its config. */
-function runCapabilityFeatures(
-  ctx: AdapterExecutionContext,
-  input: { mode: "engine" | "managed"; intel: SessionIntelConfig; directive: RunDirective },
-): CapabilityFeature[] {
-  if (input.mode === "managed") {
-    // The supervisor always reads stats and always resets the subagent
-    // subscription; host tools only when Paperclip offered them.
-    return ctx.runtimeTools !== undefined
-      ? ["managedUsage", "managedSubagents", "managedHostTools"]
-      : ["managedUsage", "managedSubagents"];
-  }
-  const features: CapabilityFeature[] = [];
-  const policy = parseGovernancePolicy(ctx.config.governancePolicy);
-  if (input.intel.browser) features.push("sessionSnapshot");
-  if (input.directive.kind === "fork") features.push("sessionFork");
-  if (requestedThinkingLevel(ctx.config) !== "") features.push("thinkingLevel");
-  if (policy.kind === "ok" && policy.policy.budgetCapUsd !== undefined) features.push("budgetHardCap");
-  if (policy.kind === "ok" && (policy.policy.restrictedFolders?.length ?? 0) > 0) features.push("folderFence");
-  if (governancePolicyActive(ctx.config)) features.push("governanceExtensions");
-  return features;
+/**
+ * The capabilities THIS run leans on. The supervisor always reads stats and
+ * always resets the subagent subscription; host tools only when Paperclip
+ * offered them.
+ */
+function runCapabilityFeatures(ctx: AdapterExecutionContext): CapabilityFeature[] {
+  return ctx.runtimeTools !== undefined
+    ? ["managedUsage", "managedSubagents", "managedHostTools"]
+    : ["managedUsage", "managedSubagents"];
 }
 
 /**
@@ -246,15 +215,12 @@ async function planCapabilities(
      * nobody wrote.
      */
     probeConfig: Record<string, unknown>;
-    mode: "engine" | "managed";
     bridge: string;
-    intel: SessionIntelConfig;
-    directive: RunDirective;
   },
 ): Promise<void> {
   const acp = ompAcpCommand(input.probeConfig, input.bridge);
   if (path.basename(acp.command) !== "omp") return;
-  const features = runCapabilityFeatures(ctx, input);
+  const features = runCapabilityFeatures(ctx);
   if (features.length === 0) return;
   // A capability read is advisory evidence: an unreadable cache, an invalid
   // instance id or a broken cache entry must never refuse or crash the run.
@@ -264,10 +230,8 @@ async function planCapabilities(
     const env = ompEnv({ config: input.probeConfig });
     capabilities = await loadCapabilities({
       acp: { ...acp, env },
-      mode: input.mode,
-      ...(input.mode === "managed"
-        ? { worker: { ...buildWorkerArgv(input.probeConfig, input.bridge), env } }
-        : {}),
+      mode: "managed",
+      worker: { ...buildWorkerArgv(input.probeConfig, input.bridge), env },
       cacheDir: capabilityCacheDir(),
       cacheOnly: true,
     });
@@ -549,16 +513,12 @@ async function materializeSkillsInstructions(
 }
 
 /**
- * Derive the run-child config: engine keys (ACP launch), the thinking overlay,
- * the merged PI_CONFIG_FILES, and the instructions file.
+ * Derive the run-child config: the resolved command line, the model, the
+ * thinking overlay, the merged PI_CONFIG_FILES, and the instructions file.
  *
- * Every overlay this run owns is folded into `config` BEFORE engineConfig is
- * derived: the fork branch rebuilds engineConfig as
- * { ...config, warmHandleIdleMs: 50 }, so an overlay added only to engineConfig
- * would be silently dropped by the fork spread — PI_CONFIG_FILES must ride on
- * `config` to survive it. The order is the precedence order: operator file,
- * then the failover chain, then governance routing, then the budget thresholds,
- * then the thinking level.
+ * The overlays are folded into the returned config in PI_CONFIG_FILES
+ * precedence order: operator file, then the failover chain, then governance
+ * routing, then the budget thresholds, then the thinking level.
  */
 async function assembleRunChildConfig(
   ctx: AdapterExecutionContext,
@@ -572,7 +532,7 @@ async function assembleRunChildConfig(
     intelDir: string;
   },
 ): Promise<Record<string, unknown>> {
-  const config = buildOmpAcpConfig(ctx.config, input.resolveModel, input.resolveCost, input.bridge);
+  const config = buildRunChildConfig(ctx.config, input.bridge, input.resolveModel, input.resolveCost);
   // The thinking level rides its own overlay (fixed path, so an edit never
   // rotates the session). Run-child only: no side channel reads a level.
   const thinkingOverlay = await materializeThinkingOverlay(ctx.config, input.intelDir);
@@ -594,11 +554,10 @@ async function assembleRunChildConfig(
   // Ephemeral skills: when the bridge is active, skill content is delivered
   // on demand via the registered native tools, so prose injection is skipped
   // (bridge and prose are mutually exclusive). Otherwise materialize the
-  // merged instructions file (skills + user instructions) so the engine
-  // injects it into this run. The merged file always carries the user's
-  // content when present, so the path is set unconditionally whenever any
-  // skill is desired; null leaves any existing instructionsFilePath
-  // untouched.
+  // merged instructions file (skills + user instructions) so this run carries
+  // it. The merged file always carries the user's content when present, so
+  // the path is set unconditionally whenever any skill is desired; null
+  // leaves any existing instructionsFilePath untouched.
   const instructionsFile = input.bridgeActive
     ? null
     : await materializeSkillsInstructions(ctx.config, input.moduleDir);
@@ -650,7 +609,7 @@ async function planSessionState(
   const sessionCwd = resolveSessionCwd(ctx, storedParams);
   // A scope flip is the one moment a resumable session is left behind: the
   // previous transcript sits in the other agent dir and this run's fingerprint
-  // differs, so the engine starts fresh. Say so ONCE (the state records the
+  // differs, so this run starts a fresh session. Say so ONCE (the state records the
   // scope of every run) instead of cold-starting silently. A state written
   // before this release reads as null and is treated as the historical
   // default, so an upgrade alone never warns.
@@ -687,8 +646,7 @@ async function planSessionState(
 
 /**
  * Apply the directive: fork (side channel), force-fresh, or rotation. Returns
- * the engine config, the runtime override each attempt carries, and the retry
- * policy for this run.
+ * the run-child config and the runtime override this run carries.
  */
 async function applySessionDirective(
   ctx: AdapterExecutionContext,
@@ -704,9 +662,8 @@ async function applySessionDirective(
     hostSessionCwd?: (sessionId: string) => Promise<string | null>;
   },
 ): Promise<{
-  engineConfig: Record<string, unknown>;
+  runChildConfig: Record<string, unknown>;
   runtimeOverride: AdapterExecutionContext["runtime"] | null;
-  retry: RetryConfig;
   forkTokenUsed: string | null;
   forkedSessionId: string | null;
   freshTokenUsed: string | null;
@@ -716,7 +673,6 @@ async function applySessionDirective(
   let forkedSessionId: string | null = null;
   let freshTokenUsed: string | null = null;
   let forceFreshOverride = false;
-  let engineConfig = input.config;
 
   if (directive.kind === "fork") {
     const ompTokens = resolveOmpAgentCommand(ctx.config, input.bridge).split(/\s+/);
@@ -726,10 +682,10 @@ async function applySessionDirective(
     // (`agent-session.ts` SESSION_CWD_CHANGE_REJECTED → -32603). So the frame
     // must carry the SOURCE's cwd, not this run's.
     //
-    // The managed lane answers this from the supervisor's session index first:
-    // a source the host ran needs no probe process at all. Only a source the
-    // host never ran falls back to the bounded, unfiltered `session/list` (the
-    // source may live under another workspace).
+    // The supervisor answers this from its own session index first: a source
+    // the host ran needs no probe process at all. Only a source the host never
+    // ran falls back to the bounded, unfiltered `session/list` (the source may
+    // live under another workspace).
     const hostCwd = input.hostSessionCwd === undefined
       ? null
       : await input.hostSessionCwd(directive.forkSourceId).catch(() => null);
@@ -749,14 +705,6 @@ async function applySessionDirective(
     if (fork.ok) {
       forkTokenUsed = directive.forkToken;
       forkedSessionId = fork.sessionId;
-      // warmHandleIdleMs: 50 makes this run's handle warm-savable (execute.js
-      // warm-save requires warmIdleMs > 0) and runs cleanupIdleHandles before
-      // the resume decision, so no stale handle can shadow the fork override.
-      // The engine's DEFAULT for omp is 0 (handles close each turn), so under
-      // default settings the cleanup is a no-op and warm-save enablement is
-      // the load-bearing effect. Must stay > 0: idleMs <= 0 disables both.
-      // Per-run only; non-fork runs keep the operator's configured value.
-      engineConfig = { ...input.config, warmHandleIdleMs: 50 };
     } else {
       await ctx.onEvent?.({
         eventType: "run.system", stream: "system", level: "warn",
@@ -777,32 +725,13 @@ async function applySessionDirective(
     }
   }
 
-  // The engine's settlement gate, not this adapter, is what keeps a warm
-  // handle from being reused under run identity (see RUN_IDENTITY_ENABLED):
-  // the operator's value is passed through, and a save that still carries this
-  // run's credential is discarded at settlement. Say so once, so an operator
-  // who expects a warm child knows why they still get a cold one. A fork run is
-  // exempt: its engineConfig carries the per-run 50 ms pin, not this value.
-  const requestedWarmIdleMs = configuredWarmHandleIdleMs(ctx.config);
-  if (requestedWarmIdleMs > 0 && directive.kind !== "fork") {
-    await ctx.onEvent?.({
-      eventType: "run.system", stream: "system", level: "info",
-      message: `omp warm-handle idle window ${requestedWarmIdleMs}ms is honoured, but this run carries a run-scoped credential, so the engine's settlement gate discards the handle instead of reusing it (close-and-relaunch); remove warmHandleIdleMs to stop this note`,
-    });
-  }
-
-  // Fork resume override: identity fields stay untouched (no env bust), so
-  // isCompatibleSession passes and the engine resumes the forked id.
-  // Force-fresh and rotation use the same override shape but CLEAR
-  // sessionParams instead: an empty sessionParams makes isCompatibleSession
-  // fail (configFingerprint "" !== the session's fingerprint), so the engine
-  // issues session/new this run. This is fingerprint-clean by design — the
-  // directive session's env is never touched, so the freshly created
-  // session's configFingerprint equals the normal run fingerprint and is
-  // RESUMABLE by subsequent markerless runs. An env marker (OMP_PAPERCLIP_FRESH)
-  // would poison the fingerprint and abandon the directive run's session —
-  // the same latent trap the retry path has (OMP_PAPERCLIP_RETRY), which we
-  // are NOT touching.
+  // Fork resume override: sessionParams carry the forked id, so the supervisor
+  // opens that session for this run. Force-fresh and rotation use the same
+  // override shape but CLEAR sessionParams: no stored id means the supervisor
+  // opens a brand-new session, and the directive itself is passed explicitly
+  // with the run. Neither path touches the run's env, so the fresh session's
+  // recorded config fingerprint is the normal run fingerprint and later
+  // markerless runs resume it.
   const runtimeOverride = forkedSessionId
     ? { ...ctx.runtime, sessionParams: { ...input.storedParams, acpSessionId: forkedSessionId } }
     : forceFreshOverride
@@ -810,17 +739,8 @@ async function applySessionDirective(
       : null;
 
   return {
-    engineConfig,
+    runChildConfig: input.config,
     runtimeOverride,
-    // Fork runs MUST bypass the fresh-session retry loop: retrying would
-    // bust the fingerprint via OMP_PAPERCLIP_RETRY, causing the engine to
-    // start a blank session (isCompatibleSession fails) instead of resuming
-    // the forked session — orphaning it. Disabling retries keeps the fork
-    // resume path intact: a single attempt either succeeds normally, or
-    // fails terminally with the token still armed (next run re-forks from
-    // source). omp's own TurnRecovery still handles transient provider
-    // failures within that single attempt.
-    retry: directive.kind === "fork" ? { enabled: false, freshRetries: 0 } : readRetryConfig(ctx.config),
     forkTokenUsed,
     forkedSessionId,
     freshTokenUsed,
@@ -831,7 +751,7 @@ async function applySessionDirective(
 /**
  * Build the plan for one run. Pure with respect to the transport: it touches
  * config, the filesystem (overlays/manifests/state) and the side channels, but
- * never the engine — a refusal returns before any of that is constructed.
+ * never the transport — a refusal returns before any of that is constructed.
  */
 export async function buildRunPlan(
   ctx: AdapterExecutionContext,
@@ -860,28 +780,11 @@ export async function buildRunPlan(
   for (const warning of preparedScope.prepared.warnings) {
     await ctx.onEvent?.({ eventType: "run.system", stream: "system", level: "warn", message: warning });
   }
-  const executionMode = resolveExecutionMode(ctx.config) ?? "engine";
-  // Run-scoped control tools (v0.9). The adapter declares
-  // `runtimeToolDelivery: "native_mcp"`, so Paperclip must hand the
-  // connections server over as an ACP MCP server. Read the channel it
-  // actually used: when the tools arrive as invocation-context data instead
-  // (a Paperclip build that ignores the flag), nothing in this process can
-  // serve them and they would disappear silently — the pre-v0.9 failure.
-  // Resolved once per run so the count reported at the end is the same list
-  // the engine received.
-  //
-  // Managed mode is the exception by design: no MCP server is forwarded into
-  // the worker. The run's `runtimeTools` travel to the supervisor as
-  // `connectionTools`, which becomes two omp host tools — so the "no MCP
-  // server delivered" warning is the managed lane's normal case, not a fault.
-  const runtimeMcpServers = executionMode === "managed" ? [] : ctx.runtimeMcp?.getServers?.() ?? [];
-  const connectionEndpoint = executionMode === "managed" ? null : connectionToolsEndpoint(ctx);
-  if (connectionEndpoint && !runtimeMcpServers.some((server) => server.url === connectionEndpoint)) {
-    await ctx.onEvent?.({
-      eventType: "run.system", stream: "system", level: "warn",
-      message: `omp connection tools are unavailable this run: Paperclip delivered no MCP server for the declared native_mcp channel (${runtimeMcpServers.length} runtime MCP server(s)), so connections_search/connection_request never reach the agent`,
-    });
-  }
+  // Run-scoped control tools travel to the supervisor as `connectionTools`,
+  // which becomes two omp host tools; no MCP server is forwarded into the
+  // worker. A Paperclip build that cannot deliver them leaves those tools
+  // unavailable for the run, which is handled by the supervisor rather than
+  // silently here.
   const intelDir = sessionIntelDir(ctx.agent.companyId, ctx.agent.id);
   // Every run-child overlay this run lands, in PI_CONFIG_FILES precedence
   // order. One writer (run/overlays.ts) owns the fixed filenames; this list
@@ -930,10 +833,7 @@ export async function buildRunPlan(
   });
   await planCapabilities(ctx, {
     probeConfig,
-    mode: executionMode,
     bridge: deps.bridge,
-    intel: session.intel,
-    directive: session.directive,
   });
   const applied = await applySessionDirective(ctx, {
     directive: session.directive,
@@ -950,13 +850,8 @@ export async function buildRunPlan(
     kind: "ready",
     plan: {
       ctx,
-      engineConfig: applied.engineConfig,
+      runChildConfig: applied.runChildConfig,
       runtimeOverride: applied.runtimeOverride,
-      // The fresh-session retry replays a transport call; the managed lane's
-      // idempotent run.begin is per runId, so a second attempt would be answered
-      // from the first attempt's state. The host itself falls back to a fresh
-      // session when a resume cannot be opened.
-      retry: executionMode === "managed" ? { enabled: false, freshRetries: 0 } : applied.retry,
       overlays,
       directive: session.directive,
       intel: session.intel,
@@ -971,7 +866,6 @@ export async function buildRunPlan(
       resolveCost: catalog.resolveCost,
       sideChannelEnv,
       bridge: deps.bridge,
-      runtimeMcpServerCount: runtimeMcpServers.length,
       forkTokenUsed: applied.forkTokenUsed,
       forkedSessionId: applied.forkedSessionId,
       freshTokenUsed: applied.freshTokenUsed,

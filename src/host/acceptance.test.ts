@@ -40,7 +40,6 @@ function ctx(
       taskKey: "task",
     },
     config: {
-      executionMode: "managed",
       agentCommand: `${process.execPath} ${fixture}`,
     },
     context: { taskId: "0b8f0d5e-9a10-4f6a-8f2b-1c2d3e4f5a6b" },
@@ -138,7 +137,6 @@ describe("phase 1 acceptance on dist/omp-host.js", () => {
       const run = createOmpAcpExecutor({ hostScript });
       const result = await run(ctx("", {
         config: {
-          executionMode: "managed",
           agentCommand: `${process.execPath} ${fixture}`,
           env: { FAKE_RPC_MODE: "hosttool" },
         },
@@ -172,7 +170,6 @@ describe("phase 1 acceptance on dist/omp-host.js", () => {
     const running = run(ctx("", {
       // A hung worker: the host is killed while the run is still prompting.
       config: {
-        executionMode: "managed",
         agentCommand: `${process.execPath} ${fixture}`,
         env: { FAKE_RPC_MODE: "survive" },
       },

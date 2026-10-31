@@ -20,7 +20,7 @@ const mocks = vi.hoisted(() => ({
   normalizeOmpModelId: vi.fn((model: string) => model),
   resolveProviderQualifiedSelector: vi.fn((model: string) => model),
   isFreeCost: vi.fn(() => false),
-  createAcpxEngineExecutor: vi.fn(),
+  transport: vi.fn(),
 }));
 
 // Spread the real module so every other models.ts export the run path uses
@@ -36,9 +36,11 @@ vi.mock("./models.js", async (importOriginal) => {
   };
 });
 
-// Mocked at this package's loader seam, not the dependency's module id.
-vi.mock("./adapters/acp/engine.js", () => ({
-  loadAcpxEngineExecutor: async () => mocks.createAcpxEngineExecutor(),
+// Mocked at the composition root's transport seam, so the plan runs for real
+// and no supervisor is spawned.
+vi.mock("./run/host-transport.js", () => ({
+  createHostTransport: () => mocks.transport(),
+  lookupHostSessionCwd: async () => null,
 }));
 
 function baseCtx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecutionContext {
@@ -67,7 +69,7 @@ describe("catalog call site env threading", () => {
     await rm(tmpRoot, { recursive: true, force: true });
   });
   beforeEach(async () => {
-    mocks.createAcpxEngineExecutor.mockReset();
+    mocks.transport.mockReset();
     mocks.listOmpModels.mockClear();
     vi.stubEnv("PAPERCLIP_HOME", tmpRoot);
     vi.stubEnv("PAPERCLIP_INSTANCE_ID", "test-catalog-env");
@@ -76,7 +78,7 @@ describe("catalog call site env threading", () => {
 
   it("forwards broker env into the listOmpModels options", async () => {
     const executor = vi.fn(async () => ({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } }));
-    mocks.createAcpxEngineExecutor.mockReturnValue(executor);
+    mocks.transport.mockReturnValue(executor);
     const run = createOmpAcpExecutor();
     await run(baseCtx({
       config: {
@@ -102,7 +104,7 @@ describe("catalog call site env threading", () => {
       { id: "axon-compat/q", label: "Q", priced: false },
     ]);
     const executor = vi.fn(async () => ({ exitCode: 0, sessionParams: { acpSessionId: "old", sessionKey: "sk" } }));
-    mocks.createAcpxEngineExecutor.mockReturnValue(executor);
+    mocks.transport.mockReturnValue(executor);
     await createOmpAcpExecutor()(baseCtx({
       config: {
         model: "prov/m",

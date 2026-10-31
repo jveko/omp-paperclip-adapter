@@ -1,14 +1,19 @@
-import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
-import type { AcpxEngineBillingIdentity } from "../adapters/acp/engine.js";
+import type { AdapterBillingType, AdapterExecutionContext } from "@paperclipai/adapter-utils";
+
+/** The billing identity the run result reports. */
+export interface OmpBillingIdentity {
+  provider?: string | null;
+  biller?: string | null;
+  billingType?: AdapterBillingType | null;
+}
 
 /**
- * The billing identity both lanes report. Lives beside the run transports
- * rather than in `acp.ts` so the managed lane does not import the engine lane
- * (and so `acp.ts` stays the public re-export surface).
+ * The billing identity the run reports. Lives beside the transport rather than
+ * in `acp.ts`, which stays the public re-export surface.
  */
 export function resolveOmpBillingIdentity(
   ctx: Pick<AdapterExecutionContext, "config">,
-): AcpxEngineBillingIdentity {
+): OmpBillingIdentity {
   const env = (ctx.config.env ?? {}) as Record<string, unknown>;
   const raw = String(env.OMP_PAPERCLIP_BILLING_TYPE ?? process.env.OMP_PAPERCLIP_BILLING_TYPE ?? "")
     .trim()

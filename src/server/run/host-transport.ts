@@ -24,10 +24,8 @@ import type { RunPlan } from "./run-plan.js";
  *
  * It sends the run plan's resolved facts (worker argv/env, prompt, credentials,
  * manifests, limits), relays `run.event` frames onto the adapter's own sinks,
- * and returns the supervisor's settle result. It does not fall back to the
- * engine: a silent second prompt path is exactly what the engine's settlement
- * gate exists to prevent, and `executionMode: "engine"` is the explicit,
- * configured fallback.
+ * and returns the supervisor's settle result. It is the only way a run starts a
+ * child: there is no second prompt path to fall back to.
  */
 
 export interface HostTransportOptions {
@@ -114,7 +112,7 @@ function issueIdOf(ctx: AdapterExecutionContext): string | null {
 }
 
 function manifestsOf(plan: RunPlan): Manifests {
-  const env = (plan.engineConfig.env ?? {}) as Record<string, unknown>;
+  const env = (plan.runChildConfig.env ?? {}) as Record<string, unknown>;
   const overlay = (kind: string): string | null =>
     plan.overlays.find((entry) => entry.kind === kind)?.path ?? null;
   const manifest = (key: string): string | null =>
@@ -349,10 +347,10 @@ export function createHostTransport(options: HostTransportOptions): ManagedRun {
   const connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
 
   return async (ctx: AdapterExecutionContext, plan: RunPlan): Promise<AdapterExecutionResult> => {
-    const workerArgv = buildWorkerArgv(plan.engineConfig, options.bridge);
+    const workerArgv = buildWorkerArgv(plan.runChildConfig, options.bridge);
     const env = {
       ...spawnEnvLines(buildPaperclipEnv(ctx.agent)),
-      ...buildWorkerEnv(plan.engineConfig),
+      ...buildWorkerEnv(plan.runChildConfig),
     };
     const sessionKey = sessionLeaseKey(ctx.agent, ctx.runtime);
     const stored = (ctx.runtime.sessionParams ?? {}) as Record<string, unknown>;
@@ -363,7 +361,7 @@ export function createHostTransport(options: HostTransportOptions): ManagedRun {
     const resumedSession = !rotate && (plan.forkedSessionId !== null || storedSessionId !== null);
     const prompt = await buildManagedPrompt({
       ctx,
-      instructionsFilePath: firstNonEmptyString(plan.engineConfig.instructionsFilePath) ?? null,
+      instructionsFilePath: firstNonEmptyString(plan.runChildConfig.instructionsFilePath) ?? null,
       resumedSession,
       env,
       onLog: (stream, chunk) => ctx.onLog(stream, chunk),
@@ -383,7 +381,7 @@ export function createHostTransport(options: HostTransportOptions): ManagedRun {
         argvHash: createHash("sha256").update([workerArgv.command, ...workerArgv.args].join("\u0000")).digest("hex").slice(0, 16),
         bridgeHash: await bridgeHash(options.bridge),
         agentDir: firstNonEmptyString(env.PI_CODING_AGENT_DIR) ?? null,
-        model: firstNonEmptyString(plan.engineConfig.model) ?? null,
+        model: firstNonEmptyString(plan.runChildConfig.model) ?? null,
         thinking: plan.requestedThinking === "" ? null : plan.requestedThinking,
         approval: firstNonEmptyString(ctx.config.approvalMode, ctx.config.permissionMode) ?? null,
       },
@@ -420,7 +418,7 @@ export function createHostTransport(options: HostTransportOptions): ManagedRun {
     const finish = (result: AdapterExecutionResult) => settled.resolve(result);
 
     // EOF before `run.settled` means the supervisor died (or was killed): the
-    // adapter reports it and never silently re-runs the prompt on the engine.
+    // adapter reports it and never silently re-runs the prompt elsewhere.
     const stopWatchingClose = client.onClose(() => {
       closed.resolve({
         exitCode: 1,

@@ -11,12 +11,12 @@ import { buildRunPlan } from "./run-plan.js";
 
 /**
  * The run path reads the capability cache the environment test writes. That
- * only works if both derive the SAME probe input — command, args and env — and
- * the run must derive it from the agent config as it arrived, not from the
- * config the run path itself mutates (session-scope fence, manifest env,
- * `--extension`, `PI_CONFIG_FILES`). This test pins that parity end to end:
- * an environment test populates the cache, then a governance-configured run
- * reads it and names the surface the build lacks.
+ * only works if both derive the SAME probe input — command, args, env and the
+ * worker argv — and the run must derive it from the agent config as it
+ * arrived, not from the config the run path itself mutates (session-scope
+ * fence, manifest env, `--extension`, `PI_CONFIG_FILES`). This test pins that
+ * parity end to end: an environment test populates the cache, then a run with
+ * the same config reads it and names the worker surface the build lacks.
  */
 
 const fakeAcp = path.resolve(
@@ -38,8 +38,8 @@ beforeAll(async () => {
   const bin = path.join(root, "bin");
   await mkdir(bin, { recursive: true });
   ompCommand = path.join(bin, "omp");
-  // A build with the settings/verbs the adapter reads EXCEPT the folder fence,
-  // so a governance-configured run has a named surface to report.
+  // A build with the settings/verbs the adapter reads but no RPC worker, so
+  // the managed run has a named surface to report.
   await writeFile(ompCommand, [
     "#!/bin/sh",
     `if [ "$1" = "acp" ]; then exec "${process.execPath}" "${fakeAcp}" "$@"; fi`,
@@ -76,7 +76,7 @@ function runCtx(onEvent: (event: { message?: string }) => void): AdapterExecutio
 }
 
 describe("run-path capability cache parity", () => {
-  it("reads the set the environment test probed, and names the missing fence", async () => {
+  it("reads the set the environment test probed, and names the missing worker frame", async () => {
     clearCapabilityCache();
     await rm(path.join(root, "instances"), { recursive: true, force: true });
 
@@ -84,7 +84,7 @@ describe("run-path capability cache parity", () => {
     const cold: Array<{ message?: string }> = [];
     const plannedCold = await buildRunPlan(runCtx((event) => cold.push(event)), { bridge: bridgePath, moduleDir });
     expect(plannedCold.kind).toBe("ready");
-    expect(cold.some((event) => /folder fence/i.test(event.message ?? ""))).toBe(false);
+    expect(cold.some((event) => /get_session_stats/i.test(event.message ?? ""))).toBe(false);
 
     // 2. The environment test probes and persists under its own input.
     const envTest = await testEnvironment({
@@ -93,16 +93,16 @@ describe("run-path capability cache parity", () => {
       config: { command: ompCommand, governancePolicy: POLICY },
       executionTarget: null,
     } as AdapterEnvironmentTestContext);
-    const fence = envTest.checks.find((check) => check.code === "omp_settings_restricted_folders_missing");
-    expect(fence?.level).toBe("warn");
+    const stats = envTest.checks.find((check) => (check.message ?? "").includes("get_session_stats"));
+    expect(stats?.level).toBe("warn");
 
     // 3. The run reads that entry — same key despite the manifests, the
     // `--extension` append and the failover overlay the run path adds later.
     const warm: Array<{ message?: string }> = [];
     const planned = await buildRunPlan(runCtx((event) => warm.push(event)), { bridge: bridgePath, moduleDir });
     expect(planned.kind).toBe("ready");
-    const reported = warm.filter((event) => /folder fence/i.test(event.message ?? ""));
+    const reported = warm.filter((event) => /get_session_stats/i.test(event.message ?? ""));
     expect(reported).toHaveLength(1);
-    expect(reported[0].message).toContain("tools.restrictedFolders");
+    expect(reported[0].message).toContain("usage receipt");
   }, 60_000);
 });
