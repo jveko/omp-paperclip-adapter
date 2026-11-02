@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.17.0 — 2026-11-02
+
+Engine naming retired, and cost receipts become per-run.
+
+- **`omp.tool_call`** replaces `acpx.tool_call` in the protocol, host emitter and adapter relay. The old
+  spelling is accepted by the adapter for one version (deprecated, with a comment naming the removal),
+  so a supervisor left running from a previous release cannot break a new adapter.
+- **The acpx stdout parser is gone.** `src/ui-parser.ts` now parses the managed lane's relayed event
+  lines and keeps the `./ui-parser` package contract (`TranscriptEntry[]`, unknown lines become
+  `stdout`, malformed JSON never throws). `acpx-engine/ui` is no longer imported anywhere.
+- **Per-run cost deltas.** The host tracks each worker's last settle snapshot and reports the delta as
+  `usageBasis: "per_run"`; a cold or restarted worker, or a session the host did not open, falls back to
+  `session_cumulative` with a run note. `routedModels` and `contextUsage` are carried from
+  `get_session_stats` when present. Two runs on one warm worker now produce deltas that sum to the
+  cumulative totals.
+
+Gates: typecheck, 759 unit tests (2 skipped), 3 conformance, build, the opt-in 60 s warm test, and a
+clean-clone `npm ci` → tests.
+
 ## 0.16.0 — 2026-11-02
 
 Supervisor operator surface.
