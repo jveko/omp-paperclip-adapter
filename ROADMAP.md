@@ -308,6 +308,16 @@ covered by tests.
 2026-10-30 assessment resolved (for example the "resume fingerprint instability"), the
 assessment above supersedes it.*
 
+- **2026-11-02 — v0.16.0 → v0.19.0 (Operator surface, naming/cost, conformance, live smoke).**
+  v0.16: `omp-host stats`, `resultJson.hostRuntime` + plugin render, lifecycle docs and an optional
+  systemd user unit, socket permission/owner self-check. v0.17: `omp.tool_call` replaces
+  `acpx.tool_call` (one-version alias), the acpx stdout parser retired behind `./ui-parser`, per-run
+  cost deltas with an honest cumulative fallback. v0.18: five supervisor invariant scenarios
+  (lease overlap, capacity, reconciliation, run-lease kill, capability-less worker) and
+  `sessionScope: "isolated"` by default under broker credentials. v0.19: `npm run smoke:real` against a
+  real omp (two turns, one reused worker, per-run usage, ledger settlement) and `LIVE-CHECK.md` for the
+  Paperclip-instance half.
+
 - **2026-10-31 — v0.15.0 (Single lane).** Engine run path deleted: `adapters/acp/engine.ts`, the engine
   branch of the run plan, `buildOmpAcpConfig`/`DEFAULT_ACP_ENGINE_*`, `executionMode`, the adapter-side
   lease wrapper and `retry.ts` (engine error taxonomy). The supervisor is the only run path; ACP remains
