@@ -1,87 +1,42 @@
-import { parseAcpxStdoutLine } from "./server/adapters/acp/ui.js";
 import type { TranscriptEntry } from "@paperclipai/adapter-utils";
 
 /**
- * omp packs everything into one display string, in two shapes:
+ * The managed lane's transcript parser.
  *
- *   announce (status=pending) "<name> (pending): <argument>"
- *   update   (status=*)       "tool call (<status>): <payload>"
+ * The supervisor relays the worker's RPC frames to the adapter as
+ * `AdapterRuntimeEvent` objects, and Paperclip records them as JSON lines. The
+ * shapes this module recognises:
  *
- * For a shell tool the announce argument just repeats the command in `name`
- * and the update payload is `<command>\n<output>`. For every other tool the
- * announce argument is the real target (a path, a glob, a skill:// ref) and
- * the update payload is the result. So the interesting half is the tail in
- * both cases; `detail` peels off whichever head is present.
+ *   {"eventType":"omp.turn","payload":{"text":"..."}}                 -> assistant
+ *   {"eventType":"omp.tool_call","payload":{"phase":"tool_call",...}} -> tool_call
+ *   {"eventType":"omp.tool_call","payload":{"phase":"tool_result",...}} -> tool_result
+ *   {"eventType":"run.system","message":"..."}                        -> system
+ *   {"eventType":"omp.subagent","message":"explore running"}          -> system
+ *   {"eventType":"omp.log","payload":{"stream":"stderr","chunk":"..."}} -> stderr / stdout
+ *
+ * Everything else — an unknown event type, a JSON object that is not an event,
+ * a malformed line, or plain text — is passed through verbatim as a `stdout`
+ * entry. A parser that throws would take the whole transcript down with one bad
+ * line.
  */
-const STATUS = "pending|in_progress|completed|failed|cancelled";
-const UPDATE_HEAD_RE = new RegExp(`^tool call \\((?:${STATUS})\\):[ \\t]*`, "i");
-const ANNOUNCE_HEAD_RE = new RegExp(`^[\\s\\S]*?\\s+\\((?:${STATUS})\\):[ \\t]*`, "i");
 
-function toolDetail(text: string): string {
-  const update = text.match(UPDATE_HEAD_RE);
-  if (update) return text.slice(update[0].length);
-  const announce = text.match(ANNOUNCE_HEAD_RE);
-  return announce ? text.slice(announce[0].length) : text;
-}
+/** The label for a tool event that carries no usable name. */
+const FALLBACK_TOOL_NAME = "omp_tool";
 
-/** The bare command for a shell tool call, or null if `name` is not one. */
-function shellCommand(name: string): string | null {
-  const trimmed = name.trim();
-  return trimmed.startsWith("$") ? trimmed.slice(1).trim() || null : null;
-}
-
-/**
- * Shown instead of an empty result when omp's display cap left no room for the
- * output. Without it a card that captured nothing is indistinguishable from a
- * command that genuinely printed nothing.
- */
-const OUTPUT_OMITTED = "[output not captured — omp truncated this event]";
-
-/**
- * Drop omp's trailing ACP terminal handle, then tighten the blank run it
- * leaves in front of the wall-time footer.
- */
-function stripTerminalFooter(output: string): string {
-  const at = output.lastIndexOf("\n[");
-  if (at === -1) return tidyWallTime(output);
-  const last = output.slice(at + 1);
-  const cut = last.replace(/…$/, "");
-  const isFooter =
-    last.startsWith("[terminal]") ||
-    // The handle line can itself be cut off by omp's cap, leaving "[t…".
-    (last.endsWith("…") && cut.length > 1 && "[terminal] ".startsWith(cut));
-  return tidyWallTime(isFooter ? output.slice(0, at).replace(/\s+$/, "") : output);
-}
-
-function tidyWallTime(output: string): string {
-  return output.replace(/\n{3,}(?=Wall time:)/, "\n\n");
-}
-
-/**
- * A shell update payload re-echoes the command before the output. The command
- * is already the card's headline, so drop the echo and keep only the output.
- */
-function commandOutput(payload: string, name: string): string {
-  const echo = name.trim();
-  // A payload that is exactly the echo means the command really printed nothing.
-  if (payload === echo) return "";
-  if (payload.startsWith(echo)) {
-    return stripTerminalFooter(payload.slice(echo.length).replace(/^\r?\n/, ""));
+function parseJson(line: string): Record<string, unknown> | null {
+  try {
+    const value: unknown = JSON.parse(line);
+    return typeof value === "object" && value !== null && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
   }
-  // omp caps the display text at ~500 chars, so a command longer than that
-  // consumes the whole budget and the payload is a cut-off echo.
-  const cut = payload.replace(/…$/, "");
-  if (cut && echo.startsWith(cut)) return OUTPUT_OMITTED;
-  return stripTerminalFooter(payload);
 }
 
-/**
- * True when `input` is the record the upstream parser synthesizes from omp's
- * flat event ({text, status}) rather than a real structured tool input, which
- * must be passed through untouched.
- */
-function isSynthesizedInput(record: Record<string, unknown>): boolean {
-  return Object.keys(record).every((key) => key === "text" || key === "status");
+/** A non-empty string, or null. */
+function asString(value: unknown): string | null {
+  return typeof value === "string" && value !== "" ? value : null;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -89,8 +44,18 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value as Record<string, unknown>;
 }
 
+function stdout(line: string, ts: string): TranscriptEntry[] {
+  return [{ kind: "stdout", ts, text: line }];
+}
+
 /** Wrappers to skip when looking for the real command in a shell line. */
-const SHELL_WRAPPERS = new Set(["sudo", "nohup", "time", "exec", "export"]);
+const SHELL_WRAPPERS: Record<string, true> = {
+  sudo: true,
+  nohup: true,
+  time: true,
+  exec: true,
+  export: true,
+};
 
 /**
  * A plausible command word. Redaction can chew a `$(` off the front of a
@@ -101,16 +66,15 @@ const SHELL_WRAPPERS = new Set(["sudo", "nohup", "time", "exec", "export"]);
 const COMMAND_WORD_RE = /^[A-Za-z0-9_.+-]+$/;
 
 /**
- * Derive a short display label for a tool call. omp sets `name` to the full
- * shell command, which the board renders with text-transform:capitalize and
- * HTML-escaping — producing "Used $ Ls /Home/Dimaz/... 2&gt;/Dev/Null; Echo".
- * A concise command label avoids that mangling while the full command stays
- * in `input.text`.
+ * Derive a short display label for a tool call. A shell call arrives with the
+ * command as its name, which the board renders with text-transform:capitalize
+ * and HTML-escaping — producing "Used $ Ls /Home/Dimaz/... 2&gt;/Dev/Null; Echo".
+ * Naming the command word avoids that mangling; any other name is already a
+ * human-authored label and is left alone.
  */
 function toolDisplayName(name: string): string {
   const trimmed = name.trim();
-  if (!trimmed) return "acp_tool";
-  // Non-"$" names are already human-authored labels ("Reading JWT API skill").
+  if (!trimmed) return FALLBACK_TOOL_NAME;
   if (!trimmed.startsWith("$")) return trimmed;
   // Drop $(...) / `...` substitutions so a token like "/tmp/jwt)" can't leak in.
   const stripped = trimmed
@@ -123,7 +87,7 @@ function toolDisplayName(name: string): string {
     // An operator before any command means there is nothing useful to label.
     if (/^[|&;<>(){}]/.test(word)) break;
     if (word.includes("=")) continue; // VAR=value assignment
-    if (SHELL_WRAPPERS.has(word)) continue;
+    if (SHELL_WRAPPERS[word] === true) continue;
     if (word === "cd") {
       i++; // also skip the directory argument
       continue;
@@ -136,157 +100,69 @@ function toolDisplayName(name: string): string {
 }
 
 /**
- * ACP events that failed JSON parse (e.g. redaction-mangled JSON) still carry
- * the `"type":"acpx.*"` signature.
+ * A tool event carries a phase and identity, never the arguments or output:
+ * `tool_call` opens the board's card, `tool_result` closes it. The result
+ * content is empty because the relay does not carry it.
  */
-const ACP_EVENT_RE = /"type"\s*:\s*"acpx\.[a-z_]+"/;
-
-/** Did the upstream parser give up on a line that is clearly an ACP event? */
-function isUnparsedAcpEvent(entries: TranscriptEntry[], line: string): boolean {
-  return (
-    entries.length === 1 &&
-    entries[0].kind === "stdout" &&
-    line.trimStart().startsWith("{") &&
-    ACP_EVENT_RE.test(line)
-  );
-}
-
-/**
- * Guess the event kind from a mangled (non-JSON) ACP-like line for display.
- */
-function guessAcpxKind(line: string): string {
-  const m = line.match(/"type"\s*:\s*"acpx\.([a-z_]+)"/);
-  return m ? m[1].replace(/_/g, " ") : "acp event";
-}
-
-/**
- * omp's log redactor substitutes secrets *after* JSON encoding, so a redacted
- * value can leave a raw `"` inside a string ("$ JWT=***REDACTED***"***REDACTED***\"")
- * and the whole event fails to parse — losing every tool call that touched a
- * secret. Re-escape those strays: inside a JSON string a `"` only ends the
- * string when the next non-space char is one of `,}]:`; anything else means the
- * quote is content. Also re-escapes raw control characters and closes an
- * unterminated tail so a cut-off line still yields a partial event.
- */
-function repairMangledJson(line: string): string {
-  const out: string[] = [];
-  const closers: string[] = [];
-  let inString = false;
-
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (!inString) {
-      if (ch === '"') inString = true;
-      else if (ch === "{") closers.push("}");
-      else if (ch === "[") closers.push("]");
-      else if (ch === "}" || ch === "]") closers.pop();
-      out.push(ch);
-      continue;
-    }
-    if (ch === "\\") {
-      out.push(ch, line[i + 1] ?? "");
-      i++;
-      continue;
-    }
-    if (ch === '"') {
-      let j = i + 1;
-      while (j < line.length && /\s/.test(line[j])) j++;
-      if (j >= line.length || ",}]:".includes(line[j])) {
-        inString = false;
-        out.push(ch);
-      } else {
-        out.push('\\"');
-      }
-      continue;
-    }
-    // Raw control characters are illegal inside a JSON string.
-    out.push(ch < " " ? JSON.stringify(ch).slice(1, -1) : ch);
+function toolEntries(
+  payload: Record<string, unknown>,
+  message: string | null,
+  ts: string,
+): TranscriptEntry[] {
+  const name = toolDisplayName(asString(payload.toolName) ?? message ?? "");
+  const toolUseId = asString(payload.toolCallId);
+  if (payload.phase === "tool_result") {
+    return [{
+      kind: "tool_result",
+      ts,
+      toolUseId: toolUseId ?? name,
+      toolName: name,
+      content: "",
+      isError: false,
+    }];
   }
-
-  if (inString) out.push('"');
-  while (closers.length) out.push(closers.pop() as string);
-  return out.join("");
-}
-
-/**
- * ACP transport chatter that only restates a tool call the board already shows
- * as a card — with the raw escaped bash spliced in. Successful plumbing is
- * dropped; anything that is not a plain running/completed transition (a
- * failure, a cancellation) is kept.
- */
-const PLUMBING_STATUS_RE = /^(?:terminal|fs)\/\S+\s+(?:running|completed)\b/;
-
-function isPlumbingStatus(text: string): boolean {
-  return PLUMBING_STATUS_RE.test(text.trim());
-}
-
-/**
- * Reshape a tool_call so the board renders it well.
- *
- * The board decides between its terminal-style command renderer and the generic
- * tool card on `input.command`/`input.cmd` being a string, so a shell call must
- * expose the command under `command` — `text` gets the wrench card and a
- * capitalized command as the title. Everything else gets its target under
- * `target`, which the board's input summarizer also looks for.
- *
- * The board folds later events for the same toolUseId into the first card by
- * shallow-merging their `input`, and skips an empty record. So a status update
- * (whose payload is the result, not the input) deliberately carries no keys for
- * a non-shell tool: that keeps the target captured at announce time instead of
- * overwriting the Input pane with the result.
- */
-function polishToolCall(entry: Extract<TranscriptEntry, { kind: "tool_call" }>): TranscriptEntry {
-  const name = toolDisplayName(entry.name);
-  const record = asRecord(entry.input);
-  if (!record || !isSynthesizedInput(record)) return { ...entry, name };
-
-  const command = shellCommand(entry.name);
-  if (command) return { ...entry, name, input: { command } };
-
-  const status = typeof record.status === "string" ? record.status : "";
-  const announced = status === "" || status === "pending";
-  const text = typeof record.text === "string" ? record.text : "";
-  const target = announced ? toolDetail(text).trim() : "";
-  return { ...entry, name, input: target ? { target } : {} };
-}
-
-/**
- * The result pane should hold the output alone: the command (or target) is
- * already the headline right above it, and omp repeats it in the payload.
- */
-function polishToolResult(entry: Extract<TranscriptEntry, { kind: "tool_result" }>): TranscriptEntry {
-  const raw = entry.toolName ?? "";
-  const command = shellCommand(raw);
-  const payload = toolDetail(entry.content);
-  return {
-    ...entry,
-    toolName: entry.toolName === undefined ? undefined : toolDisplayName(entry.toolName),
-    content: command ? commandOutput(payload, raw) : payload,
-  };
-}
-
-/** Tidy a single entry for display; returns [] to drop it. */
-function polish(entry: TranscriptEntry): TranscriptEntry[] {
-  if (entry.kind === "tool_call") return [polishToolCall(entry)];
-  if (entry.kind === "tool_result") return [polishToolResult(entry)];
-  if (entry.kind === "system" && isPlumbingStatus(entry.text)) return [];
-  return [entry];
+  return [{
+    kind: "tool_call",
+    ts,
+    name,
+    ...(toolUseId !== null ? { toolUseId } : {}),
+    input: {},
+  }];
 }
 
 export function parseStdoutLine(line: string, ts: string): TranscriptEntry[] {
-  let entries = parseAcpxStdoutLine(line, ts);
-
-  // Redaction-mangled ACP event: repair the JSON and re-parse rather than
-  // dumping the raw NDJSON (or a contentless placeholder) into the nice view.
-  if (isUnparsedAcpEvent(entries, line)) {
-    const repaired = repairMangledJson(line);
-    const reparsed = repaired === line ? null : parseAcpxStdoutLine(repaired, ts);
-    if (reparsed && !isUnparsedAcpEvent(reparsed, repaired)) {
-      entries = reparsed;
-    } else {
-      return [{ kind: "system", ts, text: `[${guessAcpxKind(line)}] (unparseable event)` }];
+  const event = parseJson(line);
+  if (event === null) return stdout(line, ts);
+  const payload = asRecord(event.payload);
+  switch (asString(event.eventType)) {
+    case "omp.turn": {
+      // Lifecycle-only turns (`agent_start`, `turn_end`, ...) carry no content.
+      const text = asString(payload?.text) ?? asString(event.message);
+      return text === null ? [] : [{ kind: "assistant", ts, text }];
     }
+    case "omp.tool_call":
+      return toolEntries(payload ?? {}, asString(event.message), ts);
+    case "run.system": {
+      const text = asString(event.message) ?? asString(payload?.message);
+      return text === null ? [] : [{ kind: "system", ts, text }];
+    }
+    case "omp.subagent": {
+      const agent = asString(payload?.agent);
+      const status = asString(payload?.status);
+      const text = asString(event.message)
+        ?? (agent !== null && status !== null ? `${agent} ${status}` : null);
+      return text === null ? [] : [{ kind: "system", ts, text }];
+    }
+    case "omp.log": {
+      const chunk = asString(payload?.chunk);
+      if (chunk === null) return [];
+      return [{
+        kind: payload?.stream === "stdout" ? "stdout" : "stderr",
+        ts,
+        text: chunk.replace(/\r?\n$/, ""),
+      }];
+    }
+    default:
+      return stdout(line, ts);
   }
-
-  return entries.flatMap(polish);
 }
