@@ -1,13 +1,11 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
-import os from "node:os";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AdapterExecutionContext, AdapterExecutionResult, AdapterUsageCheckpoint } from "@paperclipai/adapter-utils";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { AdapterExecutionResult, AdapterUsageCheckpoint } from "@paperclipai/adapter-utils";
 import { createOmpAcpExecutor } from "../src/server/acp.js";
 import { readLedgerRecords } from "../src/host/ledger.js";
-import { readDiscovery } from "../src/host/socket.js";
 import { checkGolden, normalizeGolden, runReplacements } from "./golden.js";
-import { materializeProfile } from "./profiles.js";
+import { conformanceEnv, ctx, managedWorker, type ConformanceEnv } from "./managed-harness.js";
 
 /**
  * The managed-lane golden run: the adapter spawns the REAL supervisor binary
@@ -22,80 +20,23 @@ import { materializeProfile } from "./profiles.js";
  * - the subagent events the managed lane exposes (bounded and content-free).
  */
 
-const fakeRpcDirs: string[] = [];
 const runs: Array<Record<string, unknown>> = [];
 
-let home: string;
-let instanceRoot: string;
+let env: ConformanceEnv;
 
 beforeEach(async () => {
-  // Short paths on purpose: a Unix socket path is capped at 108 bytes, and the
-  // supervisor's socket lives under PAPERCLIP_HOME/instances/<id>/omp-host.
-  home = await mkdtemp(path.join(os.tmpdir(), "ompcf-"));
-  instanceRoot = path.join(home, "instances", "cf");
-  vi.stubEnv("PAPERCLIP_HOME", home);
-  vi.stubEnv("PAPERCLIP_INSTANCE_ID", "cf");
-  // The spawned host inherits this env and drains by itself after the run.
-  vi.stubEnv("OMP_HOST_IDLE_MS", "400");
-  vi.stubEnv("OMP_HOST_WORKER_IDLE_MS", "400");
+  env = await conformanceEnv("cf");
 });
 
 afterEach(async () => {
-  vi.unstubAllEnvs();
-  await killSupervisor();
-  await rm(home, { recursive: true, force: true });
-  for (const dir of fakeRpcDirs.splice(0)) await rm(dir, { recursive: true, force: true });
+  await env.dispose();
 });
-
-async function killSupervisor(): Promise<void> {
-  const discovery = await readDiscovery(path.join(instanceRoot, "omp-host"));
-  if (discovery === null) return;
-  try {
-    process.kill(discovery.pid, "SIGKILL");
-  } catch {
-    // Already gone.
-  }
-}
-
-function ctx(config: Record<string, unknown>, overrides: Partial<AdapterExecutionContext> = {}): AdapterExecutionContext {
-  return {
-    runId: `run-${Math.random().toString(16).slice(2)}`,
-    agent: { id: "agent-1", companyId: "co-1", name: "A", adapterType: "omp_local", adapterConfig: null },
-    runtime: { sessionId: null, sessionParams: {}, sessionDisplayId: null, taskKey: "task" },
-    config,
-    context: {},
-    onLog: async () => {},
-    onEvent: async () => {},
-    ...overrides,
-  } as AdapterExecutionContext;
-}
-
-/** The managed lane's worker is `buildWorkerCommand`, not the ACP command. */
-async function managedConfig(rpcMode: string, statsFile: string, logFile: string): Promise<Record<string, unknown>> {
-  const dir = await mkdtemp(path.join(os.tmpdir(), "omp-conformance-worker-"));
-  fakeRpcDirs.push(dir);
-  const build = await materializeProfile(dir, {
-    name: "managed",
-    commandName: "omp",
-    version: "18.14.0",
-    settingsKeys: ["session.maxCost", "tools.restrictedFolders", "defaultThinkingLevel"],
-    topVerbs: ["acp", "config", "gc", "models", "session"],
-    modelsVerbs: ["ls", "refresh"],
-    sessionVerbs: ["lease"],
-    rpcMode,
-    expectedDiagnostics: [],
-  });
-  return {
-    command: build.script,
-    env: { FAKE_RPC_MODE: rpcMode, FAKE_RPC_STATS: statsFile, FAKE_RPC_LOG: logFile },
-  };
-}
 
 describe("managed-lane conformance", () => {
   it("settles two runs on one worker: journal order, usage, and session reuse", async () => {
-    const statsFile = path.join(home, "stats.json");
-    const logFile = path.join(home, "frames.log");
-    const config = await managedConfig("", statsFile, logFile);
+    const statsFile = path.join(env.home, "stats.json");
+    const logFile = path.join(env.home, "frames.log");
+    const config = await managedWorker(env, "", { stats: statsFile, log: logFile });
     const run = createOmpAcpExecutor();
 
     const events: string[] = [];
@@ -132,7 +73,7 @@ describe("managed-lane conformance", () => {
     expect(opens.map((frame) => frame.type)).toEqual(["new_session"]);
     expect(cold.sessionParams?.acpSessionId).toBe("sess-new-1");
 
-    const records = await readLedgerRecords(path.join(instanceRoot, "omp-host"));
+    const records = await readLedgerRecords(env.hostRoot);
     const states = records.map((record) => record.state);
     expect(states).toEqual([
       "leased", "worker_ready", "session_open", "prompting", "settled", "closed",
@@ -149,9 +90,9 @@ describe("managed-lane conformance", () => {
   }, 60_000);
 
   it("reports subagent lifecycle events from the worker", async () => {
-    const statsFile = path.join(home, "stats-sa.json");
-    const logFile = path.join(home, "frames-sa.log");
-    const config = await managedConfig("subagents", statsFile, logFile);
+    const statsFile = path.join(env.home, "stats-sa.json");
+    const logFile = path.join(env.home, "frames-sa.log");
+    const config = await managedWorker(env, "subagents", { stats: statsFile, log: logFile });
     const events: Array<{ eventType: string; level?: string; payload?: Record<string, unknown> }> = [];
     const result: AdapterExecutionResult = await createOmpAcpExecutor()(ctx(
       { ...config, subagentObservability: "events" },
