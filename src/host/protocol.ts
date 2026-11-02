@@ -227,6 +227,35 @@ export interface RunSettledFrame {
   result: AdapterExecutionResult;
 }
 
+/** The settlement site that ended a run, in the supervisor's own words. */
+export type SettledBy =
+  | "outcome"
+  | "timeout"
+  | "cancel"
+  | "adapter_gone"
+  | "lease"
+  | "worker_exit"
+  | "host_exit"
+  | "begin_error";
+
+/**
+ * The supervisor's own account of a finished run, carried on
+ * `resultJson.hostRuntime`. Ids and accounting only: never a credential, a
+ * prompt or a transcript. Absent on a result the supervisor did not produce
+ * (an unreachable host, a refused begin), so a board can tell "the host ran
+ * this" from "the adapter never reached one".
+ */
+export interface HostRuntime {
+  workerPid: number;
+  reusedWorker: boolean;
+  settledBy: SettledBy;
+  cause?: LedgerCause;
+  /** The settle record's `seq`; 0 when the ledger write itself failed. */
+  ledgerSeq: number;
+  /** How long the worker had been alive when the run settled. */
+  workerAgeMs: number;
+}
+
 export interface RunStatusResultFrame {
   type: "run.status.result";
   id: string;

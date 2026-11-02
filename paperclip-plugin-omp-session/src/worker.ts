@@ -30,12 +30,27 @@ interface SessionRuntime {
   mcpServerCount: number | null;
 }
 
+/**
+ * `resultJson.hostRuntime`: the supervisor's account of a managed run. Absent
+ * when the run never reached a supervisor, which is why it is nullable rather
+ * than defaulted. Ids and accounting only; no content.
+ */
+interface HostRuntime {
+  workerPid: number;
+  reusedWorker: boolean;
+  settledBy: string;
+  cause: string | null;
+  ledgerSeq: number;
+  workerAgeMs: number;
+}
+
 interface RunOverview {
   id: string;
   status: string | null;
   startedAt: string | null;
   endedAt: string | null;
   sessionRuntime: SessionRuntime | null;
+  runtime: HostRuntime | null;
   usage: Record<string, number> | null;
   costUsd: number;
   // Distinct cost_events.model values for the run, first-seen order, joined
@@ -94,6 +109,28 @@ function parseSessionRuntime(value: unknown): SessionRuntime | null {
     fork: parseFork(o.fork),
     rotation: parseRotation(o.lastRotation),
     mcpServerCount: typeof o.mcpServerCount === "number" ? o.mcpServerCount : null,
+  };
+}
+
+/**
+ * The three identity fields are the contract; the two accounting fields are
+ * tolerated as zeros so a summary from an older supervisor still renders.
+ */
+function parseHostRuntime(value: unknown): HostRuntime | null {
+  if (typeof value !== "object" || value === null) return null;
+  const o = value as Record<string, unknown>;
+  if (typeof o.workerPid !== "number"
+    || typeof o.reusedWorker !== "boolean"
+    || typeof o.settledBy !== "string") {
+    return null;
+  }
+  return {
+    workerPid: o.workerPid,
+    reusedWorker: o.reusedWorker,
+    settledBy: o.settledBy,
+    cause: typeof o.cause === "string" ? o.cause : null,
+    ledgerSeq: typeof o.ledgerSeq === "number" ? o.ledgerSeq : 0,
+    workerAgeMs: typeof o.workerAgeMs === "number" ? o.workerAgeMs : 0,
   };
 }
 
@@ -173,11 +210,11 @@ const plugin = definePlugin({
 
       for (const row of runs) {
         const resultJson = tryParseJson(row.result_json);
-        const sessionRuntime = parseSessionRuntime(
-          typeof resultJson === "object" && resultJson !== null
-            ? (resultJson as Record<string, unknown>).sessionRuntime
-            : null,
-        );
+        const resultObject = typeof resultJson === "object" && resultJson !== null
+          ? resultJson as Record<string, unknown>
+          : null;
+        const sessionRuntime = parseSessionRuntime(resultObject?.sessionRuntime ?? null);
+        const runtime = parseHostRuntime(resultObject?.hostRuntime ?? null);
         const usage = parseUsage(row.usage_json);
 
         // Compute session duration from timestamps
@@ -199,6 +236,7 @@ const plugin = definePlugin({
           startedAt: row.started_at ?? null,
           endedAt: row.finished_at ?? null,
           sessionRuntime,
+          runtime,
           usage,
           costUsd: runCost / 100,
           model: runModels && runModels.size > 0 ? [...runModels].join(", ") : null,

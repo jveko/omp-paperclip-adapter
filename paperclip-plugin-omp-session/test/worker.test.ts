@@ -11,12 +11,22 @@ interface SessionRuntime {
   mcpServerCount: number | null;
 }
 
+interface HostRuntime {
+  workerPid: number;
+  reusedWorker: boolean;
+  settledBy: string;
+  cause: string | null;
+  ledgerSeq: number;
+  workerAgeMs: number;
+}
+
 interface RunOverview {
   id: string;
   status: string | null;
   startedAt: string | null;
   endedAt: string | null;
   sessionRuntime: SessionRuntime | null;
+  runtime: HostRuntime | null;
   usage: Record<string, number> | null;
   costUsd: number;
   model: string | null;
@@ -62,6 +72,13 @@ const RUN_1 = {
       fork: { requested: "sess-a", applied: true, activeSessionId: "sess-a" },
       lastRotation: { reason: "maxRuns", at: "2026-09-01T09:00:00Z", sessionKey: "sk" },
       mcpServerCount: 2,
+    },
+    hostRuntime: {
+      workerPid: 4242,
+      reusedWorker: true,
+      settledBy: "outcome",
+      ledgerSeq: 17,
+      workerAgeMs: 90_000,
     },
   },
   usage_json: { prompt_tokens: 1500, completion_tokens: 800 },
@@ -110,6 +127,15 @@ describe("omp-session-overview data handler", () => {
       mcpServerCount: 2,
     });
     expect(r1.usage).toEqual({ prompt_tokens: 1500, completion_tokens: 800 });
+    // Result evidence is rendered as-is; an absent cause (a clean turn) is null.
+    expect(r1.runtime).toEqual({
+      workerPid: 4242,
+      reusedWorker: true,
+      settledBy: "outcome",
+      cause: null,
+      ledgerSeq: 17,
+      workerAgeMs: 90_000,
+    });
     // 500 + 200 + 0 cents = 700 -> 7.00 USD
     expect(r1.costUsd).toBe(7);
     expect(r1.model).toBe("gpt-4");
@@ -123,6 +149,8 @@ describe("omp-session-overview data handler", () => {
       mcpServerCount: null,
     });
     expect(r2.usage).toEqual({ prompt_tokens: 500, completion_tokens: 100 });
+    // The run never reported host runtime evidence: null, not a default object.
+    expect(r2.runtime).toBeNull();
     expect(r2.costUsd).toBe(3);
     expect(r2.model).toBe("claude-3");
 
@@ -227,6 +255,7 @@ describe("omp-session-overview data handler", () => {
     );
 
     expect(overview.runs[0].sessionRuntime).toBeNull();
+    expect(overview.runs[0].runtime).toBeNull();
     expect(overview.runs[0].usage).toEqual({ prompt_tokens: 1500, completion_tokens: 800 });
     expect(overview.runs[0].model).toBeNull();
   });

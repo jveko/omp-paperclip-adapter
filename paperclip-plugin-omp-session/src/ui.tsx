@@ -16,12 +16,23 @@ interface SessionRuntime {
   mcpServerCount: number | null;
 }
 
+/** `resultJson.hostRuntime`; null when the run never reached the supervisor. */
+interface HostRuntime {
+  workerPid: number;
+  reusedWorker: boolean;
+  settledBy: string;
+  cause: string | null;
+  ledgerSeq: number;
+  workerAgeMs: number;
+}
+
 interface RunOverview {
   id: string;
   status: string | null;
   startedAt: string | null;
   endedAt: string | null;
   sessionRuntime: SessionRuntime | null;
+  runtime: HostRuntime | null;
   usage: Record<string, number> | null;
   costUsd: number;
   // Null when the run has no cost events; cost_events.model is NOT NULL.
@@ -97,6 +108,25 @@ function formatSessionRuntime(rt: SessionRuntime | null): string {
 
 function formatModel(model: string | null): string {
   return model || "\u2014";
+}
+
+/**
+ * The supervisor's evidence for one run, small enough for a table cell: which
+ * worker served it, whether it was warm, and what ended the turn.
+ */
+function RuntimeBlock({ runtime }: { runtime: HostRuntime | null }) {
+  if (runtime === null) return <>{formatModel(null)}</>;
+  return (
+    <div data-testid="host-runtime" data-worker-pid={runtime.workerPid}>
+      <div>
+        pid {runtime.workerPid} · {runtime.reusedWorker ? "reused" : "fresh"} worker
+      </div>
+      <div>
+        settled by {runtime.settledBy}
+        {runtime.cause !== null ? ` · cause ${runtime.cause}` : ""}
+      </div>
+    </div>
+  );
 }
 
 // -- Component ---------------------------------------------------------------
@@ -183,6 +213,12 @@ export function OmpSessionOverview({ context }: PluginDetailTabProps) {
             header: "Session Runtime",
             width: "200px",
             render: (v) => formatSessionRuntime(v as SessionRuntime | null),
+          },
+          {
+            key: "runtime",
+            header: "Runtime",
+            width: "200px",
+            render: (v) => <RuntimeBlock runtime={v as HostRuntime | null} />,
           },
           {
             key: "usage",

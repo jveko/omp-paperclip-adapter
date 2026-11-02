@@ -115,6 +115,12 @@ describe("phase 1 acceptance on dist/omp-host.js", () => {
     });
     expect(spawns).toHaveLength(1);
     expect(usages).toHaveLength(1);
+    // The adapter forwards the supervisor's own runtime evidence unchanged.
+    expect((result.resultJson as Record<string, unknown>).hostRuntime).toMatchObject({
+      workerPid: spawns[0].pid,
+      reusedWorker: false,
+      settledBy: "outcome",
+    });
 
     const hostRoot = path.join(instanceRoot, "omp-host");
     // `run.settled` is sent before the `closed` journal line, and the idle host
@@ -130,6 +136,16 @@ describe("phase 1 acceptance on dist/omp-host.js", () => {
     const contextDirs = await readdir(path.join(hostRoot, "run-context")).catch(() => []);
     expect(contextDirs).toEqual([]);
   }, 45_000);
+
+  it("omits hostRuntime when the supervisor never starts", async () => {
+    // A run that never reaches a supervisor has no worker, no settle record and
+    // therefore no runtime evidence: the adapter must not invent any.
+    const run = createOmpAcpExecutor({ hostScript: path.join(home, "no-such-omp-host.js") });
+    const result = await run(ctx("unreachable"));
+    expect(result.exitCode).not.toBe(0);
+    expect(result.errorCode).toBe("omp_host_unavailable");
+    expect(result.resultJson).toBeUndefined();
+  }, 30_000);
 
   it("serves the run's connection tools as host tools through the spawned binary", async () => {
     const mcp = await startFakeMcp();

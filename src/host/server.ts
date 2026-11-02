@@ -14,8 +14,8 @@ import {
 } from "./ledger.js";
 import {
   HOST_PROTOCOL_VERSION, encodeFrame, parseFrame, isHostFrame,
-  type HostFrame, type HostReply, type LedgerCause, type RunBeginFrame,
-  type RunEventKind, type RunSettledFrame,
+  type HostFrame, type HostReply, type HostRuntime, type LedgerCause, type RunBeginFrame,
+  type RunEventKind, type RunSettledFrame, type SettledBy,
 } from "./protocol.js";
 import { clearRunContext, reapRunContexts, runContextPointer, writeRunContext } from "./run-context.js";
 import {
@@ -931,6 +931,7 @@ class Supervisor {
       const deadBeforeTurn = !promptAccepted && !worker.worker.alive;
       await this.settle(run, {
         kind: "lost",
+        settledBy: "begin_error",
         cause: disconnected ? "adapter_gone" : (worker.worker.alive || deadBeforeTurn ? "config_error" : "worker_exit"),
         errorCode: unwritable
           ? "omp_host_unwritable"
@@ -979,6 +980,7 @@ class Supervisor {
       if (run.terminal) return;
       void this.settle(run, {
         kind: "lost",
+        settledBy: "worker_exit",
         cause: run.abandoned ?? "worker_exit",
         errorCode: "omp_host_worker_exit",
         errorMessage: `omp worker exited (${exit.signal ?? exit.code}) mid-run`,
@@ -1196,19 +1198,20 @@ class Supervisor {
     const outcome = run.outcome;
     if (outcome === null || run.terminal) return;
     if (run.abandoned !== null) {
-      await this.settle(run, { kind: "lost", cause: run.abandoned });
+      await this.settle(run, { kind: "lost", settledBy: "adapter_gone", cause: run.abandoned });
       return;
     }
     if (outcome.status === "completed") {
-      await this.settle(run, { kind: "settled", stopReason: "end_turn" });
+      await this.settle(run, { kind: "settled", settledBy: "outcome", stopReason: "end_turn" });
       return;
     }
     if (outcome.status === "aborted") {
-      await this.settle(run, { kind: "settled", cause: "cancel", stopReason: "aborted" });
+      await this.settle(run, { kind: "settled", settledBy: "outcome", cause: "cancel", stopReason: "aborted" });
       return;
     }
     await this.settle(run, {
       kind: "settled",
+      settledBy: "outcome",
       stopReason: "error",
       errorCode: "omp_rpc_turn_failed",
       errorMessage: outcome.errorMessage ?? "the omp turn ended in error",
@@ -1222,6 +1225,7 @@ class Supervisor {
     // triggers cannot race in a competing 'cancel' outcome.
     const settling = this.settle(run, {
       kind: "settled",
+      settledBy: "timeout",
       cause: "timeout",
       stopReason: "timeout",
       timedOut: true,
@@ -1239,6 +1243,7 @@ class Supervisor {
     if (!settled) {
       const settling = this.settle(run, {
         kind: "settled",
+        settledBy: "cancel",
         cause: "cancel",
         stopReason: "cancelled",
         detail: { cancelUnconfirmed: true, reason },
@@ -1255,7 +1260,7 @@ class Supervisor {
     const settled = await this.waitForSettle(run, this.options.cancelGraceMs);
     if (settled) return;
     if (run.worker.worker.alive) run.worker.worker.kill("SIGKILL");
-    await this.settle(run, { kind: "lost", cause: "adapter_gone" });
+    await this.settle(run, { kind: "lost", settledBy: "adapter_gone", cause: "adapter_gone" });
   }
 
   /** Resolve true if the run reached a terminal state within `ms`. */
@@ -1291,7 +1296,7 @@ class Supervisor {
         void run.worker.worker.abort().catch(() => {});
         return;
       }
-      const settling = this.settle(run, { kind: "lost", cause: "adapter_gone" });
+      const settling = this.settle(run, { kind: "lost", settledBy: "lease", cause: "adapter_gone" });
       run.worker.worker.kill("SIGKILL");
       void settling;
     }, ttl);
@@ -1306,6 +1311,8 @@ class Supervisor {
     run: RunState,
     outcome: {
       kind: "settled" | "lost";
+      /** Which terminal path reached this settle; rides resultJson.hostRuntime. */
+      settledBy: SettledBy;
       stopReason?: string;
       cause?: LedgerCause;
       errorCode?: string;
@@ -1346,6 +1353,41 @@ class Supervisor {
       routedModels: used.routedModels,
       ...(used.contextUsage !== null ? { contextUsage: used.contextUsage } : {}),
     };
+    const record = this.runRecord(run, outcome.kind, {
+      ...(outcome.cause !== undefined ? { cause: outcome.cause } : {}),
+      detail: {
+        stopReason: outcome.stopReason ?? null,
+        agentInvoked,
+        sessionSettled: run.outcome?.sessionSettled ?? false,
+        status,
+        ...(outcome.detail ?? {}),
+      },
+      usage,
+      worker: this.ledgerWorker(run.worker),
+      ompSessionId: run.ompSessionId,
+      ...(run.sessionFile !== null ? { sessionFile: run.sessionFile } : {}),
+    });
+    let ledgerSeq = 0;
+    await this.journal(record).then((written) => {
+      ledgerSeq = written.seq;
+    }).catch((err: unknown) => {
+      this.emitEvent(run, "run.system", {
+        level: "warn",
+        message: `the run ledger could not record the settle: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    });
+    // The board's runtime evidence: what the host alone knows (was the worker
+    // reused, which path settled the turn, what the worker's age was). Read
+    // after the journal so `ledgerSeq` names the settle record itself.
+    const workerStartMs = Date.parse(run.worker.worker.startedAt);
+    const hostRuntime: HostRuntime = {
+      workerPid: run.worker.worker.pid,
+      reusedWorker: run.reusedWorker,
+      settledBy: outcome.settledBy,
+      ...(outcome.cause !== undefined ? { cause: outcome.cause } : {}),
+      ledgerSeq,
+      workerAgeMs: Number.isFinite(workerStartMs) ? Math.max(0, Date.now() - workerStartMs) : 0,
+    };
     const result: AdapterExecutionResult & { executionRecovery?: Record<string, unknown> } = {
       exitCode: status === "completed" ? 0 : 1,
       signal: null,
@@ -1371,6 +1413,7 @@ class Supervisor {
         transport: "host-rpc",
         workerPid: run.worker.worker.pid,
         reusedWorker: run.reusedWorker,
+        hostRuntime,
         routedModels: used.routedModels,
         ...(used.contextUsage !== null ? { contextUsage: used.contextUsage } : {}),
         ...(subagents !== null ? { subagents } : {}),
@@ -1378,26 +1421,6 @@ class Supervisor {
       summary: run.lastAssistantText ?? outcome.stopReason ?? status,
       ...(outcome.executionRecovery !== undefined ? { executionRecovery: outcome.executionRecovery } : {}),
     };
-    const record = this.runRecord(run, outcome.kind, {
-      ...(outcome.cause !== undefined ? { cause: outcome.cause } : {}),
-      detail: {
-        stopReason: outcome.stopReason ?? null,
-        agentInvoked,
-        sessionSettled: run.outcome?.sessionSettled ?? false,
-        status,
-        ...(outcome.detail ?? {}),
-      },
-      usage,
-      worker: this.ledgerWorker(run.worker),
-      ompSessionId: run.ompSessionId,
-      ...(run.sessionFile !== null ? { sessionFile: run.sessionFile } : {}),
-    });
-    await this.journal(record).catch((err: unknown) => {
-      this.emitEvent(run, "run.system", {
-        level: "warn",
-        message: `the run ledger could not record the settle: ${err instanceof Error ? err.message : String(err)}`,
-      });
-    });
     if (run.hostToolsInstalled) {
       // The handler closes over this run's bearer: drop it before the worker is
       // reused by the next run (which installs its own).
@@ -1644,7 +1667,7 @@ class Supervisor {
     }
     for (const run of [...this.runs.values()]) {
       run.worker.worker.kill("SIGKILL");
-      await this.settle(run, { kind: "lost", cause: "host_exit" }).catch(() => {});
+      await this.settle(run, { kind: "lost", settledBy: "host_exit", cause: "host_exit" }).catch(() => {});
     }
     for (const entry of [...this.workers.values()]) await this.retireWorker(entry);
     for (const connection of [...this.connections]) connection.socket.destroy();

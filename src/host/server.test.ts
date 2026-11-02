@@ -148,6 +148,7 @@ describe("supervisor", () => {
       client.send(beginFrame({ runId: "run-1" }));
       const accepted = await client.waitFor((frame) => frame.type === "run.accepted");
       expect(accepted).toMatchObject({ runId: "run-1", sessionOpening: "new", reusedWorker: false });
+      if (accepted.type !== "run.accepted") throw new Error("unreachable");
       const settled = await client.waitFor((frame) => frame.type === "run.settled");
       if (settled.type !== "run.settled") throw new Error("unreachable");
       expect(settled.result).toMatchObject({
@@ -163,12 +164,26 @@ describe("supervisor", () => {
         transport: "host-rpc", status: "completed", agentInvoked: true,
         contextUsage: { used: 4000, size: 200000 },
       });
+      const runtime = (settled.result.resultJson as Record<string, unknown>).hostRuntime as Record<string, unknown>;
+      expect(runtime).toMatchObject({
+        workerPid: accepted.worker.pid,
+        reusedWorker: false,
+        settledBy: "outcome",
+      });
+      // A clean turn has no failure cause to report.
+      expect(runtime).not.toHaveProperty("cause");
+      expect(runtime.workerAgeMs).toBeGreaterThanOrEqual(0);
+      expect(runtime.ledgerSeq).toBeGreaterThan(0);
       expect(client.frames.some((frame) => frame.type === "run.event" && frame.kind === "omp.usage")).toBe(true);
       await vi.waitFor(async () => {
         expect(await ledgerStates()).toEqual([
           "leased", "worker_ready", "session_open", "prompting", "settled", "closed",
         ]);
       });
+      // `ledgerSeq` is the settle line the result reports, not a later record.
+      const settleRecord = (await readLedgerRecords(root)).find((record) => record.state === "settled");
+      expect(runtime.ledgerSeq).toBe(settleRecord?.seq);
+      expect(settleRecord?.worker?.pid).toBe(runtime.workerPid);
       await vi.waitFor(async () => {
         const dirs = await readdir(path.join(root, "run-context")).catch(() => []);
         expect(dirs).toEqual([]);
@@ -523,6 +538,12 @@ describe("supervisor", () => {
       // turn and model, not the session total.
       expect(settledB.result.resultJson).toMatchObject({ routedModels: { "prov/m": 1 } });
       expect(settledB.result.model).toBe("prov/m");
+      // The second run's evidence names the same warm worker and says so.
+      expect((settledB.result.resultJson as Record<string, unknown>).hostRuntime).toMatchObject({
+        workerPid: acceptedB.worker.pid,
+        reusedWorker: true,
+        settledBy: "outcome",
+      });
       const commands = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { type: string });
       expect(commands.filter((command) => command.type === "open_session")).toHaveLength(1);
       expect(commands.filter((command) => command.type === "new_session")).toHaveLength(0);
@@ -912,7 +933,14 @@ describe("supervisor", () => {
     try {
       client.send(beginFrame({ runId: "run-1", mode: "hang" }));
       await client.waitFor((frame) => frame.type === "run.accepted");
+      const terminal = client.waitFor((frame) => frame.type === "run.settled");
       await running.close("operator");
+      const settled = await terminal;
+      if (settled.type !== "run.settled") throw new Error("unreachable");
+      expect((settled.result.resultJson as Record<string, unknown>).hostRuntime).toMatchObject({
+        settledBy: "host_exit",
+        cause: "host_exit",
+      });
       const records = await readLedgerRecords(root);
       const lost = records.filter((record) => record.state === "lost");
       expect(lost).toHaveLength(1);

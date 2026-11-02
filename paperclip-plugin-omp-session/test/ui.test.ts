@@ -68,6 +68,14 @@ const OVERVIEW = {
         rotation: { reason: "maxRuns", at: "2026-09-01T09:00:00Z", sessionKey: "sk" },
         mcpServerCount: 2,
       },
+      runtime: {
+        workerPid: 4242,
+        reusedWorker: true,
+        settledBy: "outcome",
+        cause: "cancel",
+        ledgerSeq: 17,
+        workerAgeMs: 90_000,
+      },
       usage: { prompt_tokens: 1500, completion_tokens: 800 },
       costUsd: 7,
       model: "gpt-4o",
@@ -82,6 +90,7 @@ const OVERVIEW = {
         rotation: { reason: "maxAgeHours", at: "2026-09-01T10:00:00Z", sessionKey: "sk2" },
         mcpServerCount: null,
       },
+      runtime: null,
       usage: { prompt_tokens: 500, completion_tokens: 100 },
       costUsd: 3,
       model: null,
@@ -133,6 +142,12 @@ describe("OmpSessionOverview detailTab", () => {
     expect(html).toContain("Run ID");
     expect(html).toContain("Status");
     expect(html).toContain("Session Runtime");
+    // Runtime block: pid, reuse and the settlement path, per run.
+    expect(html).toContain(">Runtime<");
+    expect(html).toContain('data-testid="host-runtime"');
+    expect(html).toContain('data-worker-pid="4242"');
+    expect(html).toContain("pid 4242 · reused worker");
+    expect(html).toContain("settled by outcome · cause cancel");
 
     // Per-run data: status badges with mapped variants
     expect(html).toContain('data-status="ok">completed');
