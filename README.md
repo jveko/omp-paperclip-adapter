@@ -92,6 +92,36 @@ OMP_PAPERCLIP_BILLING_TYPE=subscription   # only "api" | "subscription" valid
 
 Unknown values fall back to `"api"`; the environment check flags unknown `OMP_PAPERCLIP_BILLING_TYPE` values.
 
+## Running the supervisor
+
+The adapter starts `omp-host` lazily on the first run that reaches execution and
+the supervisor exits by itself after 30 minutes with no workers, runs or
+connections (`OMP_HOST_IDLE_MS`; workers retire after 20 minutes warm,
+`OMP_HOST_WORKER_IDLE_MS`). Nothing is installed or enabled system-wide, and
+nothing survives a reboot unless you run it under your own service manager.
+
+```sh
+omp-host serve        # foreground; what the adapter spawns for you
+omp-host status       # pid, epoch, worker count, and the socket permission check
+omp-host stats        # runs, states, causes, settle latency, worker reuse
+omp-host stats --json --since 24h
+omp-host ledger tail 50
+omp-host stop         # drains in-flight runs, then exits
+omp-host gc           # after a crash: reap orphans, stale sockets, context files
+```
+
+State lives in `$PAPERCLIP_HOME/instances/$PAPERCLIP_INSTANCE_ID/omp-host`
+(default `~/.paperclip/instances/default/omp-host`): `host.json` (discovery,
+0600), `host-<token>.sock` (0600), `ledger.jsonl` (0600) and the directory
+itself (0700). The socket name carries a random token, so only a process that
+can read the directory can even learn it — the same-uid boundary is the only
+authentication a single-user host needs.
+
+To keep one supervisor up across reboots, `contrib/systemd/omp-host.service` is
+a copy-paste `systemd --user` unit; adjust its `ExecStart` to this checkout's
+`dist/omp-host.js`. It is optional: the adapter starts (and idles out) the host
+by itself, so the unit only helps when you want it pinned.
+
 ## Development
 
 ```sh

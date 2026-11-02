@@ -1,0 +1,34 @@
+# Optional: run the omp-paperclip supervisor under systemd --user.
+#
+# The adapter already starts `omp-host serve` on demand and lets it idle out;
+# this unit exists only for operators who want one supervisor pinned across
+# reboots. Copy to ~/.config/systemd/user/omp-host.service, point ExecStart at
+# this checkout's dist/omp-host.js, then:
+#
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now omp-host
+#
+# Do not run it for an instance the adapter already manages: the host lock
+# refuses a second supervisor, and the loser exits.
+
+[Unit]
+Description=omp-paperclip supervisor (optional)
+After=network.target
+# A live adapter-managed host wins the lock and this unit exits; do not turn
+# that refusal into a permanent restart loop. Both limits are [Unit] settings.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Use the package's shipped entry point, or `omp-host serve` if it is on PATH.
+ExecStart=/usr/bin/env node %h/workspace/projects/omp-paperclip-adapter/dist/omp-host.js serve
+Environment=PAPERCLIP_HOME=%h/.paperclip
+Environment=PAPERCLIP_INSTANCE_ID=default
+Restart=on-failure
+RestartSec=5
+# SIGTERM drains in-flight runs first; the supervisor's own drain bound is 30s.
+TimeoutStopSec=45
+
+[Install]
+WantedBy=default.target
