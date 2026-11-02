@@ -53,12 +53,19 @@ function connectClient(socketPath: string): Promise<Client> {
       socket.write(encodeFrame(frame));
     },
     async waitFor(predicate) {
-      const found = await vi.waitFor(() => {
-        const frame = frames.find(predicate);
-        if (frame === undefined) throw new Error("frame not observed yet");
-        return frame;
-      }, { timeout: 5_000, interval: 10 });
-      return found;
+      try {
+        // The happy path is milliseconds; the headroom is for a CI runner that
+        // is also spawning the fixtures of the other files. Test-level timeouts
+        // still bound the total.
+        return await vi.waitFor(() => {
+          const frame = frames.find(predicate);
+          if (frame === undefined) throw new Error("frame not observed yet");
+          return frame;
+        }, { timeout: 15_000, interval: 25 });
+      } catch (err) {
+        const seen = frames.map((frame) => frame.type).join(", ") || "none";
+        throw new Error(`${err instanceof Error ? err.message : String(err)} (frames seen: ${seen})`);
+      }
     },
     close() {
       socket.destroy();
