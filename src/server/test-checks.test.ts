@@ -37,6 +37,20 @@ describe("evaluateSessionScopeCheck", () => {
     expect(check.code).toBe("omp_sessions_shared");
     expect(check.message).toContain("host-wide");
   });
+  it("takes the isolated scope by default under broker credentials", () => {
+    const check = evaluateSessionScopeCheck({ credentialMode: "broker" });
+    expect(check.level).toBe("info");
+    expect(check.code).toBe("omp_sessions_isolated");
+  });
+  it("warns only for an explicit shared scope under broker credentials", () => {
+    const check = evaluateSessionScopeCheck({ sessionScope: "shared", credentialMode: "broker" });
+    expect(check.level).toBe("warn");
+    expect(check.code).toBe("omp_sessions_shared_cross_tenant");
+    expect(check.message).toContain("cross-tenant");
+    // The non-broker default keeps its existing warning, not the cross-tenant one.
+    expect(evaluateSessionScopeCheck({ sessionScope: "shared" }).code).toBe("omp_sessions_shared");
+    expect(evaluateSessionScopeCheck({ credentialMode: "local" }).code).toBe("omp_sessions_shared");
+  });
   it("fails isolated without broker credentials, same message as the run path", () => {
     const check = evaluateSessionScopeCheck({ sessionScope: "isolated" });
     expect(check.level).toBe("error");

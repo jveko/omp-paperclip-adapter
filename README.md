@@ -56,7 +56,7 @@ Hot-registers — no service restart needed (`requiresRestart` only on reinstall
 | `nonInteractivePermissions` | `deny` | fail-closed headless turns |
 | `timeoutSec` / `graceSec` | `0` / `15` | run timeout / SIGTERM grace (the adapter forwards an explicit value) |
 | `stateDir`, `instructionsFilePath`, `cwd`, `env` | unset | passed through to the run child |
-| `sessionScope` | `"shared"` | `shared` = omp's host agent dir (every employee on the host shares sessions). `isolated` requires `credentialMode: broker`, fences the agent dir per employee, and fails fast otherwise |
+| `sessionScope` | `broker: isolated` / otherwise `shared` | `isolated` = this agent's own omp agent dir (per employee, requires `credentialMode: broker`, the broker-mode default). `shared` = omp's host agent dir, where every employee on the host shares sessions — an explicit `shared` under broker credentials warns about that cross-tenant reach |
 | `subagentObservability` | `"summary"` | `off` / `summary` / `events`. Streams bounded `omp.subagent` events and a `resultJson.subagents` snapshot |
 | `thinking` | *(omp default)* | `off`, `auto`, `minimal`…`max`; applied through a settings overlay. Changing it on an existing session costs one rotation (omp keeps a resumed transcript's stored level) |
 | `fallbackChain` | unset | per-agent model fallback chain (`retry.fallbackChains.default`) |

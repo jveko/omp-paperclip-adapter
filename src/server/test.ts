@@ -16,7 +16,7 @@ import { buildWorkerArgv } from "../host/worker.js";
 import { ompEnv } from "./omp-env.js";
 import { listOmpModels, type OmpModelInfo } from "./models.js";
 import { providerQualifiedSelectors, validateProviderQualifiedSelectors } from "./failover-config.js";
-import { resolveSessionScope, validateSessionScope } from "./session-directives.js";
+import { resolveSessionScope, sharedScopeRisk, validateSessionScope } from "./session-directives.js";
 
 function run(command: string, args: string[], timeoutMs: number, env?: Record<string, string>): Promise<string> {
   return new Promise<string>((resolve) => {
@@ -35,11 +35,13 @@ function pickOtel(src: Record<string, unknown> | undefined): Record<string, unkn
 }
 /**
  * Report the session scope this agent would run under. `shared` is not an
- * error — it is the historical default — but it must be visible as a warning,
- * because it means every omp employee on this host shares one agent dir
- * (sessions, titles, caches, credentials). `isolated` reuses the run path's
- * validator, so the test screen and the heartbeat fail on the same configs for
- * the same reason.
+ * error — it is the default outside broker mode — but it must be visible as a
+ * warning, because it means every omp employee on this host shares one agent
+ * dir (sessions, titles, caches, credentials). Under broker credentials the
+ * default is `isolated`; an explicit `shared` there is a deliberate opt-out, so
+ * the warning names the cross-tenant risk it accepts. `isolated` reuses the run
+ * path's validator, so the test screen and the heartbeat fail on the same
+ * configs for the same reason.
  */
 export function evaluateSessionScopeCheck(
   config: Record<string, unknown>,
@@ -52,6 +54,15 @@ export function evaluateSessionScopeCheck(
       code: "omp_sessions_isolated",
       message: "sessionScope=isolated: sessions, titles and caches live in this agent's own omp agent dir (`companies/<company>/acp-engine/agents/<agent>/omp-agent`)",
       detail: "The run creates that dir on first use and resolves PI_CODING_AGENT_DIR to it; credentials come from the auth broker only.",
+    };
+  }
+  const risk = sharedScopeRisk(config);
+  if (risk !== null) {
+    return {
+      level: "warn",
+      code: "omp_sessions_shared_cross_tenant",
+      message: risk,
+      detail: "Clear sessionScope (or choose the automatic value) to take the broker-mode default, which gives this agent its own omp agent dir.",
     };
   }
   return {

@@ -1,7 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import { mkdir, stat } from "node:fs/promises";
-import { resolveSessionScope, type SessionScope } from "./session-directives.js";
+import { resolveSessionScope, sharedScopeRisk, type SessionScope } from "./session-directives.js";
 import { ompAgentDir } from "./session-state.js";
 
 export interface PreparedSessionScope {
@@ -85,7 +85,13 @@ export async function prepareSessionScope(
   ids: { companyId: string; agentId: string },
 ): Promise<PrepareSessionScopeResult> {
   if (resolveSessionScope(config) !== "isolated") {
-    return { ok: true, prepared: { scope: "shared", agentDir: null, config, warnings: [] } };
+    // Shared is the default outside broker mode; under broker mode it is an
+    // explicit opt-out of the fence, and the run must name what it accepts.
+    const risk = sharedScopeRisk(config);
+    return {
+      ok: true,
+      prepared: { scope: "shared", agentDir: null, config, warnings: risk === null ? [] : [risk] },
+    };
   }
   const warnings: string[] = [];
   let agentDir: string;

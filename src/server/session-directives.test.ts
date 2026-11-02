@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
 import {
   getSessionConfigSchema, paperclipApiBase, readSessionIntelConfig, resolveRunDirective,
-  resolveSessionScope, resolveSubagentObservability, sessionSnapshotDigestInput, thinkingLevelChanged,
+  resolveSessionScope, resolveSubagentObservability, sessionSnapshotDigestInput, sharedScopeRisk,
+  thinkingLevelChanged,
   validateCredentialMode, validateSessionScope, validThinkingLevel, validatePlanMode,
   validateSubagentObservability, validateThinkingLevel,
 } from "./session-directives.js";
@@ -472,10 +473,28 @@ describe("sessionSnapshotDigestInput", () => {
 });
 
 describe("sessionScope", () => {
-  it("defaults to shared and reports isolated when set", () => {
+  it("defaults to isolated under broker credentials and shared otherwise", () => {
+    expect(resolveSessionScope({ credentialMode: "broker" })).toBe("isolated");
+    expect(resolveSessionScope({ sessionScope: "", credentialMode: "broker" })).toBe("isolated");
+    expect(resolveSessionScope({ credentialMode: "local" })).toBe("shared");
     expect(resolveSessionScope({})).toBe("shared");
     expect(resolveSessionScope({ sessionScope: "" })).toBe("shared");
-    expect(resolveSessionScope({ sessionScope: "isolated" })).toBe("isolated");
+  });
+  it("honours an explicit scope in either credential mode", () => {
+    expect(resolveSessionScope({ sessionScope: "shared", credentialMode: "broker" })).toBe("shared");
+    expect(resolveSessionScope({ sessionScope: "isolated", credentialMode: "broker" })).toBe("isolated");
+    expect(resolveSessionScope({ sessionScope: "isolated", credentialMode: "local" })).toBe("isolated");
+    expect(validateSessionScope({ sessionScope: "shared", credentialMode: "broker" })).toBe(null);
+  });
+  it("names the cross-tenant risk only for shared under broker credentials", () => {
+    const risk = sharedScopeRisk({ sessionScope: "shared", credentialMode: "broker" });
+    expect(risk).toContain("cross-tenant");
+    // The broker default is the fence, so no warning: nothing was chosen.
+    expect(sharedScopeRisk({ credentialMode: "broker" })).toBe(null);
+    // Without broker credentials `shared` is the default and the env check
+    // already reports it; it is not a deliberate cross-tenant choice.
+    expect(sharedScopeRisk({ sessionScope: "shared" })).toBe(null);
+    expect(sharedScopeRisk({ credentialMode: "local" })).toBe(null);
   });
   it("reports an unknown value instead of silently downgrading to shared", () => {
     // A typo must not quietly disable a containment control.
@@ -494,11 +513,15 @@ describe("sessionScope", () => {
     expect(validateSessionScope({ sessionScope: "shared", credentialMode: "local" })).toBe(null);
     expect(validateSessionScope({})).toBe(null);
   });
-  it("exposes both knobs on the config schema with shared as the default", () => {
+  it("exposes the scope select with an automatic default resolved by credential mode", () => {
     const fields = getSessionConfigSchema().fields;
-    expect(fields.find((f) => f.key === "sessionScope")).toMatchObject({
-      type: "select", default: "shared",
-    });
+    const scope = fields.find((f) => f.key === "sessionScope");
+    expect(scope).toMatchObject({ type: "select", default: "" });
+    // "" must be an offered value: the Paperclip form otherwise materializes
+    // the first option as an explicit choice, pinning shared under broker.
+    expect(scope?.options?.map((o) => o.value)).toEqual(["", "isolated", "shared"]);
+    expect(scope?.hint).toMatch(/credentialMode is 'broker'/);
+    expect(scope?.hint).toMatch(/cross-tenant/);
     expect(fields.find((f) => f.key === "sessionSnapshotDiagnostic")).toMatchObject({
       type: "toggle", default: false,
     });

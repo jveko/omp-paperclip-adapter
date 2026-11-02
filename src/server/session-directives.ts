@@ -58,11 +58,35 @@ export function readSessionIntelConfig(config: Record<string, unknown>): Session
  * session-listing.ts:660), while `--session-dir` scopes writes only. That dir
  * also holds `agent.db` (credential store) and `config.yml`, so an isolated run
  * must get credentials out of band: it requires `credentialMode: broker`.
+ *
+ * The default follows the credential mode. Broker credentials arrive per run,
+ * so the fence costs nothing to apply and is the default; every other mode
+ * keeps its credential store in the shared agent dir, so `shared` stays the
+ * default there (and `testEnvironment` reports it).
  */
 export type SessionScope = "shared" | "isolated";
 
 export function resolveSessionScope(config: Record<string, unknown>): SessionScope {
-  return config.sessionScope === "isolated" ? "isolated" : "shared";
+  if (config.sessionScope === "isolated" || config.sessionScope === "shared") {
+    return config.sessionScope;
+  }
+  // An unset (or empty) value is the operator's silence, not a choice; the
+  // credential mode answers it. An unknown spelling is a config error that
+  // validateSessionScope refuses before a run starts.
+  return config.credentialMode === "broker" ? "isolated" : "shared";
+}
+
+/**
+ * The cross-tenant risk an explicit `shared` scope accepts under broker
+ * credentials, or null when that pairing does not arise.
+ *
+ * Broker mode does not need the shared agent dir for credentials, so choosing
+ * it there is a deliberate (or stale) opt-out of the fence — exactly the case
+ * an operator must see named.
+ */
+export function sharedScopeRisk(config: Record<string, unknown>): string | null {
+  if (config.credentialMode !== "broker" || resolveSessionScope(config) !== "shared") return null;
+  return "sessionScope is 'shared' with credentialMode 'broker': every omp employee on this host resolves the same agent dir (~/.omp/agent), so their sessions, titles, caches and config are cross-tenant readable and one employee can resume another's transcript. Set sessionScope 'isolated' (the broker-mode default) unless that sharing is intended.";
 }
 
 /**
@@ -243,12 +267,17 @@ export function thinkingLevelChanged(
 export function getSessionConfigSchema(): AdapterConfigSchema {
   return {
     fields: [
-      { key: "sessionScope", label: "Session data scope", type: "select", default: "shared",
+      { key: "sessionScope", label: "Session data scope", type: "select", default: "",
+        // The Paperclip form materializes a select's first option as the value
+        // when `default` is absent, which would pin "shared" (or "isolated")
+        // explicitly and defeat the credential-mode default. "" is the
+        // automatic choice and is skipped by the form's default pass.
         options: [
-          { label: "Shared with every omp agent on this host", value: "shared" },
+          { label: "Automatic: isolated with broker credentials, otherwise shared", value: "" },
           { label: "Isolated per employee (requires broker credentials)", value: "isolated" },
+          { label: "Shared with every omp agent on this host", value: "shared" },
         ],
-        hint: `shared = the host's one omp agent dir (~/.omp/agent): every employee shares sessions, titles, caches and credentials. isolated = this agent's own omp agent dir under the Paperclip instance, so sessions, titles and caches are private to it; it requires credentialMode 'broker' because the private dir has no credential store. Switching shared→isolated starts an empty dir and the employee's previous session is not resumed (the run warns once; the old transcript stays where it was). ${NEXT_RUN}` },
+        hint: `Defaults to 'isolated' when credentialMode is 'broker', otherwise 'shared'. shared = the host's one omp agent dir (~/.omp/agent): every employee shares sessions, titles, caches and config, and choosing it under broker credentials is reported as a cross-tenant warning. isolated = this agent's own omp agent dir under the Paperclip instance, so sessions, titles and caches are private to it; it requires credentialMode 'broker' because the private dir has no credential store. Switching shared→isolated starts an empty dir and the employee's previous session is not resumed (the run warns once; the old transcript stays where it was). ${NEXT_RUN}` },
       { key: "sessionBrowser", label: "Session browser", type: "toggle", default: true,
         hint: `Emit a session-snapshot work product when the session landscape changes. ${NEXT_RUN}` },
       { key: "sessionSnapshotDiagnostic", label: "Host-wide session listing (diagnostic)", type: "toggle", default: false,

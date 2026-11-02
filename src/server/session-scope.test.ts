@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
 import { ompAgentDir } from "./session-state.js";
 import { prepareSessionScope } from "./session-scope.js";
+import { sharedScopeRisk } from "./session-directives.js";
 
 let tmpRoot = "";
 
@@ -37,11 +38,36 @@ describe("ompAgentDir", () => {
 });
 
 describe("prepareSessionScope", () => {
-  it("leaves a shared run untouched and creates nothing", async () => {
-    const config = { credentialMode: "broker", env: { OMP_AUTH_BROKER_URL: "http://b" } };
+  it("leaves an explicit shared run untouched and creates nothing", async () => {
+    const config = { sessionScope: "shared", credentialMode: "local", env: {} };
     const out = await prepareSessionScope(config, { companyId: "co-1", agentId: "agent-1" });
     if (!out.ok) throw new Error(out.error);
     expect(out.prepared).toEqual({ scope: "shared", agentDir: null, config, warnings: [] });
+    await expect(stat(expectedAgentDir())).rejects.toThrow();
+  });
+
+  it("takes the isolated fence by default under broker credentials", async () => {
+    // Broker credentials are supplied per run, so the fence costs nothing to
+    // apply and is the default; no sessionScope key is needed.
+    const out = await prepareSessionScope(
+      { credentialMode: "broker", env: { OMP_AUTH_BROKER_URL: "http://b" } },
+      { companyId: "co-1", agentId: "agent-1" },
+    );
+    if (!out.ok) throw new Error(out.error);
+    expect(out.prepared.scope).toBe("isolated");
+    expect(out.prepared.agentDir).toBe(expectedAgentDir());
+    expect(out.prepared.config.env).toMatchObject({ PI_CODING_AGENT_DIR: expectedAgentDir() });
+    expect((await stat(expectedAgentDir())).isDirectory()).toBe(true);
+  });
+
+  it("warns that an explicit shared scope under broker credentials is cross-tenant", async () => {
+    const config = { sessionScope: "shared", credentialMode: "broker", env: { OMP_AUTH_BROKER_URL: "http://b" } };
+    const out = await prepareSessionScope(config, { companyId: "co-1", agentId: "agent-1" });
+    if (!out.ok) throw new Error(out.error);
+    expect(out.prepared).toEqual({
+      scope: "shared", agentDir: null, config, warnings: [sharedScopeRisk(config)],
+    });
+    expect(out.prepared.warnings[0]).toContain("cross-tenant");
     await expect(stat(expectedAgentDir())).rejects.toThrow();
   });
 

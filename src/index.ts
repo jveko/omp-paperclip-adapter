@@ -31,7 +31,7 @@ fork, \`_omp/*\`, model discovery, the environment probe).
 | \`timeoutSec\` / \`graceSec\` | 0 / 20 | unlimited run; SIGTERM grace |
 | \`env\` | \`{}\` | incl. \`OMP_PAPERCLIP_BILLING_TYPE\` (\`api\` or \`subscription\`) |
 | \`stateDir\`, \`instructionsFilePath\`, \`cwd\` | unset | passed through to the run child |
-| \`sessionScope\` | \`shared\` | \`shared\` = the host's one omp agent dir; \`isolated\` = this agent's own (requires \`credentialMode: broker\`) |
+| \`sessionScope\` | broker: \`isolated\`; otherwise \`shared\` | \`isolated\` = this agent's own omp agent dir (requires \`credentialMode: broker\`); \`shared\` = the host's one omp agent dir (a cross-tenant choice under broker credentials) |
 | \`sessionSnapshotDiagnostic\` | \`false\` | log counts from omp's host-wide \`_omp/*\` listing (never ids, cwds or titles) |
 | \`subagentObservability\` | \`summary\` | \`off\` / \`summary\` / \`events\` |
 
@@ -85,11 +85,19 @@ fork, \`_omp/*\`, model discovery, the environment probe).
   which would delete the approval step plan mode exists for.
 
 ### Session scope and the data fence
-- \`sessionScope\` decides where omp keeps this employee's state. \`shared\`
-  (default) is the historical behavior: every omp process on the host resolves
+- \`sessionScope\` decides where omp keeps this employee's state, and its
+  default follows \`credentialMode\`. With \`credentialMode: broker\` it defaults
+  to \`isolated\`: broker credentials arrive per run, so fencing the agent dir
+  costs nothing and the cross-tenant window is not the default. Any other
+  credential mode defaults to \`shared\` (its credential store lives in the
+  shared agent dir, and the environment test says so).
+- \`shared\` is the historical behavior: every omp process on the host resolves
   the same agent dir (\`~/.omp/agent\`), so sessions, titles, caches, config and
-  credentials are shared and omp's \`_omp/*\` listing can see them all.
-  \`isolated\` sets \`PI_CODING_AGENT_DIR\` to
+  credentials are shared and omp's \`_omp/*\` listing can see them all. Choosing
+  \`shared\` explicitly under broker credentials still works, but the run and the
+  environment test warn that it makes those sessions cross-tenant readable
+  (and resumable by another employee).
+- \`isolated\` sets \`PI_CODING_AGENT_DIR\` to
   \`<paperclip instance>/companies/<company>/acp-engine/agents/<agent>/omp-agent\`
   for the run child and every side channel, which is the only knob that scopes
   omp's session *reads* — \`--session-dir\` scopes writes only, and omp's
