@@ -24,7 +24,6 @@ if (mode === "survive") setInterval(() => {}, 1 << 30);
 const logFile = process.env.FAKE_RPC_LOG;
 const statsFile = process.env.FAKE_RPC_STATS;
 const send = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
-
 let sessionId = "sess-1";
 let sessionFile = "/tmp/fake-session-1.json";
 let seq = 0;
@@ -34,6 +33,17 @@ let subagentLevel = "off";
 const subagents = new Map();
 
 let memoryStats = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
+/**
+ * `coldstats` models a freshly spawned worker whose first stats read comes back
+ * before the session counters are ready: the call succeeds with an empty body,
+ * which the host must treat as "no baseline", not as zero usage. The reads
+ * alternate (begin, settle), so every run's begin read is the empty one.
+ */
+let statsCalls = 0;
+const statsRefused = () => {
+  if (mode === "nostats") return true;
+  return mode === "coldstats" && statsCalls++ % 2 === 0;
+};
 const stats = () => {
   if (!statsFile) return memoryStats;
   try {
@@ -252,6 +262,7 @@ rl.on("line", (line) => {
     case "get_state":
       return succeed(id, "get_state", { sessionId, sessionFile, isStreaming: false, isSettled: true });
     case "get_session_stats": {
+      if (statsRefused()) return succeed(id, "get_session_stats", {});
       const current = stats();
       return succeed(id, "get_session_stats", {
         sessionId,

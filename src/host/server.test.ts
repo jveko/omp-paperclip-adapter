@@ -556,6 +556,196 @@ describe("supervisor", () => {
     }
   }, 20_000);
 
+  it("reports per-run usage deltas that sum to the worker's cumulative stats", async () => {
+    const statsFile = path.join(root, "stats.json");
+    const worker = {
+      command: process.execPath,
+      args: [fixture],
+      env: { FAKE_RPC_STATS: statsFile },
+    };
+    const running = await start();
+    const client = await connectClient(running.socketPath);
+    try {
+      client.send(beginFrame({ runId: "run-1", worker }));
+      const acceptedA = await client.waitFor((frame) => frame.type === "run.accepted" && frame.runId === "run-1");
+      const settledA = await client.waitFor((frame) => frame.type === "run.settled" && frame.runId === "run-1");
+      if (acceptedA.type !== "run.accepted" || settledA.type !== "run.settled") throw new Error("unreachable");
+      expect(acceptedA.sessionOpening).toBe("new");
+
+      client.send(beginFrame({
+        runId: "run-2",
+        worker,
+        session: { ompSessionId: acceptedA.ompSessionId },
+      }));
+      const acceptedB = await client.waitFor((frame) => frame.type === "run.accepted" && frame.runId === "run-2");
+      const settledB = await client.waitFor((frame) => frame.type === "run.settled" && frame.runId === "run-2");
+      if (acceptedB.type !== "run.accepted" || settledB.type !== "run.settled") throw new Error("unreachable");
+      expect(acceptedB.reusedWorker).toBe(true);
+
+      // 100 uncached input + 10 cache-write tokens (billed as input), 20 output,
+      // 40 cache reads and $0.50 per turn: each run reports its own turn.
+      const perRun = { inputTokens: 110, outputTokens: 20, cachedInputTokens: 40 };
+      expect(settledA.result).toMatchObject({ usageBasis: "per_run", usage: perRun, costUsd: 0.5 });
+      expect(settledB.result).toMatchObject({ usageBasis: "per_run", usage: perRun, costUsd: 0.5 });
+      expect(settledA.result.resultJson).toMatchObject({ routedModels: { "prov/m": 1 } });
+      expect(settledB.result.resultJson).toMatchObject({ routedModels: { "prov/m": 1 } });
+
+      const receipts = client.frames.filter(
+        (frame): frame is Extract<HostReply, { type: "run.event" }> =>
+          frame.type === "run.event" && frame.kind === "omp.usage",
+      );
+      expect(receipts.map((frame) => frame.payload.usageBasis)).toEqual(["per_run", "per_run"]);
+
+      const cumulative = JSON.parse(await readFile(statsFile, "utf8")) as {
+        input: number; output: number; cacheRead: number; cacheWrite: number; cost: number;
+      };
+      // The two deltas account for the whole session, not twice and not half.
+      expect(perRun.inputTokens * 2).toBe(cumulative.input + cumulative.cacheWrite);
+      expect(perRun.outputTokens * 2).toBe(cumulative.output);
+      expect(perRun.cachedInputTokens * 2).toBe(cumulative.cacheRead);
+      expect(0.5 * 2).toBeCloseTo(cumulative.cost);
+    } finally {
+      client.close();
+    }
+  }, 20_000);
+
+  it("reports session-cumulative usage when a cold worker cannot show the baseline", async () => {
+    const statsFile = path.join(root, "stats.json");
+    // Five earlier turns of this session, from before this host started.
+    await writeFile(statsFile, JSON.stringify({
+      input: 1000, output: 100, cacheRead: 50, cacheWrite: 10, cost: 2, turns: 5,
+    }));
+    const worker = {
+      command: process.execPath,
+      args: [fixture],
+      env: { FAKE_RPC_MODE: "coldstats", FAKE_RPC_STATS: statsFile },
+    };
+    const running = await start();
+    const client = await connectClient(running.socketPath);
+    try {
+      client.send(beginFrame({
+        runId: "run-1",
+        worker,
+        session: { ompSessionId: "sess-prior" },
+      }));
+      const settled = await client.waitFor((frame) => frame.type === "run.settled");
+      if (settled.type !== "run.settled") throw new Error("unreachable");
+
+      // No baseline for the resumed session: report the running totals and say
+      // so. A per-run delta here would misattribute the session's history.
+      expect(settled.result).toMatchObject({
+        usageBasis: "session_cumulative",
+        usage: { inputTokens: 1120, outputTokens: 120, cachedInputTokens: 90 },
+        costUsd: 2.5,
+        model: "prov/m",
+      });
+      expect(settled.result.resultJson).toMatchObject({ routedModels: { "prov/m": 6 } });
+      // `session_cumulative` cannot back a run-scoped receipt.
+      expect(settled.result).not.toHaveProperty("usageByModel");
+      const note = client.frames.find(
+        (frame) => frame.type === "run.event" && frame.kind === "run.system"
+          && typeof frame.payload.message === "string" && /session-cumulative/.test(frame.payload.message),
+      );
+      expect(note).toBeTruthy();
+      const settleRecord = (await readLedgerRecords(root)).find((record) => record.state === "settled");
+      expect(settleRecord?.detail?.usageBasis).toBe("session_cumulative");
+      expect(settleRecord?.usage).toMatchObject({ inputTokens: 1120, costUsd: 2.5 });
+    } finally {
+      client.close();
+    }
+  }, 20_000);
+
+  it("resets the per-session baseline when the worker restarts", async () => {
+    const statsFile = path.join(root, "stats.json");
+    const worker = {
+      command: process.execPath,
+      args: [fixture],
+      env: { FAKE_RPC_MODE: "coldstats", FAKE_RPC_STATS: statsFile },
+    };
+    const running = await start({ workerIdleMs: 50 });
+    const client = await connectClient(running.socketPath);
+    try {
+      // Run 1: cold worker, resumed session, no readable baseline.
+      client.send(beginFrame({ runId: "run-1", worker, session: { ompSessionId: "sess-prior" } }));
+      const acceptedA = await client.waitFor((frame) => frame.type === "run.accepted");
+      const settledA = await client.waitFor((frame) => frame.type === "run.settled" && frame.runId === "run-1");
+      if (acceptedA.type !== "run.accepted" || settledA.type !== "run.settled") throw new Error("unreachable");
+      expect(settledA.result.usageBasis).toBe("session_cumulative");
+
+      // Run 2: the settle snapshot recorded above is this run's baseline.
+      client.send(beginFrame({
+        runId: "run-2",
+        worker,
+        session: { ompSessionId: acceptedA.ompSessionId },
+      }));
+      const settledB = await client.waitFor((frame) => frame.type === "run.settled" && frame.runId === "run-2");
+      if (settledB.type !== "run.settled") throw new Error("unreachable");
+      expect(settledB.result).toMatchObject({
+        usageBasis: "per_run",
+        usage: { inputTokens: 110, outputTokens: 20, cachedInputTokens: 40 },
+        costUsd: 0.5,
+      });
+
+      // The idle sweep retires the worker; its recorded baseline goes with it.
+      await vi.waitFor(async () => {
+        expect(running.workers).toBe(0);
+      }, { timeout: 5_000 });
+
+      client.send(beginFrame({
+        runId: "run-3",
+        worker,
+        session: { ompSessionId: acceptedA.ompSessionId },
+      }));
+      const acceptedC = await client.waitFor((frame) => frame.type === "run.accepted" && frame.runId === "run-3");
+      const settledC = await client.waitFor((frame) => frame.type === "run.settled" && frame.runId === "run-3");
+      if (acceptedC.type !== "run.accepted" || settledC.type !== "run.settled") throw new Error("unreachable");
+      expect(acceptedC.reusedWorker).toBe(false);
+      // Three turns accumulated from a zero baseline in this stats file. A
+      // delta would have claimed only the third turn and known nothing about
+      // the first two, so the cumulative total is what proves the reset.
+      expect(settledC.result).toMatchObject({
+        usageBasis: "session_cumulative",
+        costUsd: 1.5,
+      });
+    } finally {
+      client.close();
+    }
+  }, 20_000);
+
+  it("omits usage instead of reporting zeros when the worker never reports stats", async () => {
+    const worker = {
+      command: process.execPath,
+      args: [fixture],
+      env: { FAKE_RPC_MODE: "nostats" },
+    };
+    const running = await start();
+    const client = await connectClient(running.socketPath);
+    try {
+      client.send(beginFrame({ runId: "run-1", worker }));
+      const settled = await client.waitFor((frame) => frame.type === "run.settled");
+      if (settled.type !== "run.settled") throw new Error("unreachable");
+
+      // No evidence of usage is not the same as zero usage.
+      expect(settled.result).not.toHaveProperty("usage");
+      expect(settled.result).not.toHaveProperty("usageBasis");
+      expect(settled.result).not.toHaveProperty("costUsd");
+      expect(settled.result.resultJson).toMatchObject({ routedModels: {} });
+      expect(client.frames.some(
+        (frame) => frame.type === "run.event" && frame.kind === "omp.usage",
+      )).toBe(false);
+      const note = client.frames.find(
+        (frame) => frame.type === "run.event" && frame.kind === "run.system"
+          && typeof frame.payload.message === "string" && /usage is unknown/.test(frame.payload.message),
+      );
+      expect(note).toBeTruthy();
+      const settleRecord = (await readLedgerRecords(root)).find((record) => record.state === "settled");
+      expect(settleRecord?.usage).toBeUndefined();
+      expect(settleRecord?.detail?.usageBasis).toBeUndefined();
+    } finally {
+      client.close();
+    }
+  }, 20_000);
+
   const slowTests = process.env.OMP_HOST_SLOW_TESTS === "1";
 
   // The brief's wall-clock acceptance: two heartbeats a real minute apart. The

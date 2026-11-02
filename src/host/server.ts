@@ -130,11 +130,15 @@ interface WorkerEntry {
   /** The omp session this process currently has open, if any. */
   ompSessionId: string | null;
   sessionFile: string | null;
+  /** The last settle snapshot this worker reported; the next run's baseline. */
+  settledUsage: UsageBaseline | null;
   currentRun: string | null;
   lastUsedAt: number;
 }
 
 interface StatsSnapshot {
+  /** The session these totals belong to; null when the worker omits it. */
+  sessionId: string | null;
   input: number;
   output: number;
   cacheRead: number;
@@ -143,6 +147,18 @@ interface StatsSnapshot {
   cost: number;
   routedModels: Record<string, number>;
   contextUsage: { used: number; size: number } | null;
+}
+
+/** The baseline for a session this run created: cumulative totals start at zero. */
+const ZERO_STATS: StatsSnapshot = {
+  sessionId: null, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0,
+  routedModels: {}, contextUsage: null,
+};
+
+/** The last settle snapshot a worker reported, and the session it belongs to. */
+interface UsageBaseline {
+  sessionId: string;
+  snapshot: StatsSnapshot;
 }
 
 interface PromptOutcome {
@@ -176,6 +192,8 @@ interface RunState {
   terminal: boolean;
   startedAtMs: number;
   statsBefore: StatsSnapshot | null;
+  /** This run created its session, so its cumulative totals start at zero. */
+  freshSession: boolean;
   unsubscribe: Array<() => void>;
   lastAssistantText: string | null;
   /** Whether this run installed the connection tools on its worker. */
@@ -229,6 +247,7 @@ function readStats(data: Record<string, unknown>): StatsSnapshot | null {
     if (typeof used === "number" && typeof size === "number") contextUsage = { used, size };
   }
   return {
+    sessionId: typeof data.sessionId === "string" && data.sessionId !== "" ? data.sessionId : null,
     input,
     output,
     cacheRead,
@@ -239,11 +258,7 @@ function readStats(data: Record<string, unknown>): StatsSnapshot | null {
   };
 }
 
-function delta(before: StatsSnapshot | null, after: StatsSnapshot | null): StatsSnapshot {
-  const base = before ?? {
-    input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, routedModels: {}, contextUsage: null,
-  };
-  const top = after ?? base;
+function delta(base: StatsSnapshot, top: StatsSnapshot): StatsSnapshot {
   // Model turn counts are cumulative too: subtracting the baseline is what makes
   // a warm session's second run report its own model rather than the sum.
   const routedModels: Record<string, number> = {};
@@ -252,6 +267,7 @@ function delta(before: StatsSnapshot | null, after: StatsSnapshot | null): Stats
     if (own > 0) routedModels[model] = own;
   }
   return {
+    sessionId: top.sessionId,
     input: Math.max(0, top.input - base.input),
     output: Math.max(0, top.output - base.output),
     cacheRead: Math.max(0, top.cacheRead - base.cacheRead),
@@ -801,6 +817,7 @@ class Supervisor {
       terminal: false,
       startedAtMs: Date.now(),
       statsBefore: null,
+      freshSession: false,
       unsubscribe: [],
       lastAssistantText: null,
       hostToolsInstalled: false,
@@ -821,6 +838,7 @@ class Supervisor {
       const sessionDir = worker.sessionDir;
       await mkdir(sessionDir, { recursive: true, mode: 0o700 });
       let sessionId = run.ompSessionId;
+      let freshSession = false;
       const alreadyOpen = sessionId !== "" && worker.ompSessionId === sessionId;
       if (alreadyOpen) {
         run.sessionFile = worker.sessionFile;
@@ -842,6 +860,7 @@ class Supervisor {
         if (opened === null || opened.cancelled) {
           const fresh = await worker.worker.newSession();
           if (fresh.cancelled) throw new Error("omp refused to open or create a session for this run");
+          freshSession = true;
           sessionId = "";
         } else {
           sessionId = opened.sessionId;
@@ -850,6 +869,7 @@ class Supervisor {
           // workspace) is adopted as a new one, but never silently: the operator
           // is looking for that transcript, and the adapter records the new id.
           if (opened.resumed === false) {
+            freshSession = true;
             this.emitEvent(run, "run.system", {
               level: "warn",
               message: `stored omp session ${named} could not be resumed in this session directory; this run started ${sessionId || "a new session"}`,
@@ -870,12 +890,16 @@ class Supervisor {
       } else {
         const fresh = await worker.worker.newSession();
         if (fresh.cancelled) throw new Error("omp refused to create a session for this run");
+        freshSession = true;
       }
       if (sessionId === "") {
         const state = await worker.worker.getState();
         sessionId = typeof state.sessionId === "string" ? state.sessionId : "";
         if (typeof state.sessionFile === "string") run.sessionFile = state.sessionFile;
       }
+      // A fork copies another session's transcript, so its counters are not
+      // this run's even when omp opens it fresh.
+      run.freshSession = freshSession && begin.session.forked !== true;
       run.ompSessionId = sessionId;
       worker.ompSessionId = sessionId === "" ? null : sessionId;
       worker.sessionFile = run.sessionFile;
@@ -1350,20 +1374,39 @@ class Supervisor {
     // Ask before the worker is reused/retired; a run with no subagent activity
     // and observability off skips the request and adds no empty field.
     const subagents = await this.subagentSummary(run);
-    const used = delta(run.statsBefore, statsAfter);
-    const model = this.singleModel(used.routedModels) ?? run.begin.cell.model;
+    const sessionId = statsAfter?.sessionId ?? run.ompSessionId;
+    const baseline = this.usageBaseline(run, statsAfter, sessionId);
+    // Keep the settle snapshot: it is the baseline for the next run on this
+    // worker and session (a retry, a warm heartbeat, or a run after a failed
+    // begin-time stats read).
+    if (statsAfter !== null) run.worker.settledUsage = { sessionId, snapshot: statsAfter };
+    const perRun = baseline !== null;
+    // `null` when the worker did not report stats at all: the run has no usage
+    // evidence, and claiming zeros would be a lie the ledger could not correct.
+    const used = statsAfter === null ? null : perRun ? delta(baseline, statsAfter) : statsAfter;
+    const model = this.singleModel(used?.routedModels ?? {}) ?? run.begin.cell.model;
     const status = run.outcome?.status ?? (outcome.kind === "settled" ? "completed" : "error");
     const agentInvoked = run.outcome?.agentInvoked ?? false;
     // Cache-write tokens are prompt tokens the provider billed to create cache
     // entries, so they count as input.
-    const inputTokens = used.input + used.cacheWrite;
-    const usage: LedgerUsage = {
-      inputTokens,
-      outputTokens: used.output,
-      cachedInputTokens: used.cacheRead,
+    const reported = used === null ? null : {
+      usage: {
+        inputTokens: used.input + used.cacheWrite,
+        outputTokens: used.output,
+        cachedInputTokens: used.cacheRead,
+      },
+      basis: (perRun ? "per_run" : "session_cumulative") as "per_run" | "session_cumulative",
       costUsd: used.cost,
       routedModels: used.routedModels,
-      ...(used.contextUsage !== null ? { contextUsage: used.contextUsage } : {}),
+      contextUsage: used.contextUsage,
+    };
+    const usage: LedgerUsage | null = reported === null ? null : {
+      inputTokens: reported.usage.inputTokens,
+      outputTokens: reported.usage.outputTokens,
+      cachedInputTokens: reported.usage.cachedInputTokens,
+      costUsd: reported.costUsd,
+      routedModels: reported.routedModels,
+      ...(reported.contextUsage !== null ? { contextUsage: reported.contextUsage } : {}),
     };
     const record = this.runRecord(run, outcome.kind, {
       ...(outcome.cause !== undefined ? { cause: outcome.cause } : {}),
@@ -1372,9 +1415,12 @@ class Supervisor {
         agentInvoked,
         sessionSettled: run.outcome?.sessionSettled ?? false,
         status,
+        ...(reported !== null && reported.basis === "session_cumulative"
+          ? { usageBasis: "session_cumulative" }
+          : {}),
         ...(outcome.detail ?? {}),
       },
-      usage,
+      ...(usage !== null ? { usage } : {}),
       worker: this.ledgerWorker(run.worker),
       ompSessionId: run.ompSessionId,
       ...(run.sessionFile !== null ? { sessionFile: run.sessionFile } : {}),
@@ -1414,9 +1460,9 @@ class Supervisor {
         cwd: run.begin.cwd,
       },
       model,
-      usage: { inputTokens, outputTokens: used.output, cachedInputTokens: used.cacheRead },
-      usageBasis: "per_run",
-      costUsd: used.cost,
+      ...(reported !== null
+        ? { usage: reported.usage, usageBasis: reported.basis, costUsd: reported.costUsd }
+        : {}),
       resultJson: {
         status,
         stopReason: outcome.stopReason ?? null,
@@ -1426,8 +1472,8 @@ class Supervisor {
         workerPid: run.worker.worker.pid,
         reusedWorker: run.reusedWorker,
         hostRuntime,
-        routedModels: used.routedModels,
-        ...(used.contextUsage !== null ? { contextUsage: used.contextUsage } : {}),
+        routedModels: reported?.routedModels ?? {},
+        ...(reported?.contextUsage != null ? { contextUsage: reported.contextUsage } : {}),
         ...(subagents !== null ? { subagents } : {}),
       },
       summary: run.lastAssistantText ?? outcome.stopReason ?? status,
@@ -1445,14 +1491,27 @@ class Supervisor {
     }
     await clearRunContext(this.root, run.worker.workerId, run.runId).catch(() => {});
     if ([...run.connections].some((connection) => !connection.closed)) {
-      const receipt = {
-        usage: { inputTokens, outputTokens: used.output, cachedInputTokens: used.cacheRead },
-        usageBasis: "per_run" as const,
-        model,
-        costUsd: used.cost,
-        complete: true,
-      };
-      this.emitEvent(run, "omp.usage", receipt);
+      if (reported === null) {
+        this.emitEvent(run, "run.system", {
+          level: "warn",
+          message: "this run's usage is unknown: the worker did not report session stats at settle",
+        });
+      } else if (reported.basis === "session_cumulative") {
+        this.emitEvent(run, "run.system", {
+          level: "warn",
+          message: "this run's usage is session-cumulative: the host has no baseline for this session (a cold or restarted worker, or a session it did not open)",
+        });
+      }
+      if (reported !== null) {
+        const receipt = {
+          usage: reported.usage,
+          usageBasis: reported.basis,
+          model,
+          costUsd: reported.costUsd,
+          complete: true,
+        };
+        this.emitEvent(run, "omp.usage", receipt);
+      }
       this.broadcastSettled(run, result);
     }
     // The connection is free again: a sequential begin on it may carry the next
@@ -1475,6 +1534,32 @@ class Supervisor {
   private singleModel(routed: Record<string, number>): string | null {
     const models = Object.keys(routed);
     return models.length === 1 ? models[0] : null;
+  }
+
+  /**
+   * The cumulative snapshot this run's usage is measured against, or null when
+   * the host cannot know it.
+   *
+   * The begin-time read is the freshest baseline. The last settle snapshot on
+   * this worker covers a begin read that came back empty (a cold worker whose
+   * session counters were not ready yet) and a run that joined a session this
+   * host had already settled. A session this run created starts at zero; a
+   * fork's copied transcript does not, so it needs one of the other sources.
+   */
+  private usageBaseline(
+    run: RunState,
+    after: StatsSnapshot | null,
+    sessionId: string,
+  ): StatsSnapshot | null {
+    if (after === null) return null;
+    const before = run.statsBefore;
+    const switched = before !== null && before.sessionId !== null && after.sessionId !== null
+      && before.sessionId !== after.sessionId;
+    if (before !== null && !switched) return before;
+    const settled = run.worker.settledUsage;
+    if (settled !== null && settled.sessionId === sessionId) return settled.snapshot;
+    if (run.freshSession && sessionId === run.ompSessionId) return ZERO_STATS;
+    return null;
   }
 
   /* ------------------------------------------------------------------ */
@@ -1579,6 +1664,7 @@ class Supervisor {
       startIdentity: await readProcessStartIdentity(worker.pid),
       ompSessionId: null,
       sessionFile: null,
+      settledUsage: null,
       currentRun: null,
       lastUsedAt: Date.now(),
     };

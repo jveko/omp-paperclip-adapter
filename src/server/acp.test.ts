@@ -1431,6 +1431,21 @@ describe("createOmpAcpExecutor session runtime wiring", () => {
     });
   });
 
+  it("carries session-cumulative usage without fabricating a per-model receipt", async () => {
+    modelsMocks.listOmpModels.mockImplementation(async () => [
+      { id: "prov/m", label: "M", pricingStatus: "fixed" },
+    ]);
+    const usage = { inputTokens: 5000, outputTokens: 500 };
+    fakeTransport({
+      exitCode: 0, model: "prov/m", costUsd: 9,
+      usage, usageBasis: "session_cumulative",
+      sessionParams: { acpSessionId: "s", sessionKey: "sk" },
+    });
+    const out = await createOmpAcpExecutor()(baseCtx({ config: { command: "omp", model: "prov/m" } }));
+    expect(out).toMatchObject({ usage, usageBasis: "session_cumulative", costUsd: 9 });
+    expect(out).not.toHaveProperty("usageByModel");
+  });
+
   it("refuses to name a billed model when a fallback chain could have switched", async () => {
     fakeTransport({
       exitCode: 0, model: "prov/m", costUsd: 0.5,
