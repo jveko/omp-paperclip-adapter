@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.16.0 — 2026-11-02
+
+Supervisor operator surface.
+
+- **`omp-host stats [--json] [--since <duration>]`** — aggregates the run ledger: runs, state and cause
+  counts, settle latency p50/p90, worker reuse rate, capacity refusals, and the newest runs. Bounded
+  read (tolerates a truncated tail), never writes, works while a host is live, prints no credentials.
+- **Runtime evidence** — a managed run now carries
+  `resultJson.hostRuntime = { workerPid, reusedWorker, settledBy, cause, ledgerSeq, workerAgeMs }`, and
+  the session-panel plugin renders it as a "Runtime" block beside the existing run rows.
+- **Lifecycle docs + optional unit** — README gains "Running the supervisor" (serve, idle exit,
+  status/stats/stop/gc, socket location and permissions) and `contrib/systemd/omp-host.service` is
+  provided as an *optional* user unit; the adapter still starts the host itself.
+- **Socket self-check** — the supervisor refuses a socket that is wider than 0600, in a directory wider
+  than 0700, or owned by another uid, with a named error; `omp-host status` reports the check.
+
+Gates: typecheck, 767 unit tests (2 skipped), 3 conformance, build, the opt-in 60 s warm test, and the
+stats CLI exercised against an empty root and a fixture ledger.
+
 ## 0.15.0 — 2026-10-31
 
 One lane. The adapter has never been deployed, so the engine rollback had no user to protect and the
