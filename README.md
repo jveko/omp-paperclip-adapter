@@ -129,10 +129,21 @@ by itself, so the unit only helps when you want it pinned.
 
 ```sh
 npm install
-npm test          # vitest unit suite
+npm test          # vitest unit suite (offline; no model calls)
 npm run build     # tsc + self-contained ui-parser bundle
 npm run typecheck
+npm run smoke:real  # two turns against a real `omp`; costs real tokens
 ```
+
+`test` and `test:conformance` never reach a model: every managed path runs
+against a scripted `omp`. `npm run smoke:real` is the exception — it starts the
+built supervisor (`dist/omp-host.js`, rebuilt by the suite's global setup) and
+lets it drive a real `omp --mode rpc` worker through two turns on one session
+key, then asserts the accepted/settled frames, token and cost reporting, the
+settled ledger record, and warm-worker reuse. It is skipped by `npm test` and
+requires an authenticated `omp` on the login-shell PATH (`OMP_SMOKE_COMMAND`
+overrides the binary). The half that needs a real Paperclip instance cannot run
+here; `LIVE-CHECK.md` is the runbook for it.
 
 See `ROADMAP.md` for where this is heading.
 
