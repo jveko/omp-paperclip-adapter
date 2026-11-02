@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.18.0 — 2026-11-02
+
+The supervisor's invariants are now conformance-tested, and tenancy defaults to fenced when broker
+credentials already supply the fence.
+
+- **Five conformance scenarios** (`conformance/supervisor-invariants.test.ts`): overlapping run on one
+  session key → `omp_session_lease_held` with exactly one `prompting` record; `maxWorkers: 1` → second
+  run refused `omp_host_capacity` while the first settles; killed worker → one `lost/worker_exit`, no
+  duplicate settle, next run spawns fresh; caller stops heartbeating → abort then kill, one
+  `adapter_gone` cause; capability-less worker → named diagnostics, the run still settles. The project
+  now runs 8 scenarios.
+- **`sessionScope` defaults to `isolated` under `credentialMode: "broker"`** — the fence no longer
+  depends on an operator remembering to set it. Non-broker modes keep `shared` (with the existing
+  environment-test warning), and an explicit `shared` under broker mode is honoured but warns about the
+  cross-tenant exposure.
+
+Gates: typecheck, 765 unit tests (2 skipped), 8 conformance, build, the opt-in 60 s warm test.
+
 ## 0.17.0 — 2026-11-02
 
 Engine naming retired, and cost receipts become per-run.
