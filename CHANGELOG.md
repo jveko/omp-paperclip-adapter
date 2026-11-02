@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.19.0 — 2026-11-02
+
+Proof against a real `omp`, and the runbook for the half this machine cannot prove.
+
+- **`npm run smoke:real`** (gated by `OMP_SMOKE_REAL=1`, skipped by default so `npm test` stays
+  offline) drives the built `dist/omp-host.js` against the real omp binary: preflight through the same
+  login-shell launch path the supervisor uses, a temp instance root, one run with a new session, then a
+  second run on the same session key. It asserts a live worker pid, `reusedWorker: true` with the same
+  pid, `sessionOpening: "open"`, per-run usage deltas, `hostRuntime.settledBy`, exactly one settled
+  ledger record with `agentInvoked`/`sessionSettled`, and that the recorded session file exists.
+- **`LIVE-CHECK.md`** — a numbered runbook for the Paperclip-instance half: install from path, hire an
+  `omp_local` agent, run `testEnvironment`, trigger `POST /agents/:id/wakeup`, then verify the run JWT,
+  work products, approval round-trip, `hostRuntime`, `subagents`, the ledger record and session resume
+  on the second heartbeat, each with the endpoint or field it checks.
+
+First real-omp result on this host (omp 18.14.0): run 1 `pid …856`, 93 in (15,168 cached) / 7 out,
+`$0.000135`, `per_run`; run 2 reused the same pid, 107 in / 6 out, `$0.000137`; ledger settled with
+`agentInvoked: true`, `sessionSettled: true`; session file present.
+
+Honest limits: this proves the supervisor ↔ omp boundary, not Paperclip itself; `LIVE-CHECK.md` is a
+runbook, not an automated test, and has not been executed against an instance.
+
 ## 0.18.0 — 2026-11-02
 
 The supervisor's invariants are now conformance-tested, and tenancy defaults to fenced when broker
