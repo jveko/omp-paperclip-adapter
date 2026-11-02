@@ -8,7 +8,7 @@ import type {
 import { buildPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";
 import { HostClient, HostUnavailableError } from "../../host/client.js";
 import type {
-  Credentials, HostReply, Manifests, RunAcceptedFrame, RunBeginFrame, RunEventFrame,
+  Credentials, HostReply, Manifests, RunAcceptedFrame, RunBeginFrame, RunEventFrame, RunEventKind,
 } from "../../host/protocol.js";
 import { buildWorkerArgv, buildWorkerEnv } from "../../host/worker.js";
 import { resolveSteering, resolveSubagentObservability } from "../session-directives.js";
@@ -164,9 +164,30 @@ function credentialsOf(ctx: AdapterExecutionContext, env: Record<string, string>
   };
 }
 
-function relayEvent(ctx: AdapterExecutionContext, frame: RunEventFrame): void {
+/**
+ * The wire kinds this relay accepts: the current vocabulary plus the retired
+ * spelling an older supervisor still emits. Keeping the alias in this local
+ * union (rather than widening to `string`) keeps the switch exhaustive.
+ */
+type RelayEventKind = RunEventKind | "acpx.tool_call";
+
+/**
+ * Relay one supervisor event onto the adapter's own sinks.
+ *
+ * Exported for the one compatibility contract it owns: a supervisor from the
+ * previous release still spells the tool event `acpx.tool_call`, and this is
+ * the only place that alias is read.
+ */
+export function relayEvent(ctx: AdapterExecutionContext, frame: RunEventFrame): void {
   const payload = frame.payload;
-  switch (frame.kind) {
+  // The host emits `omp.tool_call` since v0.17. An older supervisor process
+  // (still running from a previous release) emits `acpx.tool_call`; accept it
+  // for one version, normalise it here, and emit only the new name.
+  // The frame is typed with the current vocabulary; an older supervisor is the
+  // one case that can still put the retired spelling on the wire, which the
+  // accepted union above covers.
+  const kind = frame.kind as RelayEventKind;
+  switch (kind) {
     case "omp.log": {
       const stream = payload.stream === "stdout" ? "stdout" : "stderr";
       void ctx.onLog(stream, typeof payload.chunk === "string" ? payload.chunk : "");
@@ -188,9 +209,11 @@ function relayEvent(ctx: AdapterExecutionContext, frame: RunEventFrame): void {
       void ctx.onEvent?.(event);
       return;
     }
+    // `acpx.tool_call` is deprecated: accepted on the wire for one version.
+    case "omp.tool_call":
     case "acpx.tool_call": {
       const event: AdapterRuntimeEvent = {
-        eventType: "acpx.tool_call",
+        eventType: "omp.tool_call",
         stream: "stdout",
         ...(typeof payload.toolName === "string" ? { message: payload.toolName } : {}),
         payload,

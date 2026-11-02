@@ -207,8 +207,12 @@ export interface RunAcceptedFrame {
   runContextPath: string;
 }
 
-/** The event vocabulary the adapter maps onto its own sinks. */
-export type RunEventKind = "acpx.tool_call" | "run.system" | "omp.turn" | "omp.usage" | "omp.log" | "omp.subagent";
+/**
+ * The event vocabulary the adapter maps onto its own sinks. The tool event is
+ * `omp.tool_call`; the pre-v0.17 spelling `acpx.tool_call` is still accepted by
+ * the adapter relay from an older supervisor, and is never emitted here.
+ */
+export type RunEventKind = "omp.tool_call" | "run.system" | "omp.turn" | "omp.usage" | "omp.log" | "omp.subagent";
 
 export interface RunEventFrame {
   type: "run.event";

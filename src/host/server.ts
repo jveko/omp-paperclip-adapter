@@ -1022,7 +1022,7 @@ class Supervisor {
         return;
       case "tool_call":
       case "tool_result": {
-        this.emitEvent(run, "acpx.tool_call", {
+        this.emitEvent(run, "omp.tool_call", {
           phase: frame.type,
           toolName: typeof frame.toolName === "string" ? frame.toolName : null,
           toolCallId: typeof frame.toolCallId === "string" ? frame.toolCallId : null,
