@@ -1,8 +1,24 @@
 {
   "name": "omp-paperclip-adapter",
   "version": "0.19.0",
+  "description": "Paperclip external adapter that runs oh-my-pi (omp) employees through a per-instance supervisor over RPC.",
   "type": "module",
   "license": "MIT",
+  "author": "Dimaz Putra",
+  "keywords": [
+    "paperclip",
+    "oh-my-pi",
+    "omp",
+    "adapter",
+    "ai-agents"
+  ],
+  "homepage": "https://github.com/jveko/omp-paperclip-adapter#readme",
+  "bugs": {
+    "url": "https://github.com/jveko/omp-paperclip-adapter/issues"
+  },
+  "workspaces": [
+    "paperclip-plugin-omp-session"
+  ],
   "paperclip": {
     "adapterUiParser": "1.0.0"
   },
@@ -20,17 +36,23 @@
     "./ui-parser": "./dist/ui-parser.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "contrib"
   ],
   "scripts": {
-    "build": "tsc && npm run build:uiparser && npm run build:bridge && npm run build:host",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc && npm run build:uiparser && npm run build:bridge && npm run build:host",
     "build:uiparser": "esbuild src/ui-parser.ts --bundle --format=cjs --outfile=dist/ui-parser.js",
     "build:bridge": "esbuild src/server/paperclip-bridge.ts --bundle --platform=node --format=esm --outfile=dist/paperclip-bridge.js",
     "build:host": "esbuild src/host/main.ts --bundle --platform=node --format=esm --external:@paperclipai/adapter-utils --banner:js='#!/usr/bin/env node' --outfile=dist/omp-host.js",
+    "build:plugin": "npm run build -w paperclip-plugin-omp-session",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.conformance.json",
     "test": "vitest run",
+    "test:plugin": "npm test -w paperclip-plugin-omp-session",
     "test:conformance": "vitest run --config vitest.config.conformance.ts",
-    "smoke:real": "OMP_SMOKE_REAL=1 vitest run src/host/smoke-real.test.ts"
+    "verify": "npm run typecheck && npm test && npm run test:plugin && npm run test:conformance && npm run build && npm run build:plugin",
+    "smoke:real": "OMP_SMOKE_REAL=1 vitest run src/host/smoke-real.test.ts",
+    "prepare": "npm run build"
   },
   "dependencies": {
     "@paperclipai/adapter-utils": "2026.1023.0"
@@ -54,7 +76,6 @@
     "url": "git+https://github.com/jveko/omp-paperclip-adapter.git"
   },
   "allowScripts": {
-    "esbuild@0.25.12": true,
     "esbuild@0.28.2": true
   }
 }

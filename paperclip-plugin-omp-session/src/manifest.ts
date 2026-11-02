@@ -8,7 +8,7 @@ import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 const manifest: PaperclipPluginManifestV1 = {
   id: "omp-session",
   apiVersion: 1,
-  version: "0.1.0",
+  version: "0.1.1",
   displayName: "OMP Sessions",
   description:
     "View an agent's recent runs: session runtime, usage, and cost from heartbeat_runs and cost_events.",

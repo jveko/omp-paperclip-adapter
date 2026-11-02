@@ -4,6 +4,15 @@
   "description": "Paperclip plugin: agent run/session runtime, usage, and cost overview from heartbeat_runs and cost_events.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jveko/omp-paperclip-adapter.git",
+    "directory": "paperclip-plugin-omp-session"
+  },
+  "homepage": "https://github.com/jveko/omp-paperclip-adapter#session-panel-plugin",
+  "bugs": {
+    "url": "https://github.com/jveko/omp-paperclip-adapter/issues"
+  },
   "paperclipPlugin": {
     "manifest": "dist/manifest.js",
     "worker": "dist/worker.js",
@@ -15,7 +24,8 @@
     "migrations"
   ],
   "scripts": {
-    "build": "node scripts/build.mjs",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && node scripts/build.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
@@ -23,18 +33,17 @@
     "@paperclipai/plugin-sdk": "^2026.824.0"
   },
   "devDependencies": {
-    "@paperclipai/plugin-sdk": "^2026.824.0",
     "@paperclipai/shared": "^2026.824.0",
-    "@types/node": "^22.20.1",
+    "@types/node": "^24.0.0",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.5",
-    "esbuild": "^0.25.0",
+    "esbuild": "^0.28.2",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "typescript": "^5.7.3",
     "vitest": "^3.2.4"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=24.11.0"
   }
 }
