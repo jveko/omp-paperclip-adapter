@@ -70,6 +70,64 @@ export function newHostToken(): string {
   return randomBytes(12).toString("hex");
 }
 
+/** The socket (or its directory) is not same-uid-only; the host refuses it. */
+export class HostSocketSecurityError extends Error {
+  constructor(message: string, readonly path: string, readonly mode: number) {
+    super(message);
+    this.name = "HostSocketSecurityError";
+  }
+}
+
+export interface SocketSecurity {
+  mode: number;
+  dirMode: number;
+  uid: number;
+}
+
+/**
+ * Stat the socket and its directory and refuse anything a second user could
+ * reach: mode wider than 0600 (socket) / 0700 (directory), or an owner other
+ * than this uid. The token in the filename is the only authentication, and it
+ * is useless if the directory lists its contents or another user owns either
+ * end. Enforced at `serve` startup and at every connect, so "same uid only" is
+ * a checked invariant rather than a convention.
+ */
+export async function checkSocketSecurity(socketPath: string, dir: string): Promise<SocketSecurity> {
+  const [socket, directory] = await Promise.all([stat(socketPath), stat(dir)]);
+  const mode = socket.mode & 0o777;
+  const dirMode = directory.mode & 0o777;
+  if ((mode & 0o077) !== 0) {
+    throw new HostSocketSecurityError(
+      `refusing the omp-host socket ${socketPath}: mode 0${mode.toString(8)} is wider than 0600 (group/other access)`,
+      socketPath,
+      mode,
+    );
+  }
+  if ((dirMode & 0o077) !== 0) {
+    throw new HostSocketSecurityError(
+      `refusing the omp-host directory ${dir}: mode 0${dirMode.toString(8)} is wider than 0700 (group/other access)`,
+      dir,
+      dirMode,
+    );
+  }
+  const uid = typeof process.getuid === "function" ? process.getuid() : socket.uid;
+  if (socket.uid !== uid) {
+    throw new HostSocketSecurityError(
+      `refusing the omp-host socket ${socketPath}: owned by uid ${socket.uid}, not this process's uid ${uid}`,
+      socketPath,
+      mode,
+    );
+  }
+  if (directory.uid !== uid) {
+    throw new HostSocketSecurityError(
+      `refusing the omp-host directory ${dir}: owned by uid ${directory.uid}, not this process's uid ${uid}`,
+      dir,
+      dirMode,
+    );
+  }
+  return { mode, dirMode, uid };
+}
+
 /** Create the host directory and force its mode: mkdir's mode is umask-masked. */
 export async function ensureHostDirIn(rootDir: string): Promise<void> {
   await mkdir(rootDir, { recursive: true, mode: 0o700 });
@@ -203,8 +261,13 @@ export async function readDiscovery(rootDir: string = hostRootDir()): Promise<Ho
 /**
  * The pid's start identity, in a form comparable across calls:
  * `linux:<starttime ticks>` on Linux (field 22 of `/proc/<pid>/stat`), otherwise
- * `ps:<lstart>`; null when the process is gone or unreadable. A reused pid has a
- * different identity, which is exactly what stale-socket takeover needs.
+ * `ps:<lstart>`; null when the process is gone or unreachable. A reused pid has
+ * a different identity, which is exactly what stale-socket takeover needs.
+ *
+ * A zombie still has a `/proc` entry (its parent has not reaped it yet), but it
+ * has already exited and will never serve a socket again: it is reported as
+ * gone. `pidAlive` is deliberately left as `kill(pid, 0)`, because session
+ * leases must not steal from a process that is merely between exit and reaping.
  */
 export async function readProcessStartIdentity(pid: number): Promise<string | null> {
   if (!Number.isInteger(pid) || pid <= 0) return null;
@@ -212,8 +275,11 @@ export async function readProcessStartIdentity(pid: number): Promise<string | nu
     try {
       const stat = await readFile(`/proc/${pid}/stat`, "utf8");
       // Field 2 (`comm`) may contain spaces and parentheses: split after the
-      // last `)`, where fields 3.. follow. starttime is field 22 -> index 19.
+      // last `)`, where fields 3.. follow. State is field 3 (index 0),
+      // starttime is field 22 (index 19).
       const after = stat.slice(stat.lastIndexOf(")") + 2).split(/\s+/);
+      const state = after[0];
+      if (state === "Z" || state === "X") return null;
       const starttime = after[19];
       return starttime ? `linux:${starttime}` : null;
     } catch {

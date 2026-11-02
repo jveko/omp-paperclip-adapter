@@ -115,7 +115,10 @@ State lives in `$PAPERCLIP_HOME/instances/$PAPERCLIP_INSTANCE_ID/omp-host`
 0600), `host-<token>.sock` (0600), `ledger.jsonl` (0600) and the directory
 itself (0700). The socket name carries a random token, so only a process that
 can read the directory can even learn it — the same-uid boundary is the only
-authentication a single-user host needs.
+authentication a single-user host needs. Both `serve` and every connect stat the
+socket and its directory and refuse (by name) a mode wider than 0600/0700 or an
+owner other than the current uid, so the boundary is checked, not assumed;
+`omp-host status` prints the passing check.
 
 To keep one supervisor up across reboots, `contrib/systemd/omp-host.service` is
 a copy-paste `systemd --user` unit; adjust its `ExecStart` to this checkout's

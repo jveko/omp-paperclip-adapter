@@ -1,6 +1,9 @@
 import net from "node:net";
+import path from "node:path";
 import { encodeFrame, isHostFrame, parseFrame, type HostFrame, type HostReply } from "./protocol.js";
-import { hostRootDir, readDiscovery } from "./socket.js";
+import {
+  HostSocketSecurityError, checkSocketSecurity, hostRootDir, readDiscovery,
+} from "./socket.js";
 
 /**
  * The adapter's (and the CLI's) side of the socket: connect to the discovery
@@ -62,6 +65,17 @@ export class HostClient {
     const discovery = await readDiscovery(rootDir);
     if (discovery === null) {
       throw new HostUnavailableError(`no omp-host is running for ${rootDir}`);
+    }
+    // The token is the only authentication: prove nobody widened the socket or
+    // its directory before dialling it, and keep the named refusal distinct
+    // from "nothing is listening" so the operator sees a security fault.
+    try {
+      await checkSocketSecurity(discovery.socket, path.dirname(discovery.socket));
+    } catch (err) {
+      if (err instanceof HostSocketSecurityError) throw err;
+      throw new HostUnavailableError(
+        `the omp-host socket ${discovery.socket} is not usable: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
     const client = await new Promise<HostClient>((resolve, reject) => {
       const socket = net.createConnection(discovery.socket);

@@ -67,6 +67,7 @@ describe("omp-host cli", () => {
     const { out, io } = capture();
     expect(await runCli(["status"], io)).toBe(0);
     expect(out.join("")).toMatch(/^host 0\.12\.0 pid=\d+ epoch=host-[0-9a-f]+ workers=0$/m);
+    expect(out.join("")).toMatch(/^socket 0600 owner=\d+ ok$/m);
   }, 20_000);
 
   it("refuses to gc while a supervisor is live", async () => {

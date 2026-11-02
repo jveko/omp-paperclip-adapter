@@ -19,8 +19,8 @@ import {
 } from "./protocol.js";
 import { clearRunContext, reapRunContexts, runContextPointer, writeRunContext } from "./run-context.js";
 import {
-  acquireHostLock, clearDiscovery, clearDiscoveryOwned, ensureHostDirIn, hostRootDir,
-  isDiscoveryStale, newHostToken, readDiscovery, readProcessStartIdentity, socketPathIn,
+  acquireHostLock, checkSocketSecurity, clearDiscovery, clearDiscoveryOwned, ensureHostDirIn,
+  hostRootDir, isDiscoveryStale, newHostToken, readDiscovery, readProcessStartIdentity, socketPathIn,
   writeDiscovery, type HostDiscovery,
 } from "./socket.js";
 import { McpHttpClient } from "./mcp.js";
@@ -378,6 +378,18 @@ class Supervisor {
     await listening.promise;
     this.server = server;
     await chmod(this.socketPath, 0o600).catch(() => {});
+    // Prove the invariant before advertising the socket: a chmod that did not
+    // take (or a directory that was widened) must stop the host, never publish
+    // a token a second user could reach.
+    try {
+      await checkSocketSecurity(this.socketPath, this.root);
+    } catch (err) {
+      const done = Promise.withResolvers<void>();
+      server.close(() => done.resolve());
+      await done.promise;
+      await unlink(this.socketPath).catch(() => {});
+      throw err;
+    }
     this.discovery = {
       v: 1,
       socket: this.socketPath,

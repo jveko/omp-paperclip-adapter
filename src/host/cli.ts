@@ -1,11 +1,12 @@
 import { unlink } from "node:fs/promises";
+import path from "node:path";
 import { HostClient } from "./client.js";
 import { isTerminalState, readLedgerRecords, readLedgerTail, type LedgerRecord } from "./ledger.js";
 import type { LedgerCause, LedgerState } from "./protocol.js";
 import { reconcile, startHost } from "./server.js";
 import {
-  acquireHostLock, clearDiscovery, hostRootDir, isDiscoveryStale, readDiscovery,
-  readProcessStartIdentity,
+  HostSocketSecurityError, acquireHostLock, checkSocketSecurity, clearDiscovery, hostRootDir,
+  isDiscoveryStale, readDiscovery, readProcessStartIdentity,
 } from "./socket.js";
 
 /**
@@ -24,7 +25,7 @@ const USAGE = [
   "usage: omp-host <command>",
   "",
   "  serve            run the supervisor in the foreground (the adapter starts this itself)",
-  "  status           print the running supervisor, or 'host not running'",
+  "  status           print the running supervisor and its socket check, or 'host not running'",
   "  stop             drain and stop the running supervisor",
   "  gc               reap a crashed supervisor's ledger orphans, run-context files and stale socket",
   "  ledger tail [n]  print the last n run-ledger records (default 20)",
@@ -146,8 +147,19 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
 }
 
 async function printStatus(rootDir: string, io: CliIo): Promise<number> {
-  const client = await HostClient.connect({ rootDir }).catch(() => null);
+  let client: HostClient | null = null;
+  let connectError: unknown = null;
+  try {
+    client = await HostClient.connect({ rootDir });
+  } catch (err) {
+    connectError = err;
+  }
   if (client === null) {
+    // A widened or foreign-owned socket is an operator fault, not "not running".
+    if (connectError instanceof HostSocketSecurityError) {
+      io.err(`${connectError.message}\n`);
+      return 1;
+    }
     io.out("host not running\n");
     return 1;
   }
@@ -156,6 +168,10 @@ async function printStatus(rootDir: string, io: CliIo): Promise<number> {
     const hello = await client.waitFor((frame) => frame.type === "hello_ok", 2_000);
     if (hello.type !== "hello_ok") throw new Error("unexpected reply");
     io.out(`host ${hello.hostVersion} pid=${hello.hostPid} epoch=${hello.epoch} workers=${hello.workers}\n`);
+    // The connect already proved it; print the one-line evidence an operator
+    // can paste into a bug report.
+    const security = await checkSocketSecurity(client.socketPath, path.dirname(client.socketPath));
+    io.out(`socket 0${security.mode.toString(8)} owner=${security.uid} ok\n`);
     return 0;
   } catch {
     io.out("host not running\n");
