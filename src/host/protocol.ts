@@ -1,7 +1,7 @@
 import type { AdapterExecutionResult } from "@paperclipai/adapter-utils";
 
 /**
- * The adapter ↔ supervisor wire format (reshape-architecture.md §3.3).
+ * The adapter ↔ supervisor wire format.
  *
  * One JSON object per line, `id`-correlated, `v: 1`. The adapter is the client;
  * the supervisor is the server on a Unix socket. `run.settled` is the only

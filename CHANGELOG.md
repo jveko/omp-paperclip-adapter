@@ -1,8 +1,26 @@
 # Changelog
 
+## Unreleased — release engineering
+
+No behaviour change on a run.
+
+- **Installable from a fresh clone.** `npm run build` now cleans `dist/` first (stale compiled
+  modules no longer ship), and `prepare` builds the adapter during `npm ci`/`npm pack`, so a
+  tarball or git install contains the entry points.
+- **Workspace.** `paperclip-plugin-omp-session` is an npm workspace: one lockfile, root
+  `build:plugin` / `test:plugin`, aligned esbuild, deduplicated SDK dependency, synced manifest
+  version, package LICENSE and no shipped sourcemaps.
+- **CI** runs typecheck, unit, plugin, conformance, both builds and the published file lists.
+- **Docs.** README gains clone→build→install steps, the full common config surface, the plugin
+  section, verification and a limitations table; SECURITY.md records the trust model; ROADMAP is
+  trimmed to open/parked work; LIVE-CHECK drops machine-specific paths.
+- **Ghost knobs removed from the docs** (`mode`, `stateDir`, `nonInteractivePermissions`,
+  `graceSec`): the supervisor lane never read them. They remain accepted for old configs.
+- **Dangling citations** to unpublished design documents were replaced with inline descriptions.
+
 ## 0.19.0 — 2026-11-02
 
-Proof against a real `omp`, and the runbook for the half this machine cannot prove.
+Proof against a real `omp`, and the runbook for the Paperclip-instance half.
 
 - **`npm run smoke:real`** (gated by `OMP_SMOKE_REAL=1`, skipped by default so `npm test` stays
   offline) drives the built `dist/omp-host.js` against the real omp binary: preflight through the same
@@ -371,6 +389,7 @@ upstream change required.
   a `skills-manifest.json` (desired-filtered, provider-safe `paperclip_skill_*` names, description
   fallback) and hands its path to the run child via `config.env`; the bridge no-ops in side-channel
   children (which never get the manifest env). Toggling rotates the session (fingerprint).
+  (The skill lane now lives in `dist/paperclip-bridge.js`; `skill-bridge.js` was merged into it.)
 - **Session panel plugin** — a new `paperclip-plugin-omp-session` package adds an agent `detailTab`
   showing recent runs' session-runtime, usage, and cost, read by the plugin worker via `ctx.db.query`
   over the whitelisted `heartbeat_runs` (`result_json.sessionRuntime`, `usage_json`) and `cost_events`
@@ -452,7 +471,7 @@ Session runtime: omp employees become inspectable and steerable at the session l
 
 **Known limitations (deployment-gated):** fork-as-action and compaction-rotation depend on
 the engine resuming a session across runs (`canResume` requires a stable session fingerprint).
-On the codan instance the engine's session fingerprint varies run-to-run even with identical
+On one live instance the engine's session fingerprint varies run-to-run even with identical
 config/cwd/skills, so cross-run resume does not occur and those two capabilities are
 currently inert there (they are correct in code and activate once resume works). Session
 browser, force-fresh, the governance schema, and the `sessionManagement` declaration are

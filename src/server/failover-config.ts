@@ -22,7 +22,7 @@ export function parseFallbackChain(config: Record<string, unknown>): string[] {
     .filter((s) => s.length > 0);
 }
 
-/** `retry.fallbackOn`: which failures walk the chain (`docs/settings.md`). */
+/** `retry.fallbackOn`: which failures walk the chain (omp's settings reference). */
 export const FALLBACK_ON = ["any", "usage-limit", "except-usage-limit"] as const;
 /** `retry.fallbackRevertPolicy`: whether the primary model comes back. */
 export const FALLBACK_REVERT_POLICY = ["cooldown-expiry", "never"] as const;

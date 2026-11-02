@@ -1,9 +1,16 @@
 # omp-paperclip-adapter
 
+[![CI](https://github.com/jveko/omp-paperclip-adapter/actions/workflows/ci.yml/badge.svg)](https://github.com/jveko/omp-paperclip-adapter/actions/workflows/ci.yml)
+
 A [Paperclip](https://github.com/paperclipai/paperclip) external adapter that runs
 [oh-my-pi](https://github.com/can1357/oh-my-pi) (`omp`) as managed agent employees —
 registered as adapter type `omp_local`, executed by the per-instance `omp-host`
 supervisor, which drives an `omp --mode rpc` worker over the run ledger.
+
+Pre-1.0: the configuration surface and the supervisor protocol can still change
+between minor releases. See [CHANGELOG.md](CHANGELOG.md) for behaviour changes,
+[ROADMAP.md](ROADMAP.md) for open and parked work, and [SECURITY.md](SECURITY.md)
+for the trust model and reporting.
 
 ## How it works
 
@@ -22,47 +29,69 @@ custom providers, with rate cards).
 
 ## Requirements
 
-- oh-my-pi CLI ≥ 18.x (`omp` on PATH, or an absolute path via config)
-- Node.js ≥ 24.11 (runs inside the Paperclip server process)
-- A Paperclip instance with external-adapter installs enabled
+- Linux or macOS. The supervisor uses Unix sockets, `sh -lc`, and POSIX permissions;
+  Windows is not supported.
+- Node.js ≥ 24.11 (the adapter runs inside the Paperclip server process).
+- oh-my-pi CLI **18.13.x or 18.14.x** (`omp` on PATH, or an absolute path via config).
+  Newer 18.x minors are unverified: `testEnvironment` warns and names the probed surfaces,
+  and only a different major is a hard error. `peerDependencies` pins the tested range.
+- A Paperclip instance with external-adapter installs enabled (instance admin required).
 
 ## Install
 
-Board UI → Settings → Adapters → Install from local path:
+The adapter is not published to npm. Install it from a clone, after building `dist/`:
 
-```
-/home/<you>/workspace/projects/omp-paperclip-adapter
+```sh
+git clone https://github.com/jveko/omp-paperclip-adapter.git
+cd omp-paperclip-adapter
+npm ci
+npm run build
 ```
 
-or via API (instance-admin):
+Then, in the board UI: **Settings → Adapters → Install from local path**, pointing at the
+clone. Or, with an instance-admin credential:
 
 ```sh
 curl -X POST http://<host>:3100/api/adapters/install \
   -H "Authorization: Bearer <board-key>" -H "Content-Type: application/json" \
-  -d '{"packageName": "/path/to/omp-paperclip-adapter", "isLocalPath": true}'
+  -d '{"packageName": "'"$PWD"'", "isLocalPath": true}'
 ```
 
-Hot-registers — no service restart needed (`requiresRestart` only on reinstall).
+Hot-registers — no service restart needed (`requiresRestart` only on reinstall). The
+`omp-host` bin is not put on PATH by installing the adapter; either `npm link` in the
+checkout or use `node "$PWD/dist/omp-host.js"`.
 
 ## Configuration
+
+The board renders the adapter's full schema. The common fields:
 
 | Field | Default | Notes |
 |---|---|---|
 | `command` | `"omp"` | binary name/path; prefer absolute if the service PATH strips version-manager shims |
-| `agentCommand` | `<command> acp` | explicit override wins |
+| `agentCommand` | `<command> acp` | explicit override wins; the supervisor strips `acp` and appends `--mode rpc` |
 | `model` | *(omp default)* | any fuzzy pattern (`provider/id`); resolved by omp |
-| `mode` | `persistent` | `persistent` \| `oneshot` |
 | `permissionMode` | `approve-all` | `approve-reads` / `deny-all` to tighten |
-| `nonInteractivePermissions` | `deny` | fail-closed headless turns |
-| `timeoutSec` / `graceSec` | `0` / `15` | run timeout / SIGTERM grace (the adapter forwards an explicit value) |
-| `stateDir`, `instructionsFilePath`, `cwd`, `env` | unset | passed through to the run child |
-| `sessionScope` | `broker: isolated` / otherwise `shared` | `isolated` = this agent's own omp agent dir (per employee, requires `credentialMode: broker`, the broker-mode default). `shared` = omp's host agent dir, where every employee on the host shares sessions — an explicit `shared` under broker credentials warns about that cross-tenant reach |
+| `timeoutSec` | `0` | run deadline; `0` = unlimited. Cancellation grace is the supervisor's 5 s (`OMP_HOST_CANCEL_GRACE_MS`) |
+| `env` | `{}` | includes `OMP_PAPERCLIP_BILLING_TYPE` (`api` or `subscription`) |
+| `instructionsFilePath`, `cwd` | unset | passed through to the run child |
+| `credentialMode` | `local` | `broker` requires `OMP_AUTH_BROKER_URL` / `OMP_AUTH_BROKER_TOKEN` via `secret_ref` |
+| `sessionScope` | broker: `isolated`; otherwise `shared` | `isolated` = this agent's own omp agent dir (per employee, requires `credentialMode: broker`). `shared` = omp's host agent dir, where every employee on the host shares sessions — an explicit `shared` under broker credentials warns about that cross-tenant reach |
+| `sessionBrowser` | `true` | emit a session-snapshot work product when the landscape changes |
+| `sessionSnapshotDiagnostic` | `false` | log counts from omp's host-wide `_omp/*` listing (never ids, cwds or titles) |
+| `sessionForkSourceId` / `sessionForkToken` / `sessionForceFreshToken` | unset | fork or reset the next session |
+| `sessionMaxRuns` / `sessionMaxAgeHours` | `0` | rotate the session after N runs / N hours (`0` disables) |
 | `subagentObservability` | `"summary"` | `off` / `summary` / `events`. Streams bounded `omp.subagent` events and a `resultJson.subagents` snapshot |
 | `thinking` | *(omp default)* | `off`, `auto`, `minimal`…`max`; applied through a settings overlay. Changing it on an existing session costs one rotation (omp keeps a resumed transcript's stored level) |
 | `fallbackChain` | unset | per-agent model fallback chain (`retry.fallbackChains.default`) |
 | `fallbackOn` / `fallbackRevertPolicy` / `waitForUsageReset` / `maxDelayMs` | `any` / `cooldown-expiry` / `false` / unset | failover trigger, revert policy, authorize long usage-reset waits, backoff ceiling |
+| `usageReport` | `true` | emit an `omp-usage` work product with cost estimates |
+| `skillsAsTools` | `false` | expose each enabled company skill as an on-demand omp tool instead of prompt text |
+| `steering` | `off` | forward steer/follow-up requests to the live turn |
+| `governancePolicy` | unset | YAML/JSON guardrails, approval gates and `budgetCapUsd` enforced through the bridge |
 
-Permissions are owned by these omp knobs — the adapter never passes `--auto-approve`.
+Permissions are owned by `permissionMode` — the adapter never passes `--auto-approve`.
+Legacy ACP-lane keys (`mode`, `stateDir`, `nonInteractivePermissions`, `graceSec`) are
+accepted but ignored by the supervisor lane; use `timeoutSec` for a run deadline.
 
 ## Cost transparency
 
@@ -90,7 +119,8 @@ per agent via `OMP_PAPERCLIP_BILLING_TYPE` in the `env` map:
 OMP_PAPERCLIP_BILLING_TYPE=subscription   # only "api" | "subscription" valid
 ```
 
-Unknown values fall back to `"api"`; the environment check flags unknown `OMP_PAPERCLIP_BILLING_TYPE` values.
+Unknown values fall back to `"api"`; the environment check flags unknown
+`OMP_PAPERCLIP_BILLING_TYPE` values.
 
 ## Running the supervisor
 
@@ -125,27 +155,71 @@ a copy-paste `systemd --user` unit; adjust its `ExecStart` to this checkout's
 `dist/omp-host.js`. It is optional: the adapter starts (and idles out) the host
 by itself, so the unit only helps when you want it pinned.
 
+## Session panel plugin (optional)
+
+`paperclip-plugin-omp-session/` is a separate Paperclip plugin that adds an agent
+detail tab showing recent runs' session runtime, usage and cost from
+`heartbeat_runs` and `cost_events`. It is a workspace member, so `npm ci` at the
+repository root installs its dependencies.
+
+```sh
+npm run build:plugin
+curl -X POST http://<host>:3100/api/plugins/install \
+  -H "Authorization: Bearer <board-key>" -H "Content-Type: application/json" \
+  -d '{"packageName": "'"$PWD"'/paperclip-plugin-omp-session", "isLocalPath": true}'
+```
+
+## Verification
+
+```sh
+npm run verify          # typecheck + unit + plugin + conformance + both builds
+npm run test:conformance
+npm run smoke:real      # two turns against a real omp; costs real tokens
+```
+
+`test` and `test:conformance` never reach a model: every managed path runs against a
+scripted `omp`. `npm run smoke:real` is the exception — it starts the built supervisor
+(`dist/omp-host.js`, rebuilt by the suite's global setup) and drives a real `omp --mode rpc`
+worker through two turns on one session key, asserting accepted/settled frames, token and
+cost reporting, the settled ledger record, and warm-worker reuse. It requires an
+authenticated `omp` on the login-shell PATH (`OMP_SMOKE_COMMAND` overrides the binary).
+[LIVE-CHECK.md](LIVE-CHECK.md) is the runbook for the Paperclip-instance half.
+
+## Limitations
+
+| Area | Status |
+|---|---|
+| Plan mode | unavailable: omp auto-approves the plan without an elicitation/form client, which would delete the approval step |
+| Provider quota windows | not reported; `getQuotaWindows` receives no adapter config, so it could only show the host's login |
+| Managed MCP gateways / stdio servers | blocked upstream (allowlist hardcoded to `codex_local`; no stdio shape) |
+| Sandbox / remote execution | blocked upstream (remote allowlist and runner profiles exclude external adapters) |
+| Context-pressure compaction | no engine seam; adapter-owned session rotation is the only lever |
+| Per-subagent cancel/steer | not exposed; killing or timing out a run kills the worker group |
+| Headless collaboration | blocked upstream (TUI-bound host) |
+
+## Security
+
+The run JWT lives in a 0600 run-context file, never in a warm worker's environment;
+the ledger redacts credential-shaped strings and prompt arguments; the supervisor socket
+is same-uid-only and permission-checked on every connect. The configured `command` /
+`agentCommand` is executed through a login shell, so agent configuration is
+operator-trusted. See [SECURITY.md](SECURITY.md) for the full model and how to report a
+vulnerability.
+
 ## Development
 
 ```sh
-npm install
-npm test          # vitest unit suite (offline; no model calls)
-npm run build     # tsc + self-contained ui-parser bundle
+npm ci
+npm test                # unit suite (offline; no model calls)
+npm run test:plugin     # session-panel plugin tests
+npm run test:conformance
 npm run typecheck
-npm run smoke:real  # two turns against a real `omp`; costs real tokens
+npm run build           # clean build: tsc + ui-parser + bridge + supervisor
+npm run build:plugin
 ```
 
-`test` and `test:conformance` never reach a model: every managed path runs
-against a scripted `omp`. `npm run smoke:real` is the exception — it starts the
-built supervisor (`dist/omp-host.js`, rebuilt by the suite's global setup) and
-lets it drive a real `omp --mode rpc` worker through two turns on one session
-key, then asserts the accepted/settled frames, token and cost reporting, the
-settled ledger record, and warm-worker reuse. It is skipped by `npm test` and
-requires an authenticated `omp` on the login-shell PATH (`OMP_SMOKE_COMMAND`
-overrides the binary). The half that needs a real Paperclip instance cannot run
-here; `LIVE-CHECK.md` is the runbook for it.
-
-See `ROADMAP.md` for where this is heading.
+`npm run verify` runs all of the above except the real-model smoke test. See
+[ROADMAP.md](ROADMAP.md) for open and parked work.
 
 ## License
 

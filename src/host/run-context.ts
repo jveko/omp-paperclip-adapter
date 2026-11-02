@@ -5,7 +5,7 @@ import path from "node:path";
 import type { Credentials, Manifests } from "./protocol.js";
 
 /**
- * The per-run credential context (reshape-architecture.md §3.3, C5).
+ * The per-run credential context.
  *
  * A warm worker's env cannot change, so the run JWT cannot live there. Each
  * worker gets its own stable directory and its env carries one path into it:

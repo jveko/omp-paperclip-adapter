@@ -7,7 +7,7 @@ import { writeOverlay } from "./run/overlays.js";
  * The level used to ride `agentCommand` as `--thinking <level>`, which is part
  * of the engine's session fingerprint: every level edit started a fresh
  * session. `defaultThinkingLevel` is the settings key for the same choice
- * (docs/settings.md), so the value lives in a file with a fixed name instead —
+ * (omp's settings reference), so the value lives in a file with a fixed name instead —
  * the engine hashes the env (the path), never the content, so an edit does not
  * rotate the session.
  *

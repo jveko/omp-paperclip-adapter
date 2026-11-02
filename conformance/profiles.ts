@@ -3,7 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 /**
- * The fixture matrix (reshape-compat.md §3.2), as data.
+ * The fixture matrix, as data.
  *
  * Each profile is one scripted omp build: a small executable that execs the
  * ACP responder for `omp acp`, answers the surface probes (`--version`,

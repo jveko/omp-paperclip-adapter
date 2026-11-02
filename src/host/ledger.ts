@@ -3,7 +3,7 @@ import path from "node:path";
 import type { LedgerCause, LedgerState } from "./protocol.js";
 
 /**
- * The run journal (reshape-architecture.md §3.4).
+ * The run journal.
  *
  * Append-only JSONL, one line per state transition, `fsync`ed before the
  * transition is acked to the adapter. It answers the three questions Paperclip

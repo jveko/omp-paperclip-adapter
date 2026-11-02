@@ -25,12 +25,10 @@ fork, \`_omp/*\`, model discovery, the environment probe).
 | \`command\` | \`"omp"\` | binary name/path; must be absolute or on PATH of the service |
 | \`agentCommand\` | \`<command> acp\` | explicit override wins |
 | \`model\` | unset | any omp fuzzy pattern (\`provider/id\`); empty = omp default |
-| \`mode\` | \`persistent\` | persistent keeps session state resumable across heartbeats; \`oneshot\` closes after each turn |
 | \`permissionMode\` | \`approve-all\` | \`approve-reads\` / \`deny-all\` to tighten |
-| \`nonInteractivePermissions\` | \`deny\` | fail-closed headless turns |
-| \`timeoutSec\` / \`graceSec\` | 0 / 20 | unlimited run; SIGTERM grace |
+| \`timeoutSec\` | 0 | run deadline; 0 = unlimited. Cancellation grace is the supervisor's 5 s (\`OMP_HOST_CANCEL_GRACE_MS\`) |
 | \`env\` | \`{}\` | incl. \`OMP_PAPERCLIP_BILLING_TYPE\` (\`api\` or \`subscription\`) |
-| \`stateDir\`, \`instructionsFilePath\`, \`cwd\` | unset | passed through to the run child |
+| \`instructionsFilePath\`, \`cwd\` | unset | passed through to the run child |
 | \`sessionScope\` | broker: \`isolated\`; otherwise \`shared\` | \`isolated\` = this agent's own omp agent dir (requires \`credentialMode: broker\`); \`shared\` = the host's one omp agent dir (a cross-tenant choice under broker credentials) |
 | \`sessionSnapshotDiagnostic\` | \`false\` | log counts from omp's host-wide \`_omp/*\` listing (never ids, cwds or titles) |
 | \`subagentObservability\` | \`summary\` | \`off\` / \`summary\` / \`events\` |
@@ -216,10 +214,12 @@ fork, \`_omp/*\`, model discovery, the environment probe).
   employee's; the subscription-quota card stays empty for this adapter.
 
 ### Notes
-- Permissions are owned by the omp knobs \`permissionMode\` +
-  \`nonInteractivePermissions\`. The adapter never passes \`--auto-approve\` on the
-  command line; unattended employees keep the default approve posture only as a
-  conscious operator choice at hire time.
+- Permissions are owned by the omp knob \`permissionMode\`. The adapter never
+  passes \`--auto-approve\` on the command line; unattended employees keep the
+  default approve posture only as a conscious operator choice at hire time.
+- Legacy ACP-lane keys \`mode\`, \`stateDir\`, \`nonInteractivePermissions\` and
+  \`graceSec\` are ignored by the supervisor lane; use \`timeoutSec\` for a run
+  deadline. They stay accepted so existing agent configs keep loading.
 - Spend control has two layers, and the operator sets one number:
   \`governancePolicy.budgetCapUsd\`. The omp child receives it as its own session
   cost cap (\`session.maxCost\`) through a run-child-only config overlay, so omp

@@ -1,6 +1,3 @@
-# Internal working documents — never published
-docs/
-
 # Build & deps
 node_modules/
 dist/

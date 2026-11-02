@@ -1,17 +1,17 @@
 # Live check — `omp_local` against a real Paperclip instance
 
-`npm run smoke:real` proves the half that runs on this machine: the shipped
-supervisor drives a real `omp --mode rpc` worker through two turns, settles on
+`npm run smoke:real` proves the supervisor ↔ omp half: the shipped supervisor
+drives a real `omp --mode rpc` worker through two turns, settles on
 `sessionSettled`, accounts tokens and cost, journals the settle, and reuses the
-warm worker. It cannot prove the other half — Paperclip's dispatch, the run JWT,
-the board's records — because Paperclip is not installed here.
+warm worker. It cannot prove Paperclip's dispatch, the run JWT, or the board's
+records, so this runbook covers that half against a live instance.
 
-This file is that half: a numbered runbook against a live instance. Every step
-names the exact route or config field it checks and the value that means it
-passed. Commands use `npx paperclipai` (the CLI speaks the same routes; it also
-handles auth), with the route in the heading for anyone using `curl`.
+Every step names the exact route or config field it checks and the value that
+means it passed. Commands use `npx paperclipai` (the CLI speaks the same routes;
+it also handles auth), with the route in the heading for anyone using `curl`.
 
-Citations are to the Paperclip clone at `abc270ee` (`/home/jveko/workspace/refs/paperclip`)
+Citations to Paperclip refer to
+[`paperclipai/paperclip`](https://github.com/paperclipai/paperclip) at `abc270ee`,
 and to this repository.
 
 ## Prerequisites
@@ -84,7 +84,7 @@ Route: `POST /api/adapters/install` with `{packageName, isLocalPath: true}`
 (`server/src/routes/adapters.ts:344-456`; the CLI wrapper posts the payload
 verbatim, `cli/src/commands/client/adapter.ts:35,129-140`). The docs'
 `POST /api/adapters` / `{localPath}` spelling in
-`docs/adapters/external-adapters.md:283-298` is stale for this commit.
+Paperclip's `docs/adapters/external-adapters.md:283-298` is stale for this commit.
 
 **Expected.** `201` with `{type: "omp_local", packageName: "<abs path>", version: "<this checkout's package.json version>", requiresRestart: false}`.
 `requiresRestart: true` means this type was already registered (a reinstall) — restart Paperclip before continuing.
