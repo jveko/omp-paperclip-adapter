@@ -655,15 +655,16 @@ describe("supervisor", () => {
     }
   }, 20_000);
 
-  it("resets the per-session baseline when the worker restarts", async () => {
+  it("resets the per-session baseline across a supervisor restart", async () => {
     const statsFile = path.join(root, "stats.json");
     const worker = {
       command: process.execPath,
       args: [fixture],
       env: { FAKE_RPC_MODE: "coldstats", FAKE_RPC_STATS: statsFile },
     };
-    const running = await start({ workerIdleMs: 50 });
-    const client = await connectClient(running.socketPath);
+    const running = await start();
+    let client = await connectClient(running.socketPath);
+    let sessionId = "";
     try {
       // Run 1: cold worker, resumed session, no readable baseline.
       client.send(beginFrame({ runId: "run-1", worker, session: { ompSessionId: "sess-prior" } }));
@@ -671,13 +672,10 @@ describe("supervisor", () => {
       const settledA = await client.waitFor((frame) => frame.type === "run.settled" && frame.runId === "run-1");
       if (acceptedA.type !== "run.accepted" || settledA.type !== "run.settled") throw new Error("unreachable");
       expect(settledA.result.usageBasis).toBe("session_cumulative");
+      sessionId = acceptedA.ompSessionId;
 
       // Run 2: the settle snapshot recorded above is this run's baseline.
-      client.send(beginFrame({
-        runId: "run-2",
-        worker,
-        session: { ompSessionId: acceptedA.ompSessionId },
-      }));
+      client.send(beginFrame({ runId: "run-2", worker, session: { ompSessionId: sessionId } }));
       const settledB = await client.waitFor((frame) => frame.type === "run.settled" && frame.runId === "run-2");
       if (settledB.type !== "run.settled") throw new Error("unreachable");
       expect(settledB.result).toMatchObject({
@@ -685,21 +683,21 @@ describe("supervisor", () => {
         usage: { inputTokens: 110, outputTokens: 20, cachedInputTokens: 40 },
         costUsd: 0.5,
       });
+    } finally {
+      client.close();
+    }
 
-      // The idle sweep retires the worker; its recorded baseline goes with it.
-      await vi.waitFor(async () => {
-        expect(running.workers).toBe(0);
-      }, { timeout: 5_000 });
-
-      client.send(beginFrame({
-        runId: "run-3",
-        worker,
-        session: { ompSessionId: acceptedA.ompSessionId },
-      }));
+    // A supervisor restart retires the worker: no process, no recorded baseline.
+    await running.close("test");
+    const restarted = await start();
+    client = await connectClient(restarted.socketPath);
+    try {
+      client.send(beginFrame({ runId: "run-3", worker, session: { ompSessionId: sessionId } }));
       const acceptedC = await client.waitFor((frame) => frame.type === "run.accepted" && frame.runId === "run-3");
       const settledC = await client.waitFor((frame) => frame.type === "run.settled" && frame.runId === "run-3");
       if (acceptedC.type !== "run.accepted" || settledC.type !== "run.settled") throw new Error("unreachable");
       expect(acceptedC.reusedWorker).toBe(false);
+      expect(restarted.workers).toBe(1);
       // Three turns accumulated from a zero baseline in this stats file. A
       // delta would have claimed only the third turn and known nothing about
       // the first two, so the cumulative total is what proves the reset.
@@ -707,6 +705,26 @@ describe("supervisor", () => {
         usageBasis: "session_cumulative",
         costUsd: 1.5,
       });
+    } finally {
+      client.close();
+    }
+  }, 30_000);
+
+  it("emits a content-free omp.tool_call event for the worker's tool frames", async () => {
+    const { client } = await runFixture("run-tools", "toolframes");
+    try {
+      const payloads = client.frames
+        .filter((frame): frame is Extract<HostReply, { type: "run.event" }> =>
+          frame.type === "run.event" && frame.kind === "omp.tool_call")
+        .map((frame) => frame.payload);
+      expect(payloads).toEqual([
+        { phase: "tool_call", toolName: "bash", toolCallId: "tc-1" },
+        { phase: "tool_result", toolName: "bash", toolCallId: "tc-1" },
+      ]);
+      // The worker's args and result never cross the boundary.
+      const wire = JSON.stringify(client.frames);
+      expect(wire).not.toContain("ARG-SENTINEL");
+      expect(wire).not.toContain("RESULT-SENTINEL");
     } finally {
       client.close();
     }

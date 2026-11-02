@@ -14,6 +14,9 @@
 //   subagents200  two hundred running subagents (frame-cap fixture)
 //   subagentsleak same as subagents, with credentials/prompt text in fields
 //   subagentghost a straggler from an earlier run: roster entry plus one event
+//   toolframes    one tool_execution_start/end pair with args/result sentinels
+//   coldstats     the first get_session_stats of each process answers empty
+//   nostats       every get_session_stats answers empty (usage stays unknown)
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import readline from "node:readline";
 
@@ -336,6 +339,16 @@ rl.on("line", (line) => {
       if (mode === "hang" || mode === "deaf" || mode === "survive") {
         pendingPrompt = { id };
         return;
+      }
+      if (mode === "toolframes") {
+        send({
+          type: "tool_execution_start", toolCallId: "tc-1", toolName: "bash",
+          args: { command: "echo ARG-SENTINEL" },
+        });
+        send({
+          type: "tool_execution_end", toolCallId: "tc-1", toolName: "bash", isError: false,
+          result: { output: "RESULT-SENTINEL" },
+        });
       }
       pendingPrompt = { id };
       send({ type: "message_end", messageId: "m1", text: "working" });

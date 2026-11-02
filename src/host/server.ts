@@ -1044,10 +1044,14 @@ class Supervisor {
       case "session_settled":
         if (run.outcome !== null) void this.finishFromOutcome(run);
         return;
-      case "tool_call":
-      case "tool_result": {
+      // The RPC lane's tool events are `tool_execution_start`/`_end`
+      // (rpc-wire.generated.ts:3790-3870); `tool_call`/`tool_result` are the
+      // retired engine's frame names and never arrive on this wire. Only the
+      // identity is forwarded: args and results stay on the worker.
+      case "tool_execution_start":
+      case "tool_execution_end": {
         this.emitEvent(run, "omp.tool_call", {
-          phase: frame.type,
+          phase: frame.type === "tool_execution_start" ? "tool_call" : "tool_result",
           toolName: typeof frame.toolName === "string" ? frame.toolName : null,
           toolCallId: typeof frame.toolCallId === "string" ? frame.toolCallId : null,
         });
