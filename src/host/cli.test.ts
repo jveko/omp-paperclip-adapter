@@ -1,4 +1,4 @@
-import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, stat, writeFile, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -104,4 +104,222 @@ describe("omp-host cli", () => {
     expect(out.join("")).toContain("host not running");
     await clearDiscovery(root);
   });
+});
+
+describe("omp-host stats", () => {
+  let root: string;
+
+  beforeEach(async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), "omp-host-stats-"));
+  });
+
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  function capture(): { out: string[]; err: string[]; io: Parameters<typeof runCli>[1] } {
+    const out: string[] = [];
+    const err: string[] = [];
+    return {
+      out,
+      err,
+      io: { rootDir: root, out: (text: string) => out.push(text), err: (text: string) => err.push(text) },
+    };
+  }
+
+  function worker(pid: number) {
+    return {
+      pid,
+      pgid: pid,
+      startedAt: "2026-10-01T00:00:00.000Z",
+      startIdentity: `linux:${pid}`,
+      argvHash: "argv",
+      bridgeHash: "bridge",
+      ompVersion: "18.14.0",
+    };
+  }
+
+  function record(
+    seq: number,
+    runId: string,
+    sessionKey: string,
+    state: string,
+    at: string,
+    extra: Record<string, unknown> = {},
+  ): Record<string, unknown> {
+    return {
+      v: 1,
+      seq,
+      at,
+      epoch: "host-test",
+      runId,
+      companyId: "co",
+      agentId: "agent-1",
+      sessionKey,
+      cwd: "/tmp/work",
+      state,
+      ...extra,
+    };
+  }
+
+  /** The ledger as a fixture writes it: one line per transition, in order. */
+  const FIXTURE = [
+    record(1, "run-alpha", "sk-a", "leased", "2026-10-01T00:00:00.000Z", { worker: worker(100) }),
+    record(2, "run-alpha", "sk-a", "settled", "2026-10-01T00:00:02.000Z", {
+      worker: worker(100),
+      detail: { stopReason: "end_turn", agentInvoked: true, prompt: "PROMPT-SENTINEL", apiKey: "jwt-SENTINEL" },
+    }),
+    record(3, "run-alpha", "sk-a", "closed", "2026-10-01T00:00:02.100Z", { cause: "clean" }),
+    record(4, "run-bravo", "sk-b", "leased", "2026-10-01T00:01:00.000Z", { worker: worker(100) }),
+    record(5, "run-bravo", "sk-b", "settled", "2026-10-01T00:01:04.000Z", {
+      worker: worker(100),
+      detail: { stopReason: "end_turn", agentInvoked: true },
+    }),
+    record(6, "run-bravo", "sk-b", "closed", "2026-10-01T00:01:04.100Z", { cause: "clean" }),
+    record(7, "run-charlie", "sk-c", "refused", "2026-10-01T00:02:00.000Z", { cause: "capacity" }),
+    record(8, "run-delta", "sk-d", "leased", "2026-10-01T00:03:00.000Z", { worker: worker(200) }),
+    record(9, "run-delta", "sk-d", "lost", "2026-10-01T00:03:05.000Z", {
+      cause: "worker_exit", worker: worker(200),
+    }),
+    record(10, "run-echo", "sk-e", "prompting", "2026-10-01T00:04:00.000Z", { worker: worker(200) }),
+    record(11, "run-foxtrot", "sk-f", "leased", "2026-10-01T00:05:00.000Z", { worker: worker(300) }),
+    record(12, "run-foxtrot", "sk-f", "closed", "2026-10-01T00:05:01.000Z", { cause: "clean" }),
+  ];
+
+  async function writeFixture(lines: readonly unknown[]): Promise<string> {
+    const file = path.join(root, "ledger.jsonl");
+    await writeFile(file, lines.map((line) => `${JSON.stringify(line)}\n`).join(""), "utf8");
+    return file;
+  }
+
+  it("summarizes the ledger as JSON with exact counts and latencies", async () => {
+    await writeFixture(FIXTURE);
+    const { out, io } = capture();
+    expect(await runCli(["stats", "--json"], io)).toBe(0);
+    const stats = JSON.parse(out.join(""));
+
+    expect(stats.window).toMatchObject({ records: 12, runs: 6, truncated: false, since: null });
+    expect(stats.runs).toBe(6);
+    expect(stats.states).toEqual({ settled: 2, refused: 1, lost: 1, prompting: 1, closed: 1 });
+    expect(stats.causes).toEqual({ clean: 3, capacity: 1, worker_exit: 1 });
+    expect(stats.capacityRefusals).toBe(1);
+    // leased->settled: 2000ms and 4000ms (nearest-rank p50/p90).
+    expect(stats.settleLatencyMs).toEqual({ p50: 2000, p90: 4000, samples: 2 });
+    expect(stats.workerReuse).toEqual({
+      runsWithWorker: 5, distinctWorkers: 3, sharedWorkerRuns: 4, reuseRate: 0.8,
+    });
+
+    expect(stats.newestRuns.map((run: { runId: string }) => run.runId)).toEqual([
+      "run-foxt", "run-echo", "run-delt", "run-char", "run-brav", "run-alph",
+    ]);
+    expect(stats.newestRuns[0]).toEqual({
+      runId: "run-foxt",
+      agentId: "agent-1",
+      state: "closed",
+      cause: "clean",
+      durationMs: 1000,
+      at: "2026-10-01T00:05:01.000Z",
+    });
+    // Content fields on a record have no path into the summary: only ids and
+    // accounting are projected.
+    expect(out.join("")).not.toContain("PROMPT-SENTINEL");
+    expect(out.join("")).not.toContain("jwt-SENTINEL");
+  });
+
+  it("prints a human summary", async () => {
+    await writeFixture(FIXTURE);
+    const { out, io } = capture();
+    expect(await runCli(["stats"], io)).toBe(0);
+    const text = out.join("");
+    expect(text).toContain("runs 6");
+    expect(text).toContain("records 12");
+    expect(text).toContain("settled=2");
+    expect(text).toContain("capacity=1");
+    expect(text).toContain("p50=2000ms p90=4000ms (n=2)");
+    expect(text).toContain("reuse 80.0% (4/5 runs share a pid)");
+    expect(text).toContain("run-foxt agent-1 closed clean 1000ms");
+  });
+
+  it("prints a zero summary for an empty ledger, not an error", async () => {
+    const missing = capture();
+    expect(await runCli(["stats", "--json"], missing.io)).toBe(0);
+    expect(JSON.parse(missing.out.join(""))).toMatchObject({
+      runs: 0,
+      window: { records: 0, runs: 0, truncated: false },
+      states: {},
+      causes: {},
+      capacityRefusals: 0,
+      settleLatencyMs: { p50: null, p90: null, samples: 0 },
+      workerReuse: { runsWithWorker: 0, distinctWorkers: 0, sharedWorkerRuns: 0, reuseRate: 0 },
+      newestRuns: [],
+    });
+
+    await writeFile(path.join(root, "ledger.jsonl"), "", "utf8");
+    const empty = capture();
+    expect(await runCli(["stats"], empty.io)).toBe(0);
+    expect(empty.out.join("")).toContain("runs 0");
+    expect(empty.out.join("")).toContain("p50=n/a p90=n/a (n=0)");
+  });
+
+  it("never writes the ledger and tolerates a torn tail", async () => {
+    const file = await writeFixture(FIXTURE);
+    // A crash mid-append leaves half a line; a live host may hold an unread byte.
+    await writeFile(file, `${JSON.stringify(FIXTURE[0])}\n{"v":1,"seq":13,`, "utf8");
+    const before = await readFile(file);
+    const { out, io } = capture();
+    expect(await runCli(["stats", "--json"], io)).toBe(0);
+    expect(JSON.parse(out.join("")).runs).toBe(1);
+    expect(await readFile(file)).toEqual(before);
+  });
+
+  it("filters with --since and rejects a malformed duration", async () => {
+    const now = Date.now();
+    const iso = (offsetMs: number) => new Date(now - offsetMs).toISOString();
+    await writeFixture([
+      record(1, "run-old", "sk-1", "closed", iso(48 * 3_600_000), { cause: "clean" }),
+      record(2, "run-new", "sk-2", "closed", iso(1_000), { cause: "clean" }),
+    ]);
+
+    const recent = capture();
+    expect(await runCli(["stats", "--json", "--since", "1h"], recent.io)).toBe(0);
+    const stats = JSON.parse(recent.out.join(""));
+    expect(stats.runs).toBe(1);
+    expect(stats.newestRuns[0].runId).toBe("run-new");
+    expect(stats.window.since).toMatch(/Z$/);
+
+    const all = capture();
+    expect(await runCli(["stats", "--json", "--since", "7d"], all.io)).toBe(0);
+    expect(JSON.parse(all.out.join("")).runs).toBe(2);
+
+    for (const bad of ["1h30", "banana", "0s", "-5m"]) {
+      const invalid = capture();
+      expect(await runCli(["stats", "--since", bad], invalid.io)).toBe(2);
+      expect(invalid.err.join("")).toContain("--since");
+    }
+
+    const unknown = capture();
+    expect(await runCli(["stats", "--bogus"], unknown.io)).toBe(2);
+  });
+
+  it("summarizes a 10k-record ledger under a second", async () => {
+    const lines: string[] = [];
+    for (let i = 0; i < 10_000; i += 1) {
+      lines.push(JSON.stringify(record(
+        i + 1,
+        `run-${i}`,
+        `sk-${i}`,
+        i % 2 === 0 ? "leased" : "closed",
+        new Date(Date.parse("2026-10-01T00:00:00.000Z") + i * 1000).toISOString(),
+        i % 2 === 0 ? { worker: worker(1000 + i) } : { cause: "clean" },
+      )));
+    }
+    await writeFile(path.join(root, "ledger.jsonl"), `${lines.join("\n")}\n`, "utf8");
+
+    const { out, io } = capture();
+    const started = performance.now();
+    expect(await runCli(["stats", "--json"], io)).toBe(0);
+    const elapsedMs = performance.now() - started;
+    expect(JSON.parse(out.join("")).runs).toBe(10_000);
+    expect(elapsedMs).toBeLessThan(1_000);
+  }, 20_000);
 });

@@ -151,6 +151,73 @@ export async function readLedgerRecords(dir: string): Promise<LedgerRecord[]> {
   return records;
 }
 
+/** How much of the journal an aggregate operator view may read. */
+export const LEDGER_TAIL_MAX_BYTES = 8 * 1024 * 1024;
+export const LEDGER_TAIL_MAX_RECORDS = 20_000;
+
+export interface LedgerTail {
+  records: LedgerRecord[];
+  /** True when records before the window were dropped (bytes or count). */
+  truncated: boolean;
+}
+
+/**
+ * The last bounded slice of the journal, in file order.
+ *
+ * Reads at most `maxBytes` from the end and keeps the last `maxRecords`
+ * well-formed lines, so an operator view never loads an unbounded ledger into
+ * memory. Read-only: it opens its own handle and never touches the writer's.
+ * A window that starts mid-record drops that fragment, and a torn tail line is
+ * dropped by `parseRecord`, so an append in flight is tolerated.
+ */
+export async function readLedgerTail(
+  dir: string,
+  options: { maxBytes?: number; maxRecords?: number } = {},
+): Promise<LedgerTail> {
+  const maxBytes = options.maxBytes ?? LEDGER_TAIL_MAX_BYTES;
+  const maxRecords = options.maxRecords ?? LEDGER_TAIL_MAX_RECORDS;
+  let handle: FileHandle;
+  try {
+    handle = await openFile(path.join(dir, LEDGER_FILE), "r");
+  } catch {
+    return { records: [], truncated: false };
+  }
+  try {
+    const size = (await handle.stat()).size;
+    const start = Math.max(0, size - maxBytes);
+    const buffer = Buffer.alloc(size - start);
+    let filled = 0;
+    while (filled < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, filled, buffer.length - filled, start + filled);
+      if (bytesRead === 0) break;
+      filled += bytesRead;
+    }
+    let raw = buffer.subarray(0, filled).toString("utf8");
+    if (start > 0) {
+      // The window begins mid-record unless the byte before it is a newline;
+      // an exact boundary must keep its first complete record.
+      const boundary = Buffer.alloc(1);
+      await handle.read(boundary, 0, 1, start - 1);
+      if (boundary[0] !== 0x0a) {
+        const newline = raw.indexOf("\n");
+        raw = newline < 0 ? "" : raw.slice(newline + 1);
+      }
+    }
+    const records: LedgerRecord[] = [];
+    for (const line of raw.split("\n")) {
+      if (line.trim() === "") continue;
+      const record = parseRecord(line);
+      if (record !== null) records.push(record);
+    }
+    if (records.length > maxRecords) {
+      return { records: records.slice(-maxRecords), truncated: true };
+    }
+    return { records, truncated: start > 0 };
+  } finally {
+    await handle.close();
+  }
+}
+
 /** Last record per runId, in first-seen order. */
 export function lastPerRun(records: readonly LedgerRecord[]): Map<string, LedgerRecord> {
   const map = new Map<string, LedgerRecord>();

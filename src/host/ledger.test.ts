@@ -3,10 +3,12 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  LEDGER_FILE,
   LedgerInvariantError,
   RunLedger,
   findForbiddenLedgerKey,
   readLedgerRecords,
+  readLedgerTail,
   type LedgerInput,
 } from "./ledger.js";
 
@@ -141,6 +143,26 @@ describe("run ledger", () => {
     await second.close();
     await expect(ledger.append(input({ state: "worker_ready" }))).rejects.toThrow(/replaced/);
     await ledger.close();
+  });
+
+  it("reads a bounded tail without losing a record at an exact line boundary", async () => {
+    const ledger = await RunLedger.open(dir);
+    for (let i = 1; i <= 5; i += 1) {
+      await ledger.append(input({ runId: `run-${i}`, sessionKey: `sk-${i}`, state: "leased" }));
+    }
+    await ledger.close();
+    const content = await readFile(path.join(dir, LEDGER_FILE), "utf8");
+    const lines = content.split("\n").filter((line) => line !== "");
+    const boundary = Buffer.byteLength(`${lines.slice(0, 2).join("\n")}\n`);
+    const size = Buffer.byteLength(content);
+
+    const atBoundary = await readLedgerTail(dir, { maxBytes: size - boundary });
+    expect(atBoundary.records.map((record) => record.seq)).toEqual([3, 4, 5]);
+    expect(atBoundary.truncated).toBe(true);
+
+    // Five bytes into record 3: the leading fragment must go, the rest stays.
+    const midLine = await readLedgerTail(dir, { maxBytes: size - boundary - 5 });
+    expect(midLine.records.map((record) => record.seq)).toEqual([4, 5]);
   });
 
   it("detects forbidden keys at any depth", () => {
