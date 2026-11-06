@@ -141,9 +141,10 @@ interface WorkerEntry {
   /** The last settle snapshot this worker reported; the next run's baseline. */
   settledUsage: UsageBaseline | null;
   /**
-   * This worker's answer for the managed frames, probed once after its first
-   * session opened. Persisted on the entry so a warm worker is never re-probed
-   * and every run on it reads the same evidence.
+   * This worker's answer for the managed frames, observed on the run's own
+   * calls after its session opens. Kept on the entry so every run on the warm
+   * worker reads its latest answers (and a frame that starts answering `yes`
+   * withdraws the earlier warning for that worker).
    */
   capabilities: WorkerCapabilityObservations;
   currentRun: string | null;

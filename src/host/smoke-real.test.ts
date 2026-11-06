@@ -464,6 +464,11 @@ async function scenario(deadlineAt: number): Promise<void> {
       first.close();
     }
     await access(profileDir as string);
+    if (refused !== null) {
+      // The refusal must name the profile's own store: that proves the worker
+      // resolved OMP_PROFILE instead of falling back to the shared agent dir.
+      expect(refused, "the refusal names the profile's own agent dir").toContain(profileDir as string);
+    }
     console.log(
       `  profile      ${profileDir} (fresh profile; ${refused === null ? "run completed" : "no credential or model in the new profile, run refused as documented"})`,
     );
