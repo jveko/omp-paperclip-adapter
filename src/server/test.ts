@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { execFile } from "node:child_process";
+import { execFile, type ChildProcess, type ExecFileException } from "node:child_process";
 import type {
   AdapterEnvironmentCheck,
   AdapterEnvironmentTestContext,
@@ -208,6 +208,109 @@ export function evaluateOtlpCheck(env: Record<string, unknown>): AdapterEnvironm
   return { level: "info", code: "omp_otlp_export_armed", message: `OTLP export armed → ${endpoints.join(", ")}`, detail: "omp emits traces/metrics/logs; Paperclip has no built-in sink — point at an external collector." };
 }
 
+const HELLO_PROBE_TIMEOUT_MS = 90_000;
+
+interface HelloProbeOutcome {
+  code: number | null;
+  timedOut: boolean;
+  stdout: string;
+  stderr: string;
+}
+
+function runHelloProbe(
+  command: string,
+  args: string[],
+  cwd: string,
+  env: Record<string, string>,
+): Promise<HelloProbeOutcome> {
+  const { promise, resolve } = Promise.withResolvers<HelloProbeOutcome>();
+  // execFile always gives the child a connected stdin pipe (its options ignore
+  // `stdio`), and `omp -p` waits for stdin EOF before it exits. End the stream
+  // so the probe finishes instead of burning the whole timeout.
+  const child: ChildProcess | undefined = execFile(
+    command,
+    args,
+    { cwd, timeout: HELLO_PROBE_TIMEOUT_MS, env: { ...process.env, ...env } },
+    (
+      error: ExecFileException | null,
+      stdout: string | Buffer,
+      stderr: string | Buffer,
+    ) => {
+      const timedOut = error?.killed === true;
+      const rawCode = error?.code;
+      const code = typeof rawCode === "number" ? rawCode : error ? 1 : 0;
+      resolve({
+        code: timedOut ? null : code,
+        timedOut,
+        stdout: String(stdout ?? ""),
+        stderr: String(stderr ?? ""),
+      });
+    },
+  );
+  child?.stdin?.end();
+  return promise;
+}
+
+/**
+ * One real model turn. Paperclip's agent-lifecycle gate accepts a `warn`
+ * environment test only when an info check proves a hello probe passed
+ * (`agent-harness-verification.ts`), and the ACP handshake is not that proof.
+ * Costs one small completion per environment test; a non-zero exit or an
+ * unexpected reply is reported as its own named warning, never a pass.
+ */
+export async function evaluateHelloProbe(input: {
+  base: string[];
+  cwd: string;
+  config: Record<string, unknown>;
+  env: Record<string, string>;
+}): Promise<AdapterEnvironmentCheck> {
+  const model = typeof input.config.model === "string" ? input.config.model.trim() : "";
+  const args = [
+    ...input.base.slice(1),
+    "-p",
+    "Reply with exactly: OK",
+    "--no-session",
+    "--max-time",
+    "60",
+  ];
+  if (model) args.push("--model", model);
+  const outcome = await runHelloProbe(input.base[0], args, input.cwd, input.env);
+  if (outcome.timedOut) {
+    return {
+      level: "warn",
+      code: "omp_hello_probe_timed_out",
+      message: "omp hello probe timed out",
+      detail: "Retry, or run `omp -p \"Reply with exactly: OK\"` from the agent cwd.",
+    };
+  }
+  const detail = (outcome.stderr || outcome.stdout).trim().slice(0, 300);
+  if (outcome.code !== 0) {
+    const authRequired = /unauthor|api[ _-]?key|401|403|auth/i.test(detail);
+    return {
+      level: "warn",
+      code: authRequired ? "omp_hello_probe_auth_required" : "omp_hello_probe_failed",
+      message: authRequired
+        ? "omp hello probe could not authenticate a provider"
+        : "omp hello probe exited non-zero",
+      detail,
+    };
+  }
+  if (!/\bOK\b/.test(outcome.stdout)) {
+    return {
+      level: "warn",
+      code: "omp_hello_probe_unexpected_output",
+      message: "omp hello probe returned unexpected output",
+      detail: outcome.stdout.trim().slice(0, 300),
+    };
+  }
+  return {
+    level: "info",
+    code: "omp_hello_probe_passed",
+    message: "omp hello probe succeeded (one model turn completed)",
+    detail: model ? `model: ${model}` : undefined,
+  };
+}
+
 export async function testEnvironment(
   ctx: AdapterEnvironmentTestContext,
 ): Promise<AdapterEnvironmentTestResult> {
@@ -224,8 +327,9 @@ export async function testEnvironment(
   const base = acpIdx >= 0 ? tokens.slice(0, acpIdx) : tokens;
 
   // 1. cwd absolute + accessible
+  let cwd: string | null = null;
   try {
-    const cwd = resolveAdapterExecutionTargetCwd(
+    cwd = resolveAdapterExecutionTargetCwd(
       ctx.executionTarget ?? null,
       typeof config.cwd === "string" ? config.cwd : "",
       process.cwd(),
@@ -337,6 +441,15 @@ export async function testEnvironment(
   }
   // 9. OTLP export diagnostic (agent env overrides host env)
   checks.push(evaluateOtlpCheck({ ...pickOtel(process.env), ...pickOtel(env) }));
+
+  // 10. One real model turn. Paperclip's agent-lifecycle verification accepts a
+  // `warn` environment test only with proof that a hello probe completed (the
+  // ACP handshake is not that proof), so without this every hire stays in
+  // `verifying`. Skipped when the environment already failed, since a probe
+  // would only add a second symptom.
+  if (cwd !== null && !checks.some((check) => check.level === "error")) {
+    checks.push(await evaluateHelloProbe({ base, cwd, config, env: spawnEnv }));
+  }
 
   return {
     adapterType: ctx.adapterType,

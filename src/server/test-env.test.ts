@@ -149,6 +149,10 @@ describe("testEnvironment multi-token command probes", () => {
 });
 
 describe("testEnvironment broker-status parsing", () => {
+  beforeEach(() => {
+    execFileMock.mockReset();
+    execFileMock.mockImplementation((_c, args, _o, cb) => cb(null, args.includes("-p") ? "OK" : ""));
+  });
   afterEach(() => vi.restoreAllMocks());
 
   it("reports a reachable broker check (info) when status returns ok", async () => {
@@ -195,12 +199,44 @@ describe("testEnvironment broker-status parsing", () => {
 });
 
 describe("testEnvironment OTLP diagnostic", () => {
+  beforeEach(() => {
+    execFileMock.mockReset();
+    execFileMock.mockImplementation((_c, args, _o, cb) => cb(null, args.includes("-p") ? "OK" : ""));
+  });
   afterEach(() => vi.restoreAllMocks());
 
   it("emits an OTLP export diagnostic check", async () => {
     execFileMock.mockImplementationOnce((_c, _a, _o, cb) => cb(null, "omp/18.13.1"));
     const res = await testEnvironment(envTestCtx({}));
     expect(res.checks.some((c) => c.code === "omp_otlp_export_off" || c.code === "omp_otlp_export_armed")).toBe(true);
+  });
+});
+
+describe("testEnvironment hello probe", () => {
+  beforeEach(() => {
+    execFileMock.mockReset();
+    execFileMock.mockImplementation((_c, args, _o, cb) => cb(null, args.includes("-p") ? "OK" : ""));
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it("emits omp_hello_probe_passed when one model turn succeeds", async () => {
+    const res = await testEnvironment(envTestCtx({ model: "axon-compat/deepseek-v4.1-flash" }));
+    const check = res.checks.find((c) => c.code === "omp_hello_probe_passed");
+    expect(check?.level).toBe("info");
+    expect(check?.detail).toContain("axon-compat/deepseek-v4.1-flash");
+  });
+
+  it("reports an authentication failure as a warning, never a pass", async () => {
+    execFileMock.mockImplementation((_c, args, _o, cb) => {
+      if (args.includes("-p")) {
+        return cb(Object.assign(new Error("probe failed"), { code: 1 }), "", "401 unauthorized: invalid api key");
+      }
+      return cb(null, "");
+    });
+    const res = await testEnvironment(envTestCtx({}));
+    const check = res.checks.find((c) => c.code.startsWith("omp_hello_probe"));
+    expect(check?.code).toBe("omp_hello_probe_auth_required");
+    expect(check?.level).toBe("warn");
   });
 });
 
