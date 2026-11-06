@@ -45,7 +45,8 @@ Published on npm as `omp-paperclip-adapter`:
 npm install omp-paperclip-adapter
 ```
 
-Install it into the board from the package name. With an instance-admin credential:
+Install it into the board from the package name, under **Settings → Adapters**. With an
+instance-admin credential:
 
 ```sh
 curl -X POST http://<host>:3100/api/adapters/install \
@@ -60,6 +61,12 @@ git clone https://github.com/jveko/omp-paperclip-adapter.git
 cd omp-paperclip-adapter
 npm ci
 npm run build
+```
+
+Then, in the board UI: **Settings → Adapters → Install from local path**, pointing at the
+clone. Or, with an instance-admin credential:
+
+```sh
 curl -X POST http://<host>:3100/api/adapters/install \
   -H "Authorization: Bearer <board-key>" -H "Content-Type: application/json" \
   -d '{"packageName": "'"$PWD"'", "isLocalPath": true}'
