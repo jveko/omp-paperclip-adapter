@@ -265,4 +265,5 @@ export function parseOmpVersion(output: string): { major: number; minor: number;
 export const TESTED_OMP_MINORS = [
   { major: 18, minor: 13 },
   { major: 18, minor: 14 },
+  { major: 18, minor: 16 },
 ] as const;

@@ -4,10 +4,12 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { TESTED_OMP_MINORS } from "./acp.js";
 
 /**
- * The published upgrade contract: Paperclip installs this adapter beside an
- * externally managed omp, so the manifest's peer range is what prevents a
- * silently incompatible build. These assertions read the real manifest rather
- * than restating a constant, and pin the range to the runtime version gate.
+ * The published upgrade contract. Paperclip installs this adapter beside an
+ * externally managed omp, so two things must not drift silently: the exact
+ * engine package it compiles against, and the set of omp lines the version
+ * check calls tested. Compatibility with a *surface* is proven by the
+ * capability probes at run time; a peer range on the omp binary was a second,
+ * weaker gate that went stale the moment a new minor shipped, so it is gone.
  */
 const PACKAGE_JSON_PATH = fileURLToPath(new URL("../../package.json", import.meta.url));
 
@@ -27,34 +29,21 @@ beforeAll(async () => {
 });
 
 describe("upgrade contract", () => {
-  it("pins the omp peer dependency to the tested minors and marks it optional", () => {
-    expect(manifest.peerDependencies?.[OMP_PACKAGE]).toBe(">=18.13.0 <18.15.0");
-    expect(manifest.peerDependenciesMeta?.[OMP_PACKAGE]?.optional).toBe(true);
-  });
-
   it("pins adapter-utils exactly so the execution-target contract cannot drift", () => {
     expect(manifest.dependencies?.[ADAPTER_UTILS]).toBe("2026.1023.0");
   });
 
-  it("keeps the peer range's tested minors in sync with TESTED_OMP_MINORS", () => {
-    const range = manifest.peerDependencies?.[OMP_PACKAGE];
-    const match =
-      typeof range === "string"
-        ? /^>=(\d+)\.(\d+)\.(\d+) <(\d+)\.(\d+)\.(\d+)$/.exec(range)
-        : null;
-    expect(match).not.toBeNull();
+  it("declares no omp peer range: the capability probes are the gate", () => {
+    expect(manifest.peerDependencies?.[OMP_PACKAGE]).toBeUndefined();
+    expect(manifest.peerDependenciesMeta?.[OMP_PACKAGE]).toBeUndefined();
+  });
 
-    const [, lowerMajor, lowerMinor, lowerPatch, upperMajor, upperMinor, upperPatch] = match!;
-    const tested = [...TESTED_OMP_MINORS];
-    // A contiguous range is the manifest shape; its ends must be the tested
-    // set's ends, so adding or dropping a minor cannot leave a stale peer pin.
-    expect(tested.every((m, i) => i === 0 || (m.major === tested[i - 1].major && m.minor === tested[i - 1].minor + 1))).toBe(true);
-    const first = tested[0];
-    const last = tested[tested.length - 1];
-    expect({ major: Number(lowerMajor), minor: Number(lowerMinor) }).toEqual(first);
-    expect(Number(lowerPatch)).toBe(0);
-    expect(Number(upperMajor)).toBe(last.major);
-    expect(Number(upperMinor)).toBe(last.minor + 1);
-    expect(Number(upperPatch)).toBe(0);
+  it("keeps the tested omp lines single-major, ordered and unique", () => {
+    expect(TESTED_OMP_MINORS.length).toBeGreaterThan(0);
+    const major = TESTED_OMP_MINORS[0].major;
+    expect(TESTED_OMP_MINORS.every((m) => m.major === major)).toBe(true);
+    const minors = TESTED_OMP_MINORS.map((m) => m.minor);
+    expect([...minors].sort((a, b) => a - b)).toEqual(minors);
+    expect(new Set(minors).size).toBe(minors.length);
   });
 });

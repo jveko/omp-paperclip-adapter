@@ -15,6 +15,11 @@ Three defects a live Paperclip run exposed.
   `omp.turn`, tool activity to `omp.tool_call`, and the UI parser never emits a `[stdout]` dump for a
   line it does not understand. The real smoke now prints `tool_call bash | assistant "pong"` instead
   of raw JSON.
+- **No omp peer pin.** The `>=18.13.0 <18.15.0` peer range is gone: it was a second,
+  weaker gate that went stale the moment 18.16 shipped (the smoke proves 18.16.0 works), while the
+  capability probes are what actually validate a build. `18.16.x` joins the tested lines, the version
+  check stays a warn for an untested minor and an error only for a new major.
+
 - **`sessionScope: "profile"`.** A named omp profile per agent
   (`OMP_PROFILE=pc-<instance>-<company>-<agent>`) fences settings, rules, skills, MCP, sessions,
   `agent.db` and caches in one move, threaded into the probe lane as well. A concurrent

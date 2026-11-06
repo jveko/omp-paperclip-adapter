@@ -244,6 +244,7 @@ describe("evaluateOmpVersionCheck", () => {
   it.each([
     { minor: 13, patch: 1, output: "omp/18.13.1" },
     { minor: 14, patch: 0, output: "omp/18.14.0" },
+    { minor: 16, patch: 0, output: "omp/18.16.0" },
   ])("accepts a build inside the tested 18.$minor line", ({ minor, patch, output }) => {
     const check = evaluateOmpVersionCheck({ major: 18, minor, patch }, output, "/usr/bin/omp");
     expect(check.level).toBe("info");
@@ -264,7 +265,7 @@ describe("evaluateOmpVersionCheck", () => {
 
   it.each([
     { name: "a newer minor", version: { major: 18, minor: 12, patch: 9 }, output: "omp/18.12.9" },
-    { name: "a newer major's first minor", version: { major: 18, minor: 16, patch: 0 }, output: "omp/18.16.0" },
+    { name: "a newer minor", version: { major: 18, minor: 17, patch: 0 }, output: "omp/18.17.0" },
   ])("warns on $name of a directly executed omp", ({ version, output }) => {
     const check = evaluateOmpVersionCheck(version, output, "omp");
     expect(check.level).toBe("warn");
