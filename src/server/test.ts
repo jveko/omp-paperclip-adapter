@@ -48,6 +48,14 @@ export function evaluateSessionScopeCheck(
 ): AdapterEnvironmentCheck {
   const invalid = validateSessionScope(config);
   if (invalid) return { level: "error", code: "omp_config_error", message: invalid };
+  if (resolveSessionScope(config) === "profile") {
+    return {
+      level: "info",
+      code: "omp_sessions_profile",
+      message: "sessionScope=profile: each run uses its own named omp profile (`OMP_PROFILE=pc-<instance>-<company>-<agent>`) under `$HOME/.omp/profiles/<name>`",
+      detail: "The profile is outside the Paperclip instance root (omp joins PI_CONFIG_DIR as a name under the home), so it survives instance-root cleanup; remove one with `omp-host profile rm <name>`. A fresh profile starts with an empty model catalog, so its first run refreshes it. Credentials come from the auth broker only, and PI_CODING_AGENT_DIR must be unset (named profiles ignore it).",
+    };
+  }
   if (resolveSessionScope(config) === "isolated") {
     return {
       level: "info",
@@ -376,7 +384,7 @@ export async function testEnvironment(
   const capabilities = await loadCapabilities({
     acp: { command: bin, args: acpArgs, env: spawnEnv },
     mode: "managed",
-    worker: buildWorkerArgv(config, bridgePath),
+    worker: { ...buildWorkerArgv(config, bridgePath), env: spawnEnv },
     version: parsedVersion === null
       ? null
       : `${parsedVersion.major}.${parsedVersion.minor}.${parsedVersion.patch}`,

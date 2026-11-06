@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
 import {
   getSessionConfigSchema, paperclipApiBase, readSessionIntelConfig, resolveRunDirective,
@@ -8,6 +8,10 @@ import {
   validateSubagentObservability, validateThinkingLevel,
 } from "./session-directives.js";
 import { snapshotDigest } from "./session-state.js";
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 describe("readSessionIntelConfig", () => {
   it("defaults browser on, usage report on, everything else off", () => {
@@ -497,10 +501,11 @@ describe("sessionScope", () => {
     expect(sharedScopeRisk({ credentialMode: "local" })).toBe(null);
   });
   it("reports an unknown value instead of silently downgrading to shared", () => {
-    // A typo must not quietly disable a containment control.
+    // A typo must not quietly disable a containment control. The message must
+    // enumerate every accepted scope, profile included.
     expect(resolveSessionScope({ sessionScope: "Isolated" })).toBe("shared");
     expect(validateSessionScope({ sessionScope: "Isolated" }))
-      .toContain("expected 'shared' or 'isolated'");
+      .toMatch(/expected .*'shared'.*'isolated'.*'profile'/);
   });
   it("fails isolated without broker credentials, naming both knobs and the reason", () => {
     const msg = validateSessionScope({ sessionScope: "isolated" });
@@ -513,13 +518,38 @@ describe("sessionScope", () => {
     expect(validateSessionScope({ sessionScope: "shared", credentialMode: "local" })).toBe(null);
     expect(validateSessionScope({})).toBe(null);
   });
+  it("resolves and accepts profile only with broker credentials", () => {
+    expect(resolveSessionScope({ sessionScope: "profile", credentialMode: "broker" })).toBe("profile");
+    expect(validateSessionScope({ sessionScope: "profile", credentialMode: "broker" })).toBe(null);
+    const msg = validateSessionScope({ sessionScope: "profile", credentialMode: "local" });
+    expect(msg).toContain("sessionScope is 'profile'");
+    expect(msg).toContain("credentialMode");
+  });
+  it("refuses profile when PI_CODING_AGENT_DIR is set, naming the setting", () => {
+    // A named profile resolves its own agent dir; an inherited
+    // PI_CODING_AGENT_DIR would silently override it and defeat the isolation.
+    const fromConfig = validateSessionScope({
+      sessionScope: "profile",
+      credentialMode: "broker",
+      env: { PI_CODING_AGENT_DIR: "/somewhere/else" },
+    });
+    expect(fromConfig).toContain("PI_CODING_AGENT_DIR");
+    expect(fromConfig).toMatch(/ignore/i);
+
+    vi.stubEnv("PI_CODING_AGENT_DIR", "/from/process/env");
+    const fromProcess = validateSessionScope({ sessionScope: "profile", credentialMode: "broker" });
+    expect(fromProcess).toContain("PI_CODING_AGENT_DIR");
+    expect(fromProcess).toMatch(/ignore/i);
+  });
   it("exposes the scope select with an automatic default resolved by credential mode", () => {
     const fields = getSessionConfigSchema().fields;
     const scope = fields.find((f) => f.key === "sessionScope");
     expect(scope).toMatchObject({ type: "select", default: "" });
     // "" must be an offered value: the Paperclip form otherwise materializes
     // the first option as an explicit choice, pinning shared under broker.
-    expect(scope?.options?.map((o) => o.value)).toEqual(["", "isolated", "shared"]);
+    const values = scope?.options?.map((o) => o.value) ?? [];
+    expect(values).toEqual(expect.arrayContaining(["", "isolated", "shared", "profile"]));
+    expect(values).toHaveLength(4);
     expect(scope?.hint).toMatch(/credentialMode is 'broker'/);
     expect(scope?.hint).toMatch(/cross-tenant/);
     expect(fields.find((f) => f.key === "sessionSnapshotDiagnostic")).toMatchObject({

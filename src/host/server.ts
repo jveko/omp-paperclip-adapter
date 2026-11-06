@@ -115,6 +115,12 @@ interface Fingerprint {
   argvHash: string;
   bridgeHash: string;
   agentDir: string | null;
+  /**
+   * The named omp profile the worker resolved at spawn. A profile run carries
+   * no PI_CODING_AGENT_DIR, so without this a shared -> profile flip would
+   * reuse the old worker and keep reading the old store.
+   */
+  profile: string | null;
   cwd: string;
   ompVersion: string | null;
 }
@@ -1684,6 +1690,7 @@ class Supervisor {
       argvHash: begin.cell.argvHash,
       bridgeHash: begin.cell.bridgeHash,
       agentDir: begin.cell.agentDir,
+      profile: begin.cell.profile ?? null,
       cwd: begin.cwd,
       ompVersion: await this.ompVersionOf(begin.worker.command),
     };
@@ -1767,6 +1774,7 @@ class Supervisor {
     return a.argvHash === b.argvHash
       && a.bridgeHash === b.bridgeHash
       && a.agentDir === b.agentDir
+      && a.profile === b.profile
       && a.cwd === b.cwd
       && a.ompVersion === b.ompVersion;
   }

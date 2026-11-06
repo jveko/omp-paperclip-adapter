@@ -17,7 +17,7 @@ function begin(overrides: Partial<Extract<HostFrame, { type: "run.begin" }>> = {
     cwd: "/repo",
     session: { ompSessionId: null },
     cell: {
-      argvHash: "argv", bridgeHash: "bridge", agentDir: null,
+      argvHash: "argv", bridgeHash: "bridge", agentDir: null, profile: null,
       model: "prov/m", thinking: "high", approval: "yolo",
     },
     worker: { command: "omp", args: ["--mode", "rpc"], env: { A: "B" } },

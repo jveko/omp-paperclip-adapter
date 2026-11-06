@@ -1,9 +1,10 @@
-import { unlink } from "node:fs/promises";
+import { rm, stat, unlink } from "node:fs/promises";
 import path from "node:path";
 import { HostClient } from "./client.js";
 import { isTerminalState, readLedgerRecords, readLedgerTail, type LedgerRecord } from "./ledger.js";
 import type { LedgerCause, LedgerState } from "./protocol.js";
 import { reconcile, startHost } from "./server.js";
+import { profileConfigRoot, validateProfileName } from "../server/omp-profile.js";
 import {
   HostSocketSecurityError, acquireHostLock, checkSocketSecurity, clearDiscovery, hostRootDir,
   isDiscoveryStale, readDiscovery, readProcessStartIdentity,
@@ -32,6 +33,8 @@ const USAGE = [
   "  stats [--json] [--since <duration>]",
   "                   summarize the run ledger: runs, states, causes, latency, worker reuse",
   "                   (duration: <n>s|m|h|d; reads a bounded tail, never writes)",
+  "  profile rm <name>",
+  "                   remove a named omp profile under $HOME/.omp/profiles (sessionScope 'profile')",
 ].join("\n");
 
 /**
@@ -89,6 +92,38 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       } finally {
         await lock.release();
       }
+    }
+    case "profile": {
+      if (args[0] !== "rm" || args.length !== 2) {
+        io.err(`profile expects 'rm <name>'\n${USAGE}\n`);
+        return 2;
+      }
+      const name = args[1];
+      const invalid = validateProfileName(name);
+      if (invalid !== null) {
+        io.err(`invalid omp profile name: ${invalid}\n`);
+        return 2;
+      }
+      const dir = profileConfigRoot(name);
+      try {
+        if (!(await stat(dir)).isDirectory()) throw new Error("not a directory");
+      } catch {
+        io.out(`profile '${name}' not found (${dir})\n`);
+        return 1;
+      }
+      // A live supervisor may hold a worker (and an in-flight run) on this
+      // profile. Refusing would also block cleanup after a crash, so this
+      // names the risk instead of guessing.
+      const discovery = await readDiscovery(rootDir).catch(() => null);
+      if (discovery !== null) {
+        const identity = await readProcessStartIdentity(discovery.pid);
+        if (!isDiscoveryStale(discovery, identity)) {
+          io.err(`warning: supervisor pid ${discovery.pid} is running; stop it before removing a profile a run may be using\n`);
+        }
+      }
+      await rm(dir, { recursive: true, force: true });
+      io.out(`removed profile '${name}' (${dir})\n`);
+      return 0;
     }
     case "ledger": {
       if (args[0] !== "tail") {

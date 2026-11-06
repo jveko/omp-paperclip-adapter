@@ -534,9 +534,11 @@ async function planSessionState(
       ? storedParams.acpSessionId
       : "";
     if (previousSessionId) {
-      const where = input.sessionScope === "isolated"
-        ? `this agent's own omp agent dir (${input.scopeAgentDir})`
-        : "the host-wide omp agent dir";
+      const where = input.sessionScope === "profile"
+        ? `this agent's named omp profile (${input.scopeAgentDir})`
+        : input.sessionScope === "isolated"
+          ? `this agent's own omp agent dir (${input.scopeAgentDir})`
+          : "the host-wide omp agent dir";
       await ctx.onEvent?.({
         eventType: "run.system", stream: "system", level: "warn",
         message: `omp sessionScope switched to '${input.sessionScope}': the previous session (${previousSessionId.slice(0, 12)}) stays where it was and will not be resumed, so this run starts a fresh session in ${where}`,

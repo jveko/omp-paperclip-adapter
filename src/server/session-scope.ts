@@ -3,10 +3,13 @@ import path from "node:path";
 import { mkdir, stat } from "node:fs/promises";
 import { resolveSessionScope, sharedScopeRisk, type SessionScope } from "./session-directives.js";
 import { ompAgentDir } from "./session-state.js";
+import {
+  adapterInstanceId, agentProfileName, profileAgentDir, profileConfigRoot,
+} from "./omp-profile.js";
 
 export interface PreparedSessionScope {
   scope: SessionScope;
-  /** The per-agent omp agent dir, or null for a shared run. */
+  /** The run's omp agent dir (isolated or profile), or null for a shared run. */
   agentDir: string | null;
   /** The config the run must use. For `shared` it is the input object. */
   config: Record<string, unknown>;
@@ -84,13 +87,56 @@ export async function prepareSessionScope(
   config: Record<string, unknown>,
   ids: { companyId: string; agentId: string },
 ): Promise<PrepareSessionScopeResult> {
-  if (resolveSessionScope(config) !== "isolated") {
+  const scope = resolveSessionScope(config);
+  if (scope === "shared") {
     // Shared is the default outside broker mode; under broker mode it is an
     // explicit opt-out of the fence, and the run must name what it accepts.
     const risk = sharedScopeRisk(config);
     return {
       ok: true,
       prepared: { scope: "shared", agentDir: null, config, warnings: risk === null ? [] : [risk] },
+    };
+  }
+  if (scope === "profile") {
+    // A named profile is omp's own fence: every store it reads resolves under
+    // $HOME/<PI_CONFIG_DIR>/profiles/<name>. Outside the instance root by
+    // design (PI_CONFIG_DIR is a name joined under the home, not a path).
+    const env = { ...((config.env ?? {}) as Record<string, unknown>) };
+    const configuredAgentDir = str(env.PI_CODING_AGENT_DIR) || str(process.env.PI_CODING_AGENT_DIR);
+    if (configuredAgentDir) {
+      return {
+        ok: false,
+        error: `sessionScope is 'profile' but PI_CODING_AGENT_DIR is set (${configuredAgentDir}); named omp profiles ignore PI_CODING_AGENT_DIR, so the setting would be silently dropped. Unset PI_CODING_AGENT_DIR or use sessionScope 'isolated'.`,
+      };
+    }
+    let instanceId: string;
+    try {
+      instanceId = adapterInstanceId();
+    } catch (err) {
+      return {
+        ok: false,
+        error: `sessionScope is 'profile' but this agent's omp profile could not be resolved from the instance id: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+    const name = agentProfileName({ instanceId, companyId: ids.companyId, agentId: ids.agentId });
+    const root = profileConfigRoot(name);
+    try {
+      await mkdir(root, { recursive: true, mode: 0o700 });
+    } catch (err) {
+      return {
+        ok: false,
+        error: `sessionScope is 'profile' but the omp profile could not be created (${root}): ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+    env.OMP_PROFILE = name;
+    return {
+      ok: true,
+      prepared: {
+        scope: "profile",
+        agentDir: profileAgentDir(name),
+        config: { ...config, env },
+        warnings: [],
+      },
     };
   }
   const warnings: string[] = [];

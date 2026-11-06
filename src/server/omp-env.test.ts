@@ -36,4 +36,11 @@ describe("ompEnv", () => {
       .toEqual({ PI_CODING_AGENT_DIR: "/state/omp-agent" });
     expect(ompEnv({ config: { env: { PI_CODING_AGENT_DIR: "" } } })).toEqual({});
   });
+  // A profile run's side channels must resolve the same named profile as the
+  // run child, or they would read a different tenant's sessions and config.
+  it("forwards OMP_PROFILE and drops an empty value", () => {
+    expect(ompEnv({ config: { env: { OMP_PROFILE: "pc-inst-co-agent" } } }))
+      .toEqual({ OMP_PROFILE: "pc-inst-co-agent" });
+    expect(ompEnv({ config: { env: { OMP_PROFILE: "" } } })).toEqual({});
+  });
 });

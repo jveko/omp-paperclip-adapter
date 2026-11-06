@@ -201,6 +201,7 @@ function beginFrame(runId: string, options: {
   prompt: string;
   sessionId: string | null;
   argv: { command: string; args: string[] };
+  workerEnv?: Record<string, string>;
 }): RunBeginFrame {
   const argvHash = createHash("sha256")
     .update([options.argv.command, ...options.argv.args].join("\u0000"))
@@ -219,11 +220,12 @@ function beginFrame(runId: string, options: {
       // The bridge is not installed in this smoke; its hash names that fact.
       bridgeHash: createHash("sha256").update("no-bridge").digest("hex").slice(0, 16),
       agentDir: null,
+      profile: profileName,
       model: null,
       thinking: null,
       approval: null,
     },
-    worker: { command: options.argv.command, args: options.argv.args, env: {} },
+    worker: { command: options.argv.command, args: options.argv.args, env: options.workerEnv ?? {} },
     prompt: options.prompt,
     // Shape-valid placeholders: no bridge reads them, and they are never logged.
     credentials: {
@@ -443,12 +445,37 @@ async function scenario(deadlineAt: number): Promise<void> {
 
   const run1Id = `smoke-${Date.now()}-1`;
   const first = await HostClient.connect({ rootDir, connectTimeoutMs: remaining(CONNECT_MS, deadlineAt) });
+  if (profileName !== null) {
+    // A fresh named profile has no credential store and no model catalog: the
+    // worker must be spawned under OMP_PROFILE (which is what creates the dir),
+    // and with no broker or operator config in that profile the first turn is
+    // refused for the missing model. That refusal IS the documented state.
+    let refused: string | null = null;
+    try {
+      const attempt = await runTurn(first, beginFrame(run1Id, {
+        cwd: work, prompt: PROMPT_1, sessionId: null, argv,
+        workerEnv: { OMP_PROFILE: profileName },
+      }), deadlineAt);
+      expectCompleted(attempt, run1Id);
+    } catch (err) {
+      if (!(err instanceof RefusedRunError)) throw err;
+      refused = err.message;
+    } finally {
+      first.close();
+    }
+    await access(profileDir as string);
+    console.log(
+      `  profile      ${profileDir} (fresh profile; ${refused === null ? "run completed" : "no credential or model in the new profile, run refused as documented"})`,
+    );
+    return;
+  }
   let turn1: Turn;
   let turn2: Turn;
   let records: LedgerRecord[];
   try {
     turn1 = await runTurn(first, beginFrame(run1Id, {
       cwd: work, prompt: PROMPT_1, sessionId: null, argv,
+      ...(profileName === null ? {} : { workerEnv: { OMP_PROFILE: profileName } }),
     }), deadlineAt);
   } finally {
     first.close();
@@ -545,7 +572,10 @@ async function scenario(deadlineAt: number): Promise<void> {
   let run2Id: string;
   try {
     const secondRun = await runTurnRetryingLease(second, deadlineAt, `smoke-${Date.now()}-2`, (runId) =>
-      beginFrame(runId, { cwd: work, prompt: PROMPT_2, sessionId, argv }));
+      beginFrame(runId, {
+        cwd: work, prompt: PROMPT_2, sessionId, argv,
+        ...(profileName === null ? {} : { workerEnv: { OMP_PROFILE: profileName } }),
+      }));
     turn2 = secondRun.turn;
     run2Id = secondRun.runId;
   } finally {
@@ -608,6 +638,11 @@ describe.skipIf(!ENABLED)("real omp smoke", () => {
   // is ~13s, past vitest's 10s default hook timeout.
   afterAll(async () => {
     if (supervisor !== null) await stopSupervisor(supervisor);
+    if (profileDir !== null && !failed) {
+      // The smoke created this profile (and its catalog) in the real home;
+      // remove it unless the run failed and the evidence is wanted.
+      await rm(profileDir, { recursive: true, force: true });
+    }
     if (tempHome === null) return;
     if (failed) {
       console.log(`\nleft ${tempHome} in place for inspection (ledger, run-context, discovery)\n`);

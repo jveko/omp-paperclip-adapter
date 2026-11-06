@@ -64,7 +64,7 @@ function emptyState(): SessionIntelState {
 }
 
 function isScope(value: unknown): value is SessionScope {
-  return value === "shared" || value === "isolated";
+  return value === "shared" || value === "isolated" || value === "profile";
 }
 
 export async function loadState(dir: string): Promise<SessionIntelState> {

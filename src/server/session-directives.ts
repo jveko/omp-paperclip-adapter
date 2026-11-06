@@ -64,10 +64,10 @@ export function readSessionIntelConfig(config: Record<string, unknown>): Session
  * keeps its credential store in the shared agent dir, so `shared` stays the
  * default there (and `testEnvironment` reports it).
  */
-export type SessionScope = "shared" | "isolated";
+export type SessionScope = "shared" | "isolated" | "profile";
 
 export function resolveSessionScope(config: Record<string, unknown>): SessionScope {
-  if (config.sessionScope === "isolated" || config.sessionScope === "shared") {
+  if (config.sessionScope === "isolated" || config.sessionScope === "shared" || config.sessionScope === "profile") {
     return config.sessionScope;
   }
   // An unset (or empty) value is the operator's silence, not a choice; the
@@ -96,12 +96,31 @@ export function sharedScopeRisk(config: Record<string, unknown>): string | null 
  */
 export function validateSessionScope(config: Record<string, unknown>): string | null {
   const raw = config.sessionScope;
-  if (raw !== undefined && raw !== null && raw !== "" && raw !== "shared" && raw !== "isolated") {
+  if (raw !== undefined && raw !== null && raw !== "" && raw !== "shared" && raw !== "isolated" && raw !== "profile") {
     // A typo would otherwise mean "shared", silently disabling containment.
-    return `sessionScope is '${String(raw)}' but expected 'shared' or 'isolated'.`;
+    return `sessionScope is '${String(raw)}' but expected 'shared', 'isolated' or 'profile'.`;
   }
   if (raw === "isolated" && config.credentialMode !== "broker") {
     return "sessionScope is 'isolated' but credentialMode is not 'broker': the isolated scope points omp at this agent's own agent dir, which holds no credential store (agent.db) and no operator config, so a local-login run would start with no credentials. Set credentialMode to 'broker' with OMP_AUTH_BROKER_URL and OMP_AUTH_BROKER_TOKEN, or keep sessionScope 'shared'.";
+  }
+  if (raw === "profile") {
+    if (config.credentialMode !== "broker") {
+      return "sessionScope is 'profile' but credentialMode is not 'broker': a named omp profile has its own empty credential store, so a local-login run would start with no credentials. Set credentialMode to 'broker' with OMP_AUTH_BROKER_URL and OMP_AUTH_BROKER_TOKEN, or use sessionScope 'shared'.";
+    }
+    // Named profiles ignore PI_CODING_AGENT_DIR (dirs.ts: agentDirOverride is
+    // dropped when a profile is active). A configured override would be
+    // silently dropped — which also means it would silently defeat any fence an
+    // operator believed they had set — so refuse instead of ignoring it.
+    const configured = typeof (config.env as Record<string, unknown> | undefined)?.PI_CODING_AGENT_DIR === "string"
+      ? String((config.env as Record<string, unknown>).PI_CODING_AGENT_DIR).trim()
+      : "";
+    const inherited = typeof process.env.PI_CODING_AGENT_DIR === "string"
+      ? process.env.PI_CODING_AGENT_DIR.trim()
+      : "";
+    const conflicting = configured || inherited;
+    if (conflicting !== "") {
+      return `sessionScope is 'profile' but PI_CODING_AGENT_DIR is set (${conflicting}); named omp profiles ignore PI_CODING_AGENT_DIR, so the setting would be silently dropped. Unset PI_CODING_AGENT_DIR or use sessionScope 'isolated'.`;
+    }
   }
   return null;
 }
@@ -275,9 +294,10 @@ export function getSessionConfigSchema(): AdapterConfigSchema {
         options: [
           { label: "Automatic: isolated with broker credentials, otherwise shared", value: "" },
           { label: "Isolated per employee (requires broker credentials)", value: "isolated" },
+          { label: "Named omp profile per employee (requires broker credentials)", value: "profile" },
           { label: "Shared with every omp agent on this host", value: "shared" },
         ],
-        hint: `Defaults to 'isolated' when credentialMode is 'broker', otherwise 'shared'. shared = the host's one omp agent dir (~/.omp/agent): every employee shares sessions, titles, caches and config, and choosing it under broker credentials is reported as a cross-tenant warning. isolated = this agent's own omp agent dir under the Paperclip instance, so sessions, titles and caches are private to it; it requires credentialMode 'broker' because the private dir has no credential store. Switching shared→isolated starts an empty dir and the employee's previous session is not resumed (the run warns once; the old transcript stays where it was). ${NEXT_RUN}` },
+        hint: `Defaults to 'isolated' when credentialMode is 'broker', otherwise 'shared'. shared = the host's one omp agent dir (~/.omp/agent): every employee shares sessions, titles, caches and config, and choosing it under broker credentials is reported as a cross-tenant warning. isolated = this agent's own omp agent dir under the Paperclip instance, so sessions, titles and caches are private to it; it requires credentialMode 'broker' because the private dir has no credential store. profile = a named omp profile (OMP_PROFILE=pc-<instance>-<company>-<agent>), which also requires broker credentials; it lives at $HOME/.omp/profiles/<name>, outside the Paperclip instance root, so an instance-root cleanup does not remove it (omp-host profile rm <name> does), and its catalog starts empty so the first run refreshes it. A named profile ignores PI_CODING_AGENT_DIR, so setting one alongside profile is refused. Switching shared→isolated or →profile starts an empty store and the employee's previous session is not resumed (the run warns once; the old transcript stays where it was). ${NEXT_RUN}` },
       { key: "sessionBrowser", label: "Session browser", type: "toggle", default: true,
         hint: `Emit a session-snapshot work product when the session landscape changes. ${NEXT_RUN}` },
       { key: "sessionSnapshotDiagnostic", label: "Host-wide session listing (diagnostic)", type: "toggle", default: false,

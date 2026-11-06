@@ -1,8 +1,10 @@
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AdapterExecutionResult, AdapterUsageCheckpoint } from "@paperclipai/adapter-utils";
 import { createOmpAcpExecutor } from "../src/server/acp.js";
+import { profileAgentDir, profileConfigRoot } from "../src/server/omp-profile.js";
+import { prepareSessionScope } from "../src/server/session-scope.js";
 import { readLedgerRecords } from "../src/host/ledger.js";
 import { checkGolden, normalizeGolden, runReplacements } from "./golden.js";
 import { conformanceEnv, ctx, managedWorker, type ConformanceEnv } from "./managed-harness.js";
@@ -135,5 +137,37 @@ describe("managed-lane conformance", () => {
 
   it("matches the recorded golden", async () => {
     await checkGolden("managed-lane", runs);
+  });
+
+  it("prepares distinct named profiles for two agents of one company", async () => {
+    vi.stubEnv("HOME", env.home);
+    // Keep profileConfigRoot inside this scenario's throwaway HOME.
+    vi.stubEnv("PI_CONFIG_DIR", "omp-config");
+    vi.stubEnv("PI_CODING_AGENT_DIR", "");
+    const config = { sessionScope: "profile", credentialMode: "broker", env: {} };
+
+    const first = await prepareSessionScope(config, { companyId: "co-1", agentId: "agent-1" });
+    const second = await prepareSessionScope(config, { companyId: "co-1", agentId: "agent-2" });
+    if (!first.ok) throw new Error(first.error);
+    if (!second.ok) throw new Error(second.error);
+
+    const firstEnv = first.prepared.config.env as Record<string, unknown>;
+    const secondEnv = second.prepared.config.env as Record<string, unknown>;
+    const firstName = firstEnv.OMP_PROFILE;
+    const secondName = secondEnv.OMP_PROFILE;
+    expect(typeof firstName).toBe("string");
+    expect(typeof secondName).toBe("string");
+    expect(first.prepared.scope).toBe("profile");
+    expect(second.prepared.scope).toBe("profile");
+    // The two employees of one company must never share a profile.
+    expect(firstName).not.toBe(secondName);
+    expect(first.prepared.agentDir).toBe(profileAgentDir(firstName as string));
+    expect(second.prepared.agentDir).toBe(profileAgentDir(secondName as string));
+    expect(first.prepared.agentDir).not.toBe(second.prepared.agentDir);
+
+    for (const name of [firstName as string, secondName as string]) {
+      const stats = await stat(profileConfigRoot(name));
+      expect(stats.isDirectory()).toBe(true);
+    }
   });
 });

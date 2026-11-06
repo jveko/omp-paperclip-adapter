@@ -87,7 +87,7 @@ function beginFrame(
     cwd: process.cwd(),
     session: { ompSessionId: null },
     cell: {
-      argvHash: "argv", bridgeHash: "bridge", agentDir: null,
+      argvHash: "argv", bridgeHash: "bridge", agentDir: null, profile: null,
       model: "prov/m", thinking: "high", approval: "yolo",
     },
     worker: {
@@ -381,6 +381,42 @@ describe("supervisor", () => {
       expect(subscription).toBeLessThan(prompt);
       expect(commands[subscription].level).toBe("progress");
       expect(commands.filter((command) => command.type === "get_subagents")).toHaveLength(1);
+    } finally {
+      client.close();
+    }
+  }, 20_000);
+
+  it("respawns when only the named omp profile changes", async () => {
+    // A profile run carries no PI_CODING_AGENT_DIR, so the profile is part of
+    // the worker identity: reusing the old worker would keep reading the old
+    // store while the run believes it is fenced in the new one.
+    const running = await start();
+    const client = await connectClient(running.socketPath);
+    try {
+      client.send(beginFrame({ runId: "run-shared" }));
+      const shared = await client.waitFor((frame) => frame.type === "run.accepted" && frame.runId === "run-shared");
+      if (shared.type !== "run.accepted") throw new Error("unreachable");
+      await client.waitFor((frame) => frame.type === "run.settled" && frame.runId === "run-shared");
+
+      client.send(beginFrame({
+        runId: "run-profile",
+        session: { ompSessionId: "sess-new-1" },
+        cell: {
+          argvHash: "argv", bridgeHash: "bridge", agentDir: null, profile: "pc-test-co-agent",
+          model: "prov/m", thinking: "high", approval: "yolo",
+        },
+        // A profile worker resolves its own env; spell the worker identity change.
+        worker: {
+          command: process.execPath,
+          args: [fixture, "--mode", "rpc"],
+          env: { FAKE_RPC_MODE: "", OMP_PROFILE: "pc-test-co-agent" },
+        },
+      }));
+      const profiled = await client.waitFor((frame) => frame.type === "run.accepted" && frame.runId === "run-profile");
+      if (profiled.type !== "run.accepted") throw new Error("unreachable");
+      expect(profiled.reusedWorker).toBe(false);
+      expect(profiled.worker.pid).not.toBe(shared.worker.pid);
+      await client.waitFor((frame) => frame.type === "run.settled" && frame.runId === "run-profile");
     } finally {
       client.close();
     }

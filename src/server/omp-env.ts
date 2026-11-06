@@ -29,6 +29,10 @@ export function ompEnv(
   // fence sets it, and an operator-set value must ride along unchanged.
   const agentDir = str("PI_CODING_AGENT_DIR");
   if (agentDir) env.PI_CODING_AGENT_DIR = agentDir;
+  // A named profile (`sessionScope: "profile"`) resolves its own config root;
+  // a side channel without it would read a different store than the run child.
+  const profile = str("OMP_PROFILE");
+  if (profile) env.OMP_PROFILE = profile;
   for (const [k, v] of Object.entries(src)) {
     if (k.startsWith("OTEL_EXPORTER_OTLP_") && typeof v === "string") env[k] = v;
   }

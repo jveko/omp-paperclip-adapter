@@ -5,7 +5,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
 import { ompAgentDir } from "./session-state.js";
 import { prepareSessionScope } from "./session-scope.js";
-import { sharedScopeRisk } from "./session-directives.js";
+import { buildWorkerEnv } from "../host/worker.js";
+import { ompEnv } from "./omp-env.js";
+import { sharedScopeRisk, validateSessionScope } from "./session-directives.js";
+import {
+  PROFILE_NAME_MAX, agentProfileName, profileAgentDir, profileConfigRoot,
+  sanitizeAgentProfileName, validateProfileName,
+} from "./omp-profile.js";
 
 let tmpRoot = "";
 
@@ -161,5 +167,157 @@ describe("prepareSessionScope", () => {
     expect(out.prepared.config.env).not.toHaveProperty("PI_CONFIG_FILES");
     expect(out.prepared.warnings).toHaveLength(1);
     expect(out.prepared.warnings[0]).toContain("could not be read");
+  });
+});
+
+describe("agent profile names", () => {
+  it("sanitizes arbitrary input into a valid, stable profile name", () => {
+    const rows = [
+      ["uppercase", "MyAgent"],
+      ["spaces and slashes", "My Agent/One"],
+      ["empty", ""],
+      ["overlong", "A".repeat(PROFILE_NAME_MAX * 2)],
+    ] as const;
+    for (const [label, raw] of rows) {
+      const name = sanitizeAgentProfileName(raw);
+      expect(name, label).toMatch(/^[a-z0-9][a-z0-9._-]*$/);
+      expect(name.length, label).toBeLessThanOrEqual(PROFILE_NAME_MAX);
+      expect(validateProfileName(name), label).toBe(null);
+      expect(sanitizeAgentProfileName(raw), label).toBe(name);
+    }
+  });
+
+  it("keeps distinct overlong names distinct when truncating", () => {
+    // Truncation must not collapse two different agents onto one profile:
+    // the hash suffix is what preserves the difference past PROFILE_NAME_MAX.
+    const prefix = "a".repeat(PROFILE_NAME_MAX);
+    const first = sanitizeAgentProfileName(`${prefix}-one`);
+    const second = sanitizeAgentProfileName(`${prefix}-two`);
+    expect(first).not.toBe(second);
+    expect(first.length).toBeLessThanOrEqual(PROFILE_NAME_MAX);
+    expect(second.length).toBeLessThanOrEqual(PROFILE_NAME_MAX);
+    expect(validateProfileName(first)).toBe(null);
+    expect(validateProfileName(second)).toBe(null);
+  });
+
+  it("derives pc-<instance>-<company>-<agent> from the ids", () => {
+    const ids = { instanceId: "inst-1", companyId: "co-1", agentId: "agent.one" };
+    expect(agentProfileName(ids)).toBe("pc-inst-1-co-1-agent.one");
+    expect(agentProfileName({ ...ids })).toBe(agentProfileName(ids));
+    expect(agentProfileName({ ...ids, agentId: "agent.two" }))
+      .not.toBe(agentProfileName(ids));
+  });
+
+  it("rejects names omp would refuse", () => {
+    for (const bad of ["", "default", ".", "..", "-lead", "bad.", "UPPER"]) {
+      expect(validateProfileName(bad), bad).not.toBe(null);
+    }
+    expect(validateProfileName("agent.one")).toBe(null);
+    expect(validateProfileName("a".repeat(PROFILE_NAME_MAX))).toBe(null);
+    expect(validateProfileName("a".repeat(PROFILE_NAME_MAX + 1))).not.toBe(null);
+  });
+});
+
+describe("prepareSessionScope (profile)", () => {
+  let home = "";
+
+  beforeEach(async () => {
+    home = path.join(tmpRoot, "home");
+    await mkdir(home, { recursive: true });
+    vi.stubEnv("HOME", home);
+    vi.stubEnv("PI_CONFIG_DIR", "omp-config");
+    vi.stubEnv("PI_CODING_AGENT_DIR", "");
+  });
+
+  it("uses a named profile and creates its config root", async () => {
+    const config = {
+      sessionScope: "profile",
+      credentialMode: "broker",
+      env: { OMP_AUTH_BROKER_URL: "http://b" },
+    };
+    const out = await prepareSessionScope(config, { companyId: "co-1", agentId: "agent-1" });
+    if (!out.ok) throw new Error(out.error);
+    const name = agentProfileName({
+      instanceId: "test-session-scope", companyId: "co-1", agentId: "agent-1",
+    });
+
+    expect(out.prepared.scope).toBe("profile");
+    expect(out.prepared.config.env).toMatchObject({
+      OMP_PROFILE: name,
+      OMP_AUTH_BROKER_URL: "http://b",
+    });
+    // A named profile resolves its own dir; PI_CODING_AGENT_DIR would override it.
+    expect(out.prepared.config.env).not.toHaveProperty("PI_CODING_AGENT_DIR");
+    expect(out.prepared.agentDir).toBe(profileAgentDir(name));
+    expect(out.prepared.agentDir).toBe(path.join(profileConfigRoot(name), "agent"));
+    // The profile root lives under the stubbed HOME, so the host home is not touched.
+    expect(profileConfigRoot(name)).toBe(path.join(home, "omp-config", "profiles", name));
+    const stats = await stat(profileConfigRoot(name));
+    expect(stats.isDirectory()).toBe(true);
+    expect(stats.mode & 0o777).toBe(0o700);
+    expect(out.prepared.warnings).toEqual([]);
+    // The caller's config object is never mutated.
+    expect(config.env).not.toHaveProperty("OMP_PROFILE");
+  });
+
+  it("hands the same profile to the run's worker and side channels", async () => {
+    const out = await prepareSessionScope(
+      { sessionScope: "profile", credentialMode: "broker", env: {} },
+      { companyId: "co-1", agentId: "agent-1" },
+    );
+    if (!out.ok) throw new Error(out.error);
+    const name = agentProfileName({
+      instanceId: "test-session-scope", companyId: "co-1", agentId: "agent-1",
+    });
+    // The run child (the supervisor's worker) and every side channel derive
+    // their env from this config; both must resolve the same profile.
+    expect(buildWorkerEnv(out.prepared.config)).toMatchObject({ OMP_PROFILE: name });
+    expect(ompEnv({ config: out.prepared.config })).toMatchObject({ OMP_PROFILE: name });
+  });
+
+  it("refuses when config.env.PI_CODING_AGENT_DIR would override the profile", async () => {
+    const out = await prepareSessionScope(
+      {
+        sessionScope: "profile",
+        credentialMode: "broker",
+        env: { PI_CODING_AGENT_DIR: "/somewhere/else" },
+      },
+      { companyId: "co-1", agentId: "agent-1" },
+    );
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(out.error).toContain("PI_CODING_AGENT_DIR");
+      expect(out.error).toMatch(/ignore/i);
+    }
+  });
+
+  it("refuses when the process PI_CODING_AGENT_DIR would override the profile", async () => {
+    vi.stubEnv("PI_CODING_AGENT_DIR", "/from/process/env");
+    const out = await prepareSessionScope(
+      { sessionScope: "profile", credentialMode: "broker", env: {} },
+      { companyId: "co-1", agentId: "agent-1" },
+    );
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(out.error).toContain("PI_CODING_AGENT_DIR");
+      expect(out.error).toMatch(/ignore/i);
+    }
+  });
+
+  it("returns a typed error for an invalid instance id instead of throwing", async () => {
+    vi.stubEnv("PAPERCLIP_INSTANCE_ID", "../escape");
+    const out = await prepareSessionScope(
+      { sessionScope: "profile", credentialMode: "broker", env: {} },
+      { companyId: "co-1", agentId: "agent-1" },
+    );
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.error).toMatch(/instance/i);
+  });
+
+  it("is refused by validateSessionScope without broker credentials", () => {
+    expect(validateSessionScope({ sessionScope: "profile", credentialMode: "broker" })).toBe(null);
+    const msg = validateSessionScope({ sessionScope: "profile", credentialMode: "local" });
+    expect(msg).toContain("sessionScope is 'profile'");
+    expect(msg).toContain("credentialMode");
   });
 });

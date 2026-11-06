@@ -1,9 +1,10 @@
-import { mkdtemp, rm, stat, writeFile, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, writeFile, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runCli } from "./cli.js";
 import { RunLedger } from "./ledger.js";
+import { profileConfigRoot } from "../server/omp-profile.js";
 import { startHost, type RunningHost } from "./server.js";
 import { clearDiscovery, readDiscovery, writeDiscovery } from "./socket.js";
 
@@ -323,4 +324,56 @@ describe("omp-host stats", () => {
     expect(JSON.parse(out.join("")).runs).toBe(10_000);
     expect(elapsedMs).toBeLessThan(1_000);
   }, 20_000);
+});
+
+describe("omp-host profile rm", () => {
+  let home: string;
+  let root: string;
+
+  beforeEach(async () => {
+    home = await mkdtemp(path.join(os.tmpdir(), "omp-host-profile-home-"));
+    root = path.join(home, "host-root");
+    await mkdir(root, { recursive: true });
+    vi.stubEnv("HOME", home);
+    // A relative config dir keeps profileConfigRoot inside the temp HOME.
+    vi.stubEnv("PI_CONFIG_DIR", "omp-config");
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await rm(home, { recursive: true, force: true });
+  });
+
+  function capture(): { out: string[]; err: string[]; io: Parameters<typeof runCli>[1] } {
+    const out: string[] = [];
+    const err: string[] = [];
+    return {
+      out,
+      err,
+      io: { rootDir: root, out: (text: string) => out.push(text), err: (text: string) => err.push(text) },
+    };
+  }
+
+  it("removes a profile's config root and names the directory", async () => {
+    const name = "pc-inst-1-co-1-agent-1";
+    const dir = profileConfigRoot(name);
+    await mkdir(path.join(dir, "agent"), { recursive: true });
+    await writeFile(path.join(dir, "config.yml"), "providers: {}\n", "utf8");
+    expect(dir.startsWith(home)).toBe(true);
+
+    const { out, io } = capture();
+    expect(await runCli(["profile", "rm", name], io)).toBe(0);
+    expect(out.join("")).toContain(dir);
+    await expect(stat(dir)).rejects.toThrow();
+  });
+
+  it("exits 1 when the profile does not exist", async () => {
+    expect(await runCli(["profile", "rm", "pc-inst-1-co-1-missing"], capture().io)).toBe(1);
+  });
+
+  it("exits 2 for an invalid or missing name", async () => {
+    expect(await runCli(["profile", "rm", "Bad Name"], capture().io)).toBe(2);
+    expect(await runCli(["profile", "rm", ".."], capture().io)).toBe(2);
+    expect(await runCli(["profile", "rm"], capture().io)).toBe(2);
+  });
 });
