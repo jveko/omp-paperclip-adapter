@@ -1,6 +1,30 @@
 # Changelog
 
-## Unreleased — release engineering
+## 0.20.0 — 2026-11-06
+
+Three defects a live Paperclip run exposed.
+
+- **Unknown is not missing.** A worker capability that cannot be observed is now `info` (once per
+  worker), not a per-run `warn`; `absent` still warns. The probe runs after the worker is alive, is
+  cached per worker epoch (argv + bridge hash + omp version), and a feature that is then used
+  successfully corrects the earlier note. Live capture on omp 18.14.0/18.16.0 shows
+  `get_session_stats`, `set_host_tools` and `set_subagent_subscription` answering successfully before
+  the session and after the prompt — the old warnings were our harness, not the worker.
+- **Transcript fidelity.** Control frames (`agent_start`, `agent_end`, `turn_start`, `turn_end`,
+  bare `messageId`, bare tool names) are no longer relayed as log lines. Assistant text maps to
+  `omp.turn`, tool activity to `omp.tool_call`, and the UI parser never emits a `[stdout]` dump for a
+  line it does not understand. The real smoke now prints `tool_call bash | assistant "pong"` instead
+  of raw JSON.
+- **`sessionScope: "profile"`.** A named omp profile per agent
+  (`OMP_PROFILE=pc-<instance>-<company>-<agent>`) fences settings, rules, skills, MCP, sessions,
+  `agent.db` and caches in one move, threaded into the probe lane as well. A concurrent
+  `PI_CODING_AGENT_DIR` is refused with a named error (named profiles ignore it). The profile lives at
+  `$HOME/.omp/profiles/<name>` — **not** inside the instance root (`PI_CONFIG_DIR` is a name joined to
+  HOME), and it starts with no credential or catalog, so `profile` needs broker credentials; the
+  smoke prints the profile path and the documented refusal. `omp-host profile rm <name>` cleans up.
+  Default under broker stays `isolated`; the tradeoff is documented.
+
+### Release engineering
 
 No behaviour change on a run.
 

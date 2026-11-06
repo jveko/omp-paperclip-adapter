@@ -1,6 +1,6 @@
 {
   "name": "omp-paperclip-adapter",
-  "version": "0.19.0",
+  "version": "0.20.0",
   "description": "Paperclip external adapter that runs oh-my-pi (omp) employees through a per-instance supervisor over RPC.",
   "type": "module",
   "license": "MIT",
