@@ -333,22 +333,14 @@ export class RpcWorker {
 
   async setHostTools(tools: unknown[]): Promise<string[]> {
     const response = await this.request({ type: "set_host_tools", tools });
+    // A refusal is the caller's to name: the run warns "connection tools are
+    // unavailable" either way, and the supervisor records what the worker
+    // actually answered for this frame.
+    if (response.success === false) {
+      throw new Error(typeof response.error === "string" ? response.error : "set_host_tools was refused");
+    }
     const data = (response.data ?? {}) as Record<string, unknown>;
     return Array.isArray(data.toolNames) ? data.toolNames.filter((n): n is string => typeof n === "string") : [];
-  }
-
-  /**
-   * Set omp's subagent subscription for the runs this worker serves. A warm
-   * worker keeps the last level, so every run sets it (including `off`) before
-   * it prompts; otherwise one run's `events` would leak into the next.
-   */
-  async setSubagentSubscription(
-    level: "off" | "progress" | "events",
-  ): Promise<"off" | "progress" | "events"> {
-    const response = await this.request({ type: "set_subagent_subscription", level });
-    const data = (response.data ?? {}) as Record<string, unknown>;
-    const applied = data.level;
-    return applied === "off" || applied === "progress" || applied === "events" ? applied : level;
   }
 
   /**

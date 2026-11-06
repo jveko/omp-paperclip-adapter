@@ -5,7 +5,8 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   capabilityCacheKey, capabilityChecks, capabilityDiagnostics, clearCapabilityCache,
-  loadCapabilities, probeCapabilities,
+  clearCapabilityDiagnostics, loadCapabilities, probeCapabilities, workerCapabilityDiagnostics,
+  type WorkerCapabilityObservations,
 } from "./capabilities.js";
 
 /**
@@ -232,11 +233,124 @@ describe("probeCapabilities — managed worker frames", () => {
     });
     expect(set.capabilities["rpc.get_session_stats"].state).toBe("no");
     expect(set.capabilities["rpc.set_host_tools"].state).toBe("no");
+    expect(set.capabilities["rpc.set_subagent_subscription"].state).toBe("no");
     const checks = capabilityChecks(set);
     expect(checks.find((c) => c.code === "omp_rpc_session_stats_missing")?.level).toBe("warn");
     expect(checks.find((c) => c.code === "omp_rpc_host_tools_missing")?.message).toContain("connection tools");
+    expect(checks.find((c) => c.code === "omp_rpc_subagent_subscription_missing")?.level).toBe("warn");
     expect(checks.some((c) => c.level === "error")).toBe(false);
   }, 30_000);
+
+  it("repeats an absent capability diagnostic on every call", async () => {
+    vi.stubEnv("FAKE_RPC_MODE", "norpc");
+    const script = await fakeOmpBuild({ settingsKeys: [] });
+    const set = await probeCapabilities({
+      acp: { command: script, args: ["acp"] },
+      mode: "managed",
+      worker: { command: process.execPath, args: [fakeRpc] },
+    });
+    // An absence is a fact about the build, not a transient observation: it is
+    // not deduped away by a previous call for the same capability-set key.
+    for (const _ of [0, 1]) {
+      expect(capabilityDiagnostics(set, ["managedUsage"])).toEqual([{
+        level: "warn",
+        code: "omp_rpc_session_stats_missing",
+        message: expect.stringContaining("get_session_stats"),
+      }]);
+    }
+  }, 30_000);
+
+  it("reports the worker-frame rows as unknown and informational when the worker never becomes ready", async () => {
+    const script = await fakeOmpBuild({ settingsKeys: [] });
+    const set = await probeCapabilities({
+      acp: { command: script, args: ["acp"] },
+      mode: "managed",
+      // A live process that never emits `ready`: the probe can only time out.
+      worker: { command: "sleep", args: ["30"] },
+    });
+    for (const id of ["rpc.get_session_stats", "rpc.set_host_tools", "rpc.set_subagent_subscription"] as const) {
+      expect(set.capabilities[id].state).toBe("unknown");
+    }
+    const checks = capabilityChecks(set);
+    const checkFor = (id: string) => checks.find((check) => check.detail?.startsWith(`capability ${id}:`));
+    for (const id of ["rpc.get_session_stats", "rpc.set_host_tools", "rpc.set_subagent_subscription"] as const) {
+      const check = checkFor(id);
+      expect(check?.level).toBe("info");
+      expect(check?.message).toContain("could not be probed");
+    }
+    // An unprobed worker frame is not evidence of a missing surface.
+    expect(checks.filter((check) => check.detail?.startsWith("capability rpc.") && check.level === "warn"))
+      .toEqual([]);
+
+    // The unknown diagnostic is deduped per capability-set key: the transient
+    // "we could not look" note is emitted once, unlike an absent capability.
+    clearCapabilityDiagnostics();
+    expect(capabilityDiagnostics(set, ["managedUsage"])).toEqual([{
+      level: "info",
+      code: "omp_capability_unknown",
+      message: expect.stringContaining("get_session_stats"),
+    }]);
+    expect(capabilityDiagnostics(set, ["managedUsage"])).toEqual([]);
+  }, 40_000);
+
+  it("opens a session before asking the worker for its capability frames", async () => {
+    const dir = await tmpDir("omp-rpc-order-");
+    const frameLog = path.join(dir, "frames.log");
+    const script = await fakeOmpBuild({ settingsKeys: [] });
+    await probeCapabilities({
+      acp: { command: script, args: ["acp"] },
+      mode: "managed",
+      worker: {
+        command: process.execPath,
+        args: [fakeRpc],
+        env: { FAKE_RPC_LOG: frameLog },
+      },
+    });
+    const frames = (await readFile(frameLog, "utf8")).split("\n").filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const types = frames.map((frame) => frame.type);
+    expect(types[0]).toBe("open_session");
+    expect(types.indexOf("get_session_stats")).toBeGreaterThan(0);
+    expect(types.indexOf("set_host_tools")).toBeGreaterThan(0);
+    expect(types.indexOf("set_subagent_subscription")).toBeGreaterThan(0);
+    // The probe must not open (or resume) a session in the run's own state.
+    const sessionDir = frames[0].sessionDir;
+    expect(typeof sessionDir).toBe("string");
+    const resolved = path.resolve(sessionDir as string);
+    const tmp = path.resolve(os.tmpdir());
+    expect(resolved === tmp || resolved.startsWith(tmp + path.sep)).toBe(true);
+  }, 30_000);
+
+  it("only sees the worker's capability frames when the run's env reaches the probe", async () => {
+    const script = await fakeOmpBuild({ settingsKeys: [] });
+    const withToken = await probeCapabilities({
+      acp: { command: script, args: ["acp"] },
+      mode: "managed",
+      worker: {
+        command: process.execPath,
+        args: [fakeRpc],
+        env: { FAKE_RPC_MODE: "needenv", FAKE_RPC_PROBE_TOKEN: "1" },
+      },
+    });
+    expect(withToken.capabilities["rpc.get_session_stats"].state).toBe("yes");
+    expect(withToken.capabilities["rpc.set_host_tools"].state).toBe("yes");
+    expect(withToken.capabilities["rpc.set_subagent_subscription"].state).toBe("yes");
+
+    // Without the inherited token the worker ignores the frames silently, so
+    // the probe can only report unknown — never a confident "missing".
+    const withoutToken = await probeCapabilities({
+      acp: { command: script, args: ["acp"] },
+      mode: "managed",
+      worker: {
+        command: process.execPath,
+        args: [fakeRpc],
+        env: { FAKE_RPC_MODE: "needenv" },
+      },
+    });
+    for (const id of ["rpc.get_session_stats", "rpc.set_host_tools", "rpc.set_subagent_subscription"] as const) {
+      expect(withoutToken.capabilities[id].state).toBe("unknown");
+    }
+  }, 40_000);
 
   it("never probes the worker group for an engine-mode build", async () => {
     const script = await fakeOmpBuild({ settingsKeys: [] });
@@ -327,5 +441,79 @@ describe("capability cache", () => {
     expect(capabilityCacheKey(base)).not.toBe(
       capabilityCacheKey({ ...base, acp: { ...base.acp, args: ["acp", "--thinking", "off"] } }),
     );
+  });
+});
+
+describe("workerCapabilityDiagnostics — live probe observations", () => {
+  /** A live worker probe that has not answered any capability frame yet. */
+  const unknownWorker = (
+    overrides: Partial<WorkerCapabilityObservations> = {},
+  ): WorkerCapabilityObservations => ({
+    get_session_stats: "unknown",
+    set_host_tools: "unknown",
+    set_subagent_subscription: "unknown",
+    ...overrides,
+  });
+
+  it("emits an unknown capability as one info note per epoch", () => {
+    expect(workerCapabilityDiagnostics(unknownWorker(), ["managedUsage"], "epoch-unknown")).toEqual([{
+      level: "info",
+      code: "omp_capability_unknown",
+      message: expect.stringContaining("get_session_stats"),
+    }]);
+    expect(workerCapabilityDiagnostics(unknownWorker(), ["managedUsage"], "epoch-unknown")).toEqual([]);
+  });
+
+  it("keeps the features of one epoch independent", () => {
+    expect(workerCapabilityDiagnostics(unknownWorker(), ["managedUsage"], "epoch-features")).toHaveLength(1);
+    expect(workerCapabilityDiagnostics(unknownWorker(), ["managedHostTools"], "epoch-features")).toEqual([{
+      level: "info",
+      code: "omp_capability_unknown",
+      message: expect.stringContaining("set_host_tools"),
+    }]);
+  });
+
+  it("warns on every call while the capability is absent", () => {
+    const absent = unknownWorker({ get_session_stats: "no" });
+    for (let call = 0; call < 2; call += 1) {
+      expect(workerCapabilityDiagnostics(absent, ["managedUsage"], "epoch-absent")).toEqual([{
+        level: "warn",
+        code: "omp_rpc_session_stats_missing",
+        message: expect.stringContaining("get_session_stats"),
+      }]);
+    }
+  });
+
+  it("stays quiet when the capability is observed present with no earlier warning", () => {
+    expect(workerCapabilityDiagnostics(
+      unknownWorker({ get_session_stats: "yes" }), ["managedUsage"], "epoch-clean",
+    )).toEqual([]);
+  });
+
+  it("withdraws an earlier warning once the same epoch observes the capability", () => {
+    expect(workerCapabilityDiagnostics(
+      unknownWorker({ get_session_stats: "no" }), ["managedUsage"], "epoch-recovered",
+    )).toHaveLength(1);
+    const recovery = workerCapabilityDiagnostics(
+      unknownWorker({ get_session_stats: "yes" }), ["managedUsage"], "epoch-recovered",
+    );
+    expect(recovery).toHaveLength(1);
+    expect(recovery[0].level).toBe("info");
+    expect(recovery[0].code).toBe("omp_capability_observed");
+    expect(recovery[0].message).toContain("get_session_stats");
+    expect(recovery[0].message).toMatch(/withdraw/i);
+    // The withdrawal is itself reported once, not on every subsequent poll.
+    expect(workerCapabilityDiagnostics(
+      unknownWorker({ get_session_stats: "yes" }), ["managedUsage"], "epoch-recovered",
+    )).toEqual([]);
+  });
+
+  it("treats a new epoch as a new worker", () => {
+    expect(workerCapabilityDiagnostics(
+      unknownWorker({ get_session_stats: "no" }), ["managedUsage"], "epoch-a",
+    )).toHaveLength(1);
+    expect(workerCapabilityDiagnostics(
+      unknownWorker({ get_session_stats: "no" }), ["managedUsage"], "epoch-b",
+    )).toHaveLength(1);
   });
 });

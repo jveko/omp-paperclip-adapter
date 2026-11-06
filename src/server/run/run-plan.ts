@@ -30,11 +30,6 @@ import { mergePiConfigFiles, type OverlayEntry } from "./overlays.js";
 import { loadState, saveState, sessionIntelDir, type SessionIntelState } from "../session-state.js";
 import { buildRunChildConfig, bridgeArtifactError, firstNonEmptyString, isGovernanceArmed, resolveBridgeRunMode, resolveOmpAgentCommand, resolveSessionCwd } from "../adapters/acp/launch.js";
 import {
-  capabilityCacheDir, capabilityDiagnostics, loadCapabilities,
-  type CapabilityFeature, type CapabilitySet,
-} from "../capabilities.js";
-import { buildWorkerArgv } from "../../host/worker.js";
-import {
   readSessionIntelConfig, resolveRunDirective, thinkingLevelChanged,
   validateCredentialMode, validatePlanMode, validateSessionScope,
   validateSteering, validateSubagentObservability, validateThinkingLevel,
@@ -164,86 +159,6 @@ function ompBaseCommand(
   const acpIdx = tokens.indexOf("acp");
   const base = acpIdx >= 0 ? tokens.slice(0, acpIdx) : tokens;
   return { command: base[0], args: base.slice(1) };
-}
-
-/**
- * The ACP-lane command with its `acp` sub-command and trailing flags — the
- * shape the capability probe's ACP group drives (`<command> <args...>`).
- */
-function ompAcpCommand(
-  config: Record<string, unknown>,
-  bridge: string,
-): { command: string; args: string[] } {
-  const tokens = resolveOmpAgentCommand(config, bridge).split(/\s+/);
-  return { command: tokens[0], args: tokens.slice(1) };
-}
-
-/**
- * The capabilities THIS run leans on. The supervisor always reads stats and
- * always resets the subagent subscription; host tools only when Paperclip
- * offered them.
- */
-function runCapabilityFeatures(ctx: AdapterExecutionContext): CapabilityFeature[] {
-  return ctx.runtimeTools !== undefined
-    ? ["managedUsage", "managedSubagents", "managedHostTools"]
-    : ["managedUsage", "managedSubagents"];
-}
-
-/**
- * Read the build's capability set for the features this run depends on and
- * report the ones it lacks, naming the feature and what happens instead.
- *
- * The run path READS the cache and never probes: a heartbeat must not gain a
- * probe process (the capability contract's cost rule), and the probe itself is
- * owned by `testEnvironment`, which runs when the agent is validated. A cold
- * cache therefore reports nothing here — the environment test is where the
- * surfaces are discovered, and its result is what the runs read.
- *
- * Only a command literally named `omp` is consulted: a wrapper prints its own
- * help/settings, so its surface probe would describe the wrapper. Nothing here
- * can refuse a run.
- */
-async function planCapabilities(
-  ctx: AdapterExecutionContext,
-  input: {
-    /**
-     * The agent config as the environment test sees it: before the session
-     * scope folds in `PI_CODING_AGENT_DIR` and before the manifests add
-     * `--extension` / `PAPERCLIP_*_MANIFEST` / `PI_CONFIG_FILES`. The probe
-     * cache key is built from this exact command and env, so a run and the
-     * environment test must derive them the same way or the run reads a key
-     * nobody wrote.
-     */
-    probeConfig: Record<string, unknown>;
-    bridge: string;
-  },
-): Promise<void> {
-  const acp = ompAcpCommand(input.probeConfig, input.bridge);
-  if (path.basename(acp.command) !== "omp") return;
-  const features = runCapabilityFeatures(ctx);
-  if (features.length === 0) return;
-  // A capability read is advisory evidence: an unreadable cache, an invalid
-  // instance id or a broken cache entry must never refuse or crash the run.
-  // The features it would have named still degrade on their own paths.
-  let capabilities: CapabilitySet | null;
-  try {
-    const env = ompEnv({ config: input.probeConfig });
-    capabilities = await loadCapabilities({
-      acp: { ...acp, env },
-      mode: "managed",
-      worker: { ...buildWorkerArgv(input.probeConfig, input.bridge), env },
-      cacheDir: capabilityCacheDir(),
-      cacheOnly: true,
-    });
-  } catch {
-    return;
-  }
-  if (capabilities === null) return;
-  for (const diagnostic of capabilityDiagnostics(capabilities, features)) {
-    await ctx.onEvent?.({
-      eventType: "run.system", stream: "system", level: diagnostic.level, message: diagnostic.message,
-    });
-  }
 }
 
 /**
@@ -767,15 +682,9 @@ export async function buildRunPlan(
     return { kind: "refused", refusal: { errorCode: "omp_config_error", errorMessage: preparedScope.error } };
   }
   const sessionScope = preparedScope.prepared.scope;
-  // The agent config as it arrived, before the scope fence and the manifests
-  // change the command or the env. The capability probe is keyed by exactly
-  // that command+env (the same ones `testEnvironment` derives), so this is the
-  // snapshot the run's cache read must use. Copied, not referenced: the
-  // manifests fold their env into `ctx.config` (which may be this same object).
-  const probeConfig = { ...ctx.config };
-  // The fenced config carries PI_CODING_AGENT_DIR (and the folded operator
-  // config.yml) into the run child AND every side channel below; ompEnv
-  // forwards the value it finds here.
+  // The fenced config carries PI_CODING_AGENT_DIR (isolated) or OMP_PROFILE
+  // (profile) into the run child AND every side channel below; ompEnv forwards
+  // the value it finds here.
   if (preparedScope.prepared.config !== ctx.config) ctx.config = preparedScope.prepared.config;
   for (const warning of preparedScope.prepared.warnings) {
     await ctx.onEvent?.({ eventType: "run.system", stream: "system", level: "warn", message: warning });
@@ -830,10 +739,6 @@ export async function buildRunPlan(
     sessionScope,
     scopeAgentDir: preparedScope.prepared.agentDir,
     intelDir,
-  });
-  await planCapabilities(ctx, {
-    probeConfig,
-    bridge: deps.bridge,
   });
   const applied = await applySessionDirective(ctx, {
     directive: session.directive,

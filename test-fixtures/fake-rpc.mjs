@@ -14,9 +14,12 @@
 //   subagents200  two hundred running subagents (frame-cap fixture)
 //   subagentsleak same as subagents, with credentials/prompt text in fields
 //   subagentghost a straggler from an earlier run: roster entry plus one event
-//   toolframes    one tool_execution_start/end pair with args/result sentinels
+//   toolframes    one turn lifecycle plus a tool_execution_start/end pair with
+//                 args/result sentinels
 //   coldstats     the first get_session_stats of each process answers empty
 //   nostats       every get_session_stats answers empty (usage stays unknown)
+//   needenv       the capability frames answer only when the probe inherits
+//                 FAKE_RPC_PROBE_TOKEN=1; otherwise they are silently ignored
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import readline from "node:readline";
 
@@ -226,6 +229,14 @@ rl.on("line", (line) => {
   }
   log(frame);
   const id = frame.id;
+  // "needenv" models a worker whose config is only honored for a probe that
+  // inherits the run's env: without the token the three capability frames are
+  // silently ignored, so the probe has to time out to unknown. open_session
+  // still answers, which is what lets the probe reach the capability frames.
+  if (mode === "needenv" && process.env.FAKE_RPC_PROBE_TOKEN !== "1"
+    && (frame.type === "get_session_stats" || frame.type === "set_host_tools" || frame.type === "set_subagent_subscription")) {
+    return;
+  }
   // "norpc" models a build that answers the managed lane's requestable frames
   // with the real unknown-command error, so the capability probe can classify
   // them as absent rather than as present-but-refused.

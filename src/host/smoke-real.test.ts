@@ -419,6 +419,15 @@ async function scenario(deadlineAt: number): Promise<void> {
   const result1 = expectCompleted(turn1, run1Id);
   // The accepted frame names the real worker process the supervisor spawned.
   expect(turn1.accepted.worker.pid, "run.accepted must name a live worker pid").toBeGreaterThan(0);
+  // The worker answered its own capability frames after the session opened, so
+  // no run has to warn about a surface it cannot see.
+  // This run offers no connection tools, so the worker is never asked for
+  // `set_host_tools`; unknown is the honest answer there, and it is an info
+  // note, not a warning. The two frames the run does use must be present.
+  const workerCapabilities = turn1.accepted.workerCapabilities;
+  expect(workerCapabilities?.get_session_stats, "the live worker answers get_session_stats").toBe("yes");
+  expect(workerCapabilities?.set_subagent_subscription, "the live worker answers set_subagent_subscription").toBe("yes");
+  expect(workerCapabilities?.set_host_tools, "an unused frame is never reported as missing").not.toBe("no");
   expect(turn1.accepted.reusedWorker, "the first run cannot reuse a worker").toBe(false);
   expect(turn1.accepted.sessionOpening, "the first run opens a new session").toBe("new");
   // The reported path is the worker's stable pointer, not the run file: the
@@ -475,6 +484,15 @@ async function scenario(deadlineAt: number): Promise<void> {
     second.close();
   }
   const result2 = expectCompleted(turn2, run2Id);
+
+  // An unprobed surface is an info note (and only once per worker epoch); no
+  // run may warn "could not be probed" about a worker that answered.
+  for (const turn of [turn1, turn2]) {
+    for (const frame of turn.events) {
+      if (frame.type !== "run.event" || frame.kind !== "run.system") continue;
+      expect(String(frame.payload.message ?? ""), "no unknown-probe warning").not.toContain("could not be probed");
+    }
+  }
 
   expect(turn2.accepted.reusedWorker, "the second run reuses the warm worker").toBe(true);
   expect(turn2.accepted.worker.pid, "a reused worker keeps its pid").toBe(turn1.accepted.worker.pid);

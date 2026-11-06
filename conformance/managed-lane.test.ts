@@ -40,14 +40,24 @@ describe("managed-lane conformance", () => {
     const run = createOmpAcpExecutor();
 
     const events: string[] = [];
+    const warnings: string[] = [];
     const usages: AdapterUsageCheckpoint[] = [];
     const cold = await run(ctx(config, {
-      onEvent: async (event) => { events.push(`${event.eventType}:${event.level ?? "info"}`); },
+      onEvent: async (event) => {
+        events.push(`${event.eventType}:${event.level ?? "info"}`);
+        if (event.level === "warn") warnings.push(event.message ?? "");
+      },
       onUsage: async (receipt) => { usages.push(receipt); },
     }));
     // `toMatchObject` prints the whole result, so a failure names the error
     // code and message instead of just an exit-code mismatch.
     expect(cold).toMatchObject({ exitCode: 0 });
+    // A worker that answers every managed frame yields no capability warning:
+    // the accepted frame's observations are all `yes`, not a degraded guess.
+    expect(warnings.filter((message) =>
+      message.includes("usage receipt")
+      || message.includes("connection tools are unavailable")
+      || message.includes("subagent observability"))).toEqual([]);
     expect(cold.usage).toEqual({ inputTokens: 110, outputTokens: 20, cachedInputTokens: 40 });
     expect(usages).toHaveLength(1);
 

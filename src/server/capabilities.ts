@@ -1,6 +1,7 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import type { AdapterEnvironmentCheck } from "@paperclipai/adapter-utils";
 import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
@@ -161,6 +162,40 @@ export function capabilityCacheDir(): string {
 /** Test seam: drop the process cache (the persisted file is per cacheDir). */
 export function clearCapabilityCache(): void {
   cache.clear();
+  clearCapabilityDiagnostics();
+}
+
+/**
+ * Capability-set keys whose unknown row has already been reported. A probe that
+ * cannot complete proves nothing about the build, so its note is emitted once
+ * instead of being repeated on every run (which trains operators to ignore it).
+ */
+const emittedUnknown = new Map<string, Set<CapabilityId>>();
+
+/**
+ * Per worker epoch, the last state each managed surface was observed in. A
+ * worker that first answered `Unknown command` and later serves the frame is
+ * the one case that needs a correcting note; everything else is either a fact
+ * about the build or a transient "could not look".
+ */
+const workerEpochs = new Map<string, Map<CapabilityId, { state: CapabilityState; withdrawn: boolean }>>();
+
+/** Cap on retained diagnostic state; older epochs are evicted oldest-first. */
+const DIAGNOSTIC_STATE_CAP = 256;
+
+/** Test seam: forget which unknown rows and withdrawals were reported. */
+export function clearCapabilityDiagnostics(): void {
+  emittedUnknown.clear();
+  workerEpochs.clear();
+}
+
+/** Keep the process-lifetime bookkeeping bounded on a long-lived host. */
+function boundDiagnosticState(state: Map<string, unknown>): void {
+  while (state.size > DIAGNOSTIC_STATE_CAP) {
+    const oldest = state.keys().next().value;
+    if (oldest === undefined) return;
+    state.delete(oldest);
+  }
 }
 
 export function capabilityCacheKey(input: CapabilityProbeInput): string {
@@ -333,6 +368,11 @@ function spawnProbe(worker: CapabilityCommand): ProbeChild | null {
  * The managed worker's requestable frames, over the same `--mode rpc` spawn the
  * supervisor uses. A frame answers `success` (present), `Unknown command: x`
  * (absent), or any other refusal — which still proves the command exists.
+ *
+ * The frames are asked only after a session is open: an omp worker without a
+ * session is not the state a run probes from, and the session is opened in a
+ * throwaway directory so the build probe never leaves a session in the
+ * operator's (or an agent's) store.
  */
 function probeRpcFrames(
   worker: CapabilityCommand,
@@ -343,6 +383,8 @@ function probeRpcFrames(
   };
   const child = spawnProbe(worker);
   if (child === null) return Promise.resolve(results);
+  let sessionDir: string | null = null;
+  let opening = false;
   const { promise, resolve } = Promise.withResolvers<Record<ProbedRpcFrame, CapabilityState>>();
   let settled = false;
   const finish = () => {
@@ -350,9 +392,18 @@ function probeRpcFrames(
     settled = true;
     clearTimeout(timer);
     child.process.kill("SIGKILL");
+    if (sessionDir !== null) void fs.rm(sessionDir, { recursive: true, force: true });
     resolve(results);
   };
   const timer = setTimeout(finish, timeoutMs);
+  let framesSent = false;
+  const askFrames = () => {
+    if (framesSent) return;
+    framesSent = true;
+    child.write({ id: "probe-stats", type: "get_session_stats" });
+    child.write({ id: "probe-tools", type: "set_host_tools", tools: [] });
+    child.write({ id: "probe-subagents", type: "set_subagent_subscription", level: "off" });
+  };
   // Frames are newline-delimited and can straddle a chunk boundary, so keep
   // the unterminated tail for the next chunk instead of dropping it.
   let pending = "";
@@ -366,9 +417,23 @@ function probeRpcFrames(
       if (typeof frame !== "object" || frame === null) continue;
       const record = frame as Record<string, unknown>;
       if (record.type === "ready") {
-        child.write({ id: "probe-stats", type: "get_session_stats" });
-        child.write({ id: "probe-tools", type: "set_host_tools", tools: [] });
-        child.write({ id: "probe-subagents", type: "set_subagent_subscription", level: "off" });
+        if (opening || sessionDir !== null) continue;
+        opening = true;
+        void fs.mkdtemp(path.join(os.tmpdir(), "omp-cap-probe-")).then(
+          (dir) => {
+            if (settled) {
+              void fs.rm(dir, { recursive: true, force: true });
+              return;
+            }
+            sessionDir = dir;
+            child.write({ id: "probe-session", type: "open_session", sessionDir: dir });
+          },
+          () => askFrames(),
+        );
+        continue;
+      }
+      if (record.type === "response" && record.command === "open_session") {
+        askFrames();
         continue;
       }
       if (record.type !== "response" || typeof record.command !== "string") continue;
@@ -619,7 +684,7 @@ const DEGRADATION: Record<CapabilityId, {
       message: "this omp build does not advertise ACP session/list; the session snapshot work product will be skipped rather than widened to a host-wide listing",
     },
     unknown: {
-      level: "warn",
+      level: "info",
       code: "omp_capability_unknown",
       message: "the ACP handshake could not report session/list, so the session snapshot work product cannot be promised",
     },
@@ -631,7 +696,7 @@ const DEGRADATION: Record<CapabilityId, {
       message: "this omp build advertises no ACP session/fork; a sessionForkSourceId run fails to fork and continues on a fresh session",
     },
     unknown: {
-      level: "warn",
+      level: "info",
       code: "omp_capability_unknown",
       message: "the ACP handshake could not report session/fork, so a fork directive cannot be promised",
     },
@@ -667,7 +732,7 @@ const DEGRADATION: Record<CapabilityId, {
       message: "the ACP handshake advertised no `mode` config option, so omp's own mode selection is inert for this agent",
     },
     unknown: {
-      level: "warn",
+      level: "info",
       code: "omp_capability_unknown",
       message: "the config-option id set could not be read, so model/mode/thinking selection cannot be verified",
     },
@@ -679,7 +744,7 @@ const DEGRADATION: Record<CapabilityId, {
       message: "the ACP handshake advertised no `model` config option, so the adapter cannot report the active model and model selection may be inert",
     },
     unknown: {
-      level: "warn",
+      level: "info",
       code: "omp_capability_unknown",
       message: "the config-option id set could not be read, so model selection cannot be verified",
     },
@@ -691,7 +756,7 @@ const DEGRADATION: Record<CapabilityId, {
       message: "the ACP handshake advertised no `thinking` config option; the thinking level reaches omp only through its settings overlay, not as a live session option",
     },
     unknown: {
-      level: "warn",
+      level: "info",
       code: "omp_capability_unknown",
       message: "the config-option id set could not be read, so the thinking level's delivery cannot be verified",
     },
@@ -703,7 +768,7 @@ const DEGRADATION: Record<CapabilityId, {
       message: "`session.maxCost` is not a setting on this omp build; the governance budget hard stop is absent and only the bridge's soft per-call cap applies",
     },
     unknown: {
-      level: "warn",
+      level: "info",
       code: "omp_capability_unknown",
       message: "the omp settings key map could not be read, so the budget hard stop cannot be verified",
     },
@@ -715,7 +780,7 @@ const DEGRADATION: Record<CapabilityId, {
       message: "`tools.restrictedFolders` is not a setting on this omp build; a folder fence in the governance policy cannot be enforced",
     },
     unknown: {
-      level: "warn",
+      level: "info",
       code: "omp_capability_unknown",
       message: "the omp settings key map could not be read, so the folder fence cannot be verified",
     },
@@ -727,7 +792,7 @@ const DEGRADATION: Record<CapabilityId, {
       message: "`defaultThinkingLevel` is not a setting on this omp build; the thinking-level overlay is inert and the session keeps whatever level omp resolves",
     },
     unknown: {
-      level: "warn",
+      level: "info",
       code: "omp_capability_unknown",
       message: "the omp settings key map could not be read, so the thinking overlay cannot be verified",
     },
@@ -787,7 +852,7 @@ const DEGRADATION: Record<CapabilityId, {
       message: "the managed worker cannot answer `get_session_stats`; a managed run reports no usage receipt",
     },
     unknown: {
-      level: "warn",
+      level: "info",
       code: "omp_capability_unknown",
       message: "`get_session_stats` could not be probed on the worker; the managed run's usage receipt cannot be promised",
     },
@@ -799,7 +864,7 @@ const DEGRADATION: Record<CapabilityId, {
       message: "the managed worker cannot receive host tools; Paperclip's connection tools never reach the agent on this build",
     },
     unknown: {
-      level: "warn",
+      level: "info",
       code: "omp_capability_unknown",
       message: "`set_host_tools` could not be probed on the worker; connection-tool delivery cannot be promised",
     },
@@ -811,7 +876,7 @@ const DEGRADATION: Record<CapabilityId, {
       message: "the managed worker has no subagent subscription; subagentObservability stays off and the run reports no subagent events",
     },
     unknown: {
-      level: "warn",
+      level: "info",
       code: "omp_capability_unknown",
       message: "`set_subagent_subscription` could not be probed on the worker; subagent observability cannot be promised",
     },
@@ -888,6 +953,10 @@ export interface CapabilityDiagnostic {
  * The named diagnostics for THIS run: only the features it depends on, so a
  * default heartbeat on a healthy build logs nothing. An absent capability names
  * the feature and what happens instead; it never refuses the run.
+ *
+ * A `unknown` row is not evidence of a missing surface, so it is an `info` note
+ * emitted once per capability set (the build did not answer, not "the feature
+ * is gone"); an absent row keeps warning on every call.
  */
 export function capabilityDiagnostics(
   set: CapabilitySet,
@@ -895,15 +964,105 @@ export function capabilityDiagnostics(
 ): CapabilityDiagnostic[] {
   const diagnostics: CapabilityDiagnostic[] = [];
   for (const feature of new Set(features)) {
-    const capability = set.capabilities[FEATURE_CAPABILITY[feature]];
+    const id = FEATURE_CAPABILITY[feature];
+    const capability = set.capabilities[id];
     if (capability === undefined) continue;
     // A wrapper's settings are not omp's, so a fence/budget claim cannot be
     // made either way; the environment test reports the version as unverified.
     if (!set.surfaceProbed && (feature === "budgetHardCap" || feature === "folderFence")) continue;
     if (capability.state === "yes") continue;
-    const row = capability.state === "no" ? DEGRADATION[FEATURE_CAPABILITY[feature]].absent
-      : DEGRADATION[FEATURE_CAPABILITY[feature]].unknown;
+    const row = capability.state === "no" ? DEGRADATION[id].absent : DEGRADATION[id].unknown;
+    if (capability.state === "unknown") {
+      if (!emittedUnknown.has(set.key)) boundDiagnosticState(emittedUnknown);
+      const seen = emittedUnknown.get(set.key) ?? new Set<CapabilityId>();
+      emittedUnknown.set(set.key, seen);
+      if (seen.has(id)) continue;
+      seen.add(id);
+    }
     diagnostics.push({ level: row.level, code: row.code, message: row.message });
+  }
+  return diagnostics;
+}
+
+/** The live worker's answer for each managed surface. */
+export interface WorkerCapabilityObservations {
+  get_session_stats: CapabilityState;
+  set_host_tools: CapabilityState;
+  set_subagent_subscription: CapabilityState;
+}
+
+const FEATURE_LABEL: Partial<Record<CapabilityFeature, string>> = {
+  managedUsage: "the managed usage receipt",
+  managedHostTools: "connection-tool delivery",
+  managedSubagents: "subagent observability",
+};
+
+const WORKER_FRAME_CAPABILITY: Record<ProbedRpcFrame, CapabilityId> = {
+  get_session_stats: "rpc.get_session_stats",
+  set_host_tools: "rpc.set_host_tools",
+  set_subagent_subscription: "rpc.set_subagent_subscription",
+};
+
+const CAPABILITY_WORKER_FRAME = new Map<CapabilityId, ProbedRpcFrame>(
+  Object.entries(WORKER_FRAME_CAPABILITY).map(([frame, id]) => [id, frame as ProbedRpcFrame]),
+);
+
+/**
+ * Diagnostics for the managed surfaces observed on THIS worker, in its own
+ * epoch (one worker process: argv + bridge + pid).
+ *
+ * - `unknown` (the frame did not answer in time) is an `info` note, once per
+ *   epoch: a probe that cannot complete proves nothing.
+ * - `no` (`Unknown command`) is a `warn`, repeated because the surface really
+ *   is absent on this worker.
+ * - A surface that warned and later answers `yes` gets one `info` withdrawal
+ *   for that epoch, and no further warning is produced for it.
+ */
+export function workerCapabilityDiagnostics(
+  observations: WorkerCapabilityObservations,
+  features: readonly CapabilityFeature[],
+  epoch: string,
+): CapabilityDiagnostic[] {
+  if (!workerEpochs.has(epoch)) boundDiagnosticState(workerEpochs);
+  const observed = workerEpochs.get(epoch) ?? new Map<CapabilityId, { state: CapabilityState; withdrawn: boolean }>();
+  workerEpochs.set(epoch, observed);
+  const diagnostics: CapabilityDiagnostic[] = [];
+  for (const feature of new Set(features)) {
+    const id = FEATURE_CAPABILITY[feature];
+    const frame = CAPABILITY_WORKER_FRAME.get(id);
+    if (frame === undefined) continue;
+    const state = observations[frame];
+    const previous = observed.get(id);
+    if (state === "yes") {
+      if (previous?.state === "no" && !previous.withdrawn) {
+        diagnostics.push({
+          level: "info",
+          code: "omp_capability_observed",
+          message: `\`${frame}\` answered on this worker; the earlier warning that ${FEATURE_LABEL[feature] ?? feature} was unavailable is withdrawn for this worker`,
+        });
+      }
+      observed.set(id, { state: "yes", withdrawn: true });
+      continue;
+    }
+    if (state === "unknown") {
+      // The note is emitted once per epoch. A surface that was absent and is
+      // now unprobed is not re-noted: the absence warning already stands.
+      if (previous === undefined) {
+        diagnostics.push({
+          level: DEGRADATION[id].unknown.level,
+          code: DEGRADATION[id].unknown.code,
+          message: DEGRADATION[id].unknown.message,
+        });
+      }
+      observed.set(id, { state: "unknown", withdrawn: previous?.withdrawn ?? false });
+      continue;
+    }
+    diagnostics.push({
+      level: DEGRADATION[id].absent.level,
+      code: DEGRADATION[id].absent.code,
+      message: DEGRADATION[id].absent.message,
+    });
+    observed.set(id, { state: "no", withdrawn: false });
   }
   return diagnostics;
 }

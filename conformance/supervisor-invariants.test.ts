@@ -177,7 +177,7 @@ describe("supervisor invariants", () => {
         sessionKey: "paperclip:co-1:agent-ttl:task",
         cwd: env.home,
         session: { ompSessionId: null },
-        cell: { argvHash: "conformance", bridgeHash: "conformance", agentDir: null, model: null, thinking: null, approval: null },
+        cell: { argvHash: "conformance", bridgeHash: "conformance", agentDir: null, profile: null, model: null, thinking: null, approval: null },
         worker: {
           command: config.command as string,
           args: ["--mode", "rpc"],
@@ -198,7 +198,20 @@ describe("supervisor invariants", () => {
         5_000,
       );
       expect(accepted.type).toBe("run.accepted");
-      const workerPid = accepted.type === "run.accepted" ? accepted.worker.pid : 0;
+      if (accepted.type !== "run.accepted") throw new Error("unreachable");
+      // The accepted frame carries what the run's own worker answered for the
+      // managed frames it was asked: the two it served are `yes`; host tools
+      // were never requested, so the row stays `unknown` rather than `no`.
+      const capabilities = accepted.workerCapabilities;
+      expect(Object.keys(capabilities ?? {}).sort())
+        .toEqual(["get_session_stats", "set_host_tools", "set_subagent_subscription"]);
+      for (const state of Object.values(capabilities ?? {})) {
+        expect(["yes", "no", "unknown"]).toContain(state);
+      }
+      expect(capabilities?.get_session_stats).toBe("yes");
+      expect(capabilities?.set_subagent_subscription).toBe("yes");
+      expect(capabilities?.set_host_tools).toBe("unknown");
+      const workerPid = accepted.worker.pid;
 
       const settled = await client.waitFor(
         (frame) => frame.type === "run.settled" && frame.runId === "run-ttl",
@@ -260,6 +273,13 @@ describe("supervisor invariants", () => {
         && message.includes("Unknown command: set_host_tools"))).toBe(true);
       expect(warnings.some((message) => message.includes("this run's usage is unknown"))).toBe(true);
       expect(warnings.some((message) => message.includes("subagent observability is unavailable"))).toBe(true);
+      // The accepted frame's observations name the managed surfaces the
+      // worker refused, independent of the supervisor's per-request warnings.
+      expect(warnings.some((message) =>
+        message.includes("get_session_stats") && message.includes("usage receipt"))).toBe(true);
+      expect(events.some((event) => event.level === "warn"
+        && event.payload?.code === "omp_rpc_subagent_subscription_missing"
+        && (event.message ?? "").includes("subagent subscription"))).toBe(true);
 
       // The settle frame precedes the supervisor's final `closed` record.
       const ledger = await vi.waitFor(async () => {

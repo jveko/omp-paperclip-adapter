@@ -16,6 +16,7 @@ import {
   HOST_PROTOCOL_VERSION, encodeFrame, parseFrame, isHostFrame,
   type HostFrame, type HostReply, type HostRuntime, type LedgerCause, type RunBeginFrame,
   type RunEventKind, type RunSettledFrame, type SettledBy,
+  type WorkerCapabilityObservations,
 } from "./protocol.js";
 import { clearRunContext, reapRunContexts, runContextPointer, writeRunContext } from "./run-context.js";
 import {
@@ -132,6 +133,12 @@ interface WorkerEntry {
   sessionFile: string | null;
   /** The last settle snapshot this worker reported; the next run's baseline. */
   settledUsage: UsageBaseline | null;
+  /**
+   * This worker's answer for the managed frames, probed once after its first
+   * session opened. Persisted on the entry so a warm worker is never re-probed
+   * and every run on it reads the same evidence.
+   */
+  capabilities: WorkerCapabilityObservations;
   currentRun: string | null;
   lastUsedAt: number;
 }
@@ -909,19 +916,30 @@ class Supervisor {
         ...(run.sessionFile !== null ? { sessionFile: run.sessionFile } : {}),
       }));
 
-      run.statsBefore = readStats(await worker.worker.getStats().catch(() => ({})));
+      // The run's own calls ARE the probe: they happen after the session is
+      // open, on the worker this run will use, and their answers are cached on
+      // the worker entry (one observation per worker epoch, never a second
+      // spawn or duplicate frame).
+      const statsData = await this.workerFrame(worker, "get_session_stats", { type: "get_session_stats" });
+      run.statsBefore = readStats(statsData ?? {});
 
       // Subscribe before the prompt so the run sees subagents it starts. omp
       // filters at the subscription; `off` still has to be sent to clear a level
       // a previous run left on a warm worker.
       const wantedLevel = rpcSubagentLevel(begin.subagentObservability ?? "summary");
-      try {
-        run.subagentLevel = await worker.worker.setSubagentSubscription(wantedLevel);
-      } catch (err) {
+      const subscription = await this.workerFrame(worker, "set_subagent_subscription", {
+        type: "set_subagent_subscription", level: wantedLevel,
+      });
+      if (subscription === null) {
         this.emitEvent(run, "run.system", {
           level: "warn",
-          message: `omp subagent observability is unavailable this run (${err instanceof Error ? err.message : String(err)}); continuing without it`,
+          message: "omp subagent observability is unavailable this run (the worker did not accept the subscription); continuing without it",
         });
+      } else {
+        const applied = subscription.level;
+        run.subagentLevel = applied === "off" || applied === "progress" || applied === "events"
+          ? applied
+          : wantedLevel;
       }
 
       if (begin.connectionTools !== undefined && begin.connectionTools !== null) {
@@ -989,6 +1007,48 @@ class Supervisor {
     }
   }
 
+  /**
+   * Record what this worker answered for one managed frame. A resolved
+   * response proves the command exists; a rejection carrying `Unknown command`
+   * proves it does not; any other failure (a timeout, a dead worker) proves
+   * nothing and leaves the row `unknown`. Returns the response data, or null
+   * when the worker did not serve the frame.
+   */
+  private async workerFrame(
+    worker: WorkerEntry,
+    frame: keyof WorkerCapabilityObservations,
+    command: RpcFrame,
+  ): Promise<Record<string, unknown> | null> {
+    try {
+      const response = await worker.worker.request(command);
+      worker.capabilities[frame] = "yes";
+      return (response.data ?? {}) as Record<string, unknown>;
+    } catch (err) {
+      // `request` rejects a failed response, so the refusal arrives here: the
+      // explicit `Unknown command` is an absence; any other failure (a timeout,
+      // a dead worker) proves nothing and stays unknown.
+      const message = err instanceof Error ? err.message : String(err);
+      if (/Unknown command/i.test(message)) worker.capabilities[frame] = "no";
+      return null;
+    }
+  }
+
+  /**
+   * A successful use is better evidence than an earlier refusal: if the worker
+   * first said `Unknown command` and then serves the frame, the next run's
+   * accepted frame carries `yes` and the adapter withdraws its warning for
+   * this worker.
+   */
+  private recordWorkerCapability(worker: WorkerEntry, frame: keyof WorkerCapabilityObservations): void {
+    worker.capabilities[frame] = "yes";
+  }
+
+  /** A refusal names the frame; only `Unknown command` proves it is missing. */
+  private recordWorkerRefusal(worker: WorkerEntry, frame: keyof WorkerCapabilityObservations, err: unknown): void {
+    const message = err instanceof Error ? err.message : String(err);
+    worker.capabilities[frame] = /Unknown command/i.test(message) ? "no" : "unknown";
+  }
+
   private sendAccepted(connection: Connection, run: RunState): void {
     this.send(connection, {
       type: "run.accepted",
@@ -1003,6 +1063,7 @@ class Supervisor {
       sessionOpening: run.sessionOpening,
       ompSessionId: run.ompSessionId,
       runContextPath: run.runContextPath,
+      workerCapabilities: run.worker.capabilities,
     });
   }
 
@@ -1201,7 +1262,16 @@ class Supervisor {
         description: tool.description,
         parameters: tool.inputSchema,
         loadMode: "essential",
-      })));
+      }))).then(
+        (installed) => {
+          this.recordWorkerCapability(run.worker, "set_host_tools");
+          return installed;
+        },
+        (err: unknown) => {
+          this.recordWorkerRefusal(run.worker, "set_host_tools", err);
+          throw err;
+        },
+      );
       run.worker.worker.onHostToolCall(async (frame) => {
         const toolName = typeof frame.toolName === "string" ? frame.toolName : "";
         if (!selected.some((tool) => tool.name === toolName)) {
@@ -1669,6 +1739,11 @@ class Supervisor {
       ompSessionId: null,
       sessionFile: null,
       settledUsage: null,
+      capabilities: {
+        get_session_stats: "unknown",
+        set_host_tools: "unknown",
+        set_subagent_subscription: "unknown",
+      },
       currentRun: null,
       lastUsedAt: Date.now(),
     };

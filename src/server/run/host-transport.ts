@@ -14,6 +14,9 @@ import { buildWorkerArgv, buildWorkerEnv } from "../../host/worker.js";
 import { resolveSteering, resolveSubagentObservability } from "../session-directives.js";
 import { sessionLeaseKey } from "../session-lease.js";
 import { firstNonEmptyString, packageRootDir } from "../adapters/acp/launch.js";
+import {
+  workerCapabilityDiagnostics, type CapabilityFeature,
+} from "../capabilities.js";
 import { resolveOmpBillingIdentity } from "./billing.js";
 import { buildManagedPrompt } from "./prompt.js";
 import type { RunPlan } from "./run-plan.js";
@@ -404,6 +407,7 @@ export function createHostTransport(options: HostTransportOptions): ManagedRun {
         argvHash: createHash("sha256").update([workerArgv.command, ...workerArgv.args].join("\u0000")).digest("hex").slice(0, 16),
         bridgeHash: await bridgeHash(options.bridge),
         agentDir: firstNonEmptyString(env.PI_CODING_AGENT_DIR) ?? null,
+        profile: firstNonEmptyString(env.OMP_PROFILE) ?? null,
         model: firstNonEmptyString(plan.runChildConfig.model) ?? null,
         thinking: plan.requestedThinking === "" ? null : plan.requestedThinking,
         approval: firstNonEmptyString(ctx.config.approvalMode, ctx.config.permissionMode) ?? null,
@@ -477,6 +481,24 @@ export function createHostTransport(options: HostTransportOptions): ManagedRun {
     });
 
     function reportSpawn(frame: RunAcceptedFrame): void {
+      // The worker answered for itself: report only what IT will serve. An
+      // unprobed frame is an info note once per worker epoch; an absent one is
+      // a warn; one that warned and later answered is withdrawn once.
+      if (frame.workerCapabilities !== undefined) {
+        const features: CapabilityFeature[] = ctx.runtimeTools !== undefined
+          ? ["managedUsage", "managedSubagents", "managedHostTools"]
+          : ["managedUsage", "managedSubagents"];
+        const epoch = `${begin.cell.argvHash}:${begin.cell.bridgeHash}:${frame.worker.pid}`;
+        for (const diagnostic of workerCapabilityDiagnostics(frame.workerCapabilities, features, epoch)) {
+          void ctx.onEvent?.({
+            eventType: "run.system",
+            stream: "system",
+            level: diagnostic.level,
+            message: diagnostic.message,
+            payload: { level: diagnostic.level, message: diagnostic.message, code: diagnostic.code },
+          });
+        }
+      }
       if (spawnReported) return;
       spawnReported = true;
       void ctx.onSpawn?.({

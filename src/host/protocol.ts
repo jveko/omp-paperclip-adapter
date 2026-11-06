@@ -53,6 +53,8 @@ export interface Cell {
   argvHash: string;
   bridgeHash: string;
   agentDir: string | null;
+  /** The named omp profile this run uses (`sessionScope: "profile"`), else null. */
+  profile: string | null;
   model: string | null;
   thinking: string | null;
   approval: string | null;
@@ -205,6 +207,21 @@ export interface RunAcceptedFrame {
   sessionOpening: "new" | "open";
   ompSessionId: string;
   runContextPath: string;
+  /**
+   * What this worker answered for the managed frames, observed on the run's
+   * own calls after its session opened. Absent from a supervisor that predates
+   * the probe; the adapter then reports no managed-capability diagnostics.
+   */
+  workerCapabilities?: WorkerCapabilityObservations;
+}
+
+/** The managed worker's answer for one requestable frame. */
+export type WorkerCapabilityState = "yes" | "no" | "unknown";
+
+export interface WorkerCapabilityObservations {
+  get_session_stats: WorkerCapabilityState;
+  set_host_tools: WorkerCapabilityState;
+  set_subagent_subscription: WorkerCapabilityState;
 }
 
 /**
