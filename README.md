@@ -90,7 +90,7 @@ The board renders the adapter's full schema. The common fields:
 | `env` | `{}` | includes `OMP_PAPERCLIP_BILLING_TYPE` (`api` or `subscription`) |
 | `instructionsFilePath`, `cwd` | unset | passed through to the run child |
 | `credentialMode` | `local` | `broker` requires `OMP_AUTH_BROKER_URL` / `OMP_AUTH_BROKER_TOKEN` via `secret_ref` |
-| `sessionScope` | broker: `isolated`; otherwise `shared` | `isolated` = this agent's own omp agent dir (per employee, requires `credentialMode: broker`). `shared` = omp's host agent dir, where every employee on the host shares sessions — an explicit `shared` under broker credentials warns about that cross-tenant reach |
+| `sessionScope` | broker: `isolated`; otherwise `shared` | `isolated` = this agent's own omp agent dir under the Paperclip instance (per employee, requires `credentialMode: broker`). `profile` = a named omp profile (`OMP_PROFILE=pc-<instance>-<company>-<agent>`) at `$HOME/.omp/profiles/<name>`, outside the instance root (also requires broker credentials; refuses a concurrent `PI_CODING_AGENT_DIR`). `shared` = omp's host agent dir, where every employee shares sessions — an explicit `shared` under broker credentials warns about that cross-tenant reach |
 | `sessionBrowser` | `true` | emit a session-snapshot work product when the landscape changes |
 | `sessionSnapshotDiagnostic` | `false` | log counts from omp's host-wide `_omp/*` listing (never ids, cwds or titles) |
 | `sessionForkSourceId` / `sessionForkToken` / `sessionForceFreshToken` | unset | fork or reset the next session |

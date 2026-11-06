@@ -143,7 +143,8 @@ check below) and these `code` values:
 | `omp_version` | info | message names `18.13.x` or `18.14.x`; `omp_version_untested_minor` is a warning, `omp_version_unsupported` is an error |
 | `acp_handshake_ok` | info | `omp acp` answered `initialize` + `session/new` (hard gate; `acp_handshake_failed` is an error) |
 | `omp_capabilities` | info | `n/m` probed surfaces present |
-| `omp_sessions_shared` / `omp_sessions_isolated` | warn / info | the session scope this agent will run under |
+| `<surface>` capability rows | warn only when absent | a surface the probe could not verify is an `info` note, never a warning: an unanswered probe is not a missing surface |
+| `omp_sessions_shared` / `omp_sessions_isolated` / `omp_sessions_profile` | warn / info / info | the session scope this agent will run under |
 
 ### 2b. Model catalog
 

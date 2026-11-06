@@ -29,7 +29,7 @@ fork, \`_omp/*\`, model discovery, the environment probe).
 | \`timeoutSec\` | 0 | run deadline; 0 = unlimited. Cancellation grace is the supervisor's 5 s (\`OMP_HOST_CANCEL_GRACE_MS\`) |
 | \`env\` | \`{}\` | incl. \`OMP_PAPERCLIP_BILLING_TYPE\` (\`api\` or \`subscription\`) |
 | \`instructionsFilePath\`, \`cwd\` | unset | passed through to the run child |
-| \`sessionScope\` | broker: \`isolated\`; otherwise \`shared\` | \`isolated\` = this agent's own omp agent dir (requires \`credentialMode: broker\`); \`shared\` = the host's one omp agent dir (a cross-tenant choice under broker credentials) |
+| \`sessionScope\` | broker: \`isolated\`; otherwise \`shared\` | \`isolated\` = this agent's own omp agent dir (requires \`credentialMode: broker\`); \`profile\` = a named omp profile at \`$HOME/.omp/profiles/<name>\` (also requires broker credentials, refuses \`PI_CODING_AGENT_DIR\`); \`shared\` = the host's one omp agent dir (a cross-tenant choice under broker credentials) |
 | \`sessionSnapshotDiagnostic\` | \`false\` | log counts from omp's host-wide \`_omp/*\` listing (never ids, cwds or titles) |
 | \`subagentObservability\` | \`summary\` | \`off\` / \`summary\` / \`events\` |
 
@@ -106,15 +106,32 @@ fork, \`_omp/*\`, model discovery, the environment probe).
   \`isolated\` without the broker fails the run and the environment test with
   \`omp_config_error\`. The adapter never copies, links or moves a credential
   store.
+- \`profile\` uses omp's own named profile instead of an agent dir:
+  \`OMP_PROFILE=pc-<instance>-<company>-<agent>\` (sanitized, at most 64 chars,
+  stable per agent) makes every omp store resolve under
+  \`$HOME/.omp/profiles/<name>\`. That path is outside the Paperclip instance
+  root by design: \`PI_CONFIG_DIR\` is a NAME joined under the home, so
+  instance-root placement is not possible. It requires \`credentialMode: broker\`
+  for the same reason \`isolated\` does, and refuses a concurrent
+  \`PI_CODING_AGENT_DIR\` because named profiles ignore it. A fresh profile
+  starts with an empty catalog (\`omp models ls --json\` returns
+  \`{"models":[]}\`), so its first run refreshes it, and it is removed with
+  \`omp-host profile rm <name>\` rather than with instance cleanup. The tradeoff
+  against \`isolated\` is uniform: \`isolated\` keeps every byte inside the
+  instance root, \`profile\` keeps omp's own state outside it. The environment
+  test cannot name an agent's profile (Paperclip's test context carries no
+  agent id), so its catalog/hello checks run against the default store; the
+  run's own worker probe and every side channel use the agent's profile.
 - The operator's \`config.yml\` from the shared agent dir is folded back in via
-  \`PI_CONFIG_FILES\` at the lowest precedence, so providers and model roles keep
-  working after the switch. \`models.yml\` and \`secrets.yml\` cannot be carried
+  \`PI_CONFIG_FILES\` at the lowest precedence for \`isolated\` runs, so providers
+  and model roles keep working after the switch. A \`profile\` run does not fold
+  it in: the profile's own config is what applies. \`models.yml\` and \`secrets.yml\` cannot be carried
   that way: define those providers in \`config.yml\` (or via env) before
   switching, and re-login inside the fenced dir if you need per-employee
   credentials there.
-- Switching scope starts an empty dir, so the employee's previous session is
-  not resumed: the run warns once, naming the previous session's short id, and
-  leaves the old transcript where it was. Reverting to \`shared\` also starts a
+- Switching scope (including to/from \`profile\`) starts an empty store, so the
+  employee's previous session is not resumed: the run warns once, naming the
+  previous session's short id, and leaves the old transcript where it was. Reverting to \`shared\` also starts a
   fresh session (fingerprint and session id come from the run that just
   happened), and warns the same way — the legacy transcript is untouched but is
   not picked up automatically. Resume it explicitly on the host with
@@ -256,12 +273,19 @@ fork, \`_omp/*\`, model discovery, the environment probe).
   \`get_session_stats\` / \`set_host_tools\` / \`set_subagent_subscription\`
   worker frames — and names the feature each absent surface disables. A build
   outside the tested minors is a **warning** that points at those checks; only
-  a different major is an error. The worker-frame group is what the run needs;
-  the ACP group describes the probe lane. Wrapper commands report their own version, so they are
-  reported as unverified rather than failed. The probe is cached per command
-  and environment; the run path only reads that cache and never spawns a probe
-  of its own. \`omp models ls --json\` is unversioned; the catalog is parsed by
-  field, so a missing or future \`schemaVersion\` is inert.
+  a different major is an error. The ACP group describes the probe lane; the
+  worker frames are observed on the RUN's own worker, after its session opens,
+  by the calls the run already makes (stats, subagent subscription, host
+  tools). The result is cached per worker epoch and carried on \`run.accepted\`.
+  A frame that does not answer is an \`info\` note, once per worker epoch — an
+  unanswered probe is not a missing surface — while a frame the worker answers
+  \`Unknown command\` is a warning naming the feature it disables; if that
+  worker later serves the frame, one \`info\` note withdraws the warning for it.
+  Wrapper commands report their own version, so they are reported as unverified
+  rather than failed. The ACP/settings/CLI probe is cached per command and
+  environment; the run path does not read it — the managed frames come from the
+  run's own live worker. \`omp models ls --json\` is unversioned; the catalog is
+  parsed by field, so a missing or future \`schemaVersion\` is inert.
 - A provider-qualified model selector (anything containing \`/\`) must be an
   exact catalog id, for \`model\` and every \`fallbackChain\` leg. omp 18.14
   resolves such a selector exactly: a near match fails instead of selecting a
