@@ -39,27 +39,35 @@ custom providers, with rate cards).
 
 ## Install
 
-The adapter is not published to npm. Install it from a clone, after building `dist/`:
+Published on npm as `omp-paperclip-adapter`:
+
+```sh
+npm install omp-paperclip-adapter
+```
+
+Install it into the board from the package name. With an instance-admin credential:
+
+```sh
+curl -X POST http://<host>:3100/api/adapters/install \
+  -H "Authorization: Bearer <board-key>" -H "Content-Type: application/json" \
+  -d '{"packageName": "omp-paperclip-adapter"}'
+```
+
+To install local changes instead, build a checkout and pass it as a local path:
 
 ```sh
 git clone https://github.com/jveko/omp-paperclip-adapter.git
 cd omp-paperclip-adapter
 npm ci
 npm run build
-```
-
-Then, in the board UI: **Settings → Adapters → Install from local path**, pointing at the
-clone. Or, with an instance-admin credential:
-
-```sh
 curl -X POST http://<host>:3100/api/adapters/install \
   -H "Authorization: Bearer <board-key>" -H "Content-Type: application/json" \
   -d '{"packageName": "'"$PWD"'", "isLocalPath": true}'
 ```
 
-Hot-registers — no service restart needed (`requiresRestart` only on reinstall). The
-`omp-host` bin is not put on PATH by installing the adapter; either `npm link` in the
-checkout or use `node "$PWD/dist/omp-host.js"`.
+Hot-registers — no service restart needed (`requiresRestart` only on reinstall). Installing
+the adapter does not put `omp-host` on PATH; run `npx omp-host status` from the install, or
+`npm link` a checkout.
 
 ## Configuration
 
@@ -159,15 +167,18 @@ by itself, so the unit only helps when you want it pinned.
 
 `paperclip-plugin-omp-session/` is a separate Paperclip plugin that adds an agent
 detail tab showing recent runs' session runtime, usage and cost from
-`heartbeat_runs` and `cost_events`. It is a workspace member, so `npm ci` at the
-repository root installs its dependencies.
+`heartbeat_runs` and `cost_events`. It is published as `paperclip-plugin-omp-session`
+and is a workspace member, so `npm ci` at the repository root installs its build
+dependencies.
 
 ```sh
-npm run build:plugin
 curl -X POST http://<host>:3100/api/plugins/install \
   -H "Authorization: Bearer <board-key>" -H "Content-Type: application/json" \
-  -d '{"packageName": "'"$PWD"'/paperclip-plugin-omp-session", "isLocalPath": true}'
+  -d '{"packageName": "paperclip-plugin-omp-session"}'
 ```
+
+To install local changes, run `npm run build:plugin` and pass
+`'{"packageName": "'"$PWD"'/paperclip-plugin-omp-session", "isLocalPath": true}'` instead.
 
 ## Verification
 

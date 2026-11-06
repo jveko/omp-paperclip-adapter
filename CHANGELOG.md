@@ -11,7 +11,14 @@ No behaviour change on a run.
   `build:plugin` / `test:plugin`, aligned esbuild, deduplicated SDK dependency, synced manifest
   version, package LICENSE and no shipped sourcemaps.
 - **CI** runs typecheck, unit, plugin, conformance, both builds and the published file lists.
-- **Docs.** README gains clone→build→install steps, the full common config surface, the plugin
+  It also installs the packed adapter tarball and loads its entry point, and checks the
+  plugin tarball's `manifest.js`/`worker.js`, so a broken `files`/`exports` list fails
+  before publish.
+- **npm releases.** A `v<version>` tag runs `.github/workflows/release.yml`: it rejects a tag
+  that does not match `package.json`, re-runs the full verify suite, publishes both packages
+  with provenance attestations, skips versions already on the registry (re-runs are safe),
+  and creates the GitHub release. `RELEASING.md` has the token setup and the release steps.
+- **Docs.** README gains npm and local-path install steps, the full common config surface, the plugin
   section, verification and a limitations table; SECURITY.md records the trust model; ROADMAP is
   trimmed to open/parked work; LIVE-CHECK drops machine-specific paths.
 - **Ghost knobs removed from the docs** (`mode`, `stateDir`, `nonInteractivePermissions`,

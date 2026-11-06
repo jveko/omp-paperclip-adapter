@@ -39,3 +39,30 @@ jobs:
         run: |
           npm pack --dry-run
           npm pack --dry-run -w paperclip-plugin-omp-session
+
+      # The tarball, not the checkout, is what users install: prove its entry
+      # points load and its bin is executable before a release can ship it.
+      - name: Smoke-test the packed tarballs
+        run: |
+          set -euo pipefail
+          pack_dir="$(mktemp -d)"
+          install_dir="$(mktemp -d)"
+          adapter_tarball="$(npm pack --silent --pack-destination "$pack_dir")"
+          plugin_tarball="$(npm pack --silent --pack-destination "$pack_dir" -w paperclip-plugin-omp-session)"
+
+          npm install --prefix "$install_dir" --no-audit --no-fund \
+            "$pack_dir/$adapter_tarball"
+          node --input-type=module -e "
+            const mod = await import('file://$install_dir/node_modules/omp-paperclip-adapter/dist/index.js');
+            if (mod.type !== 'omp_local') throw new Error('unexpected adapter type: ' + mod.type);
+          "
+          test -x "$install_dir/node_modules/.bin/omp-host"
+
+          # Read the listing once: `tar | grep -q` trips pipefail via SIGPIPE.
+          plugin_files="$(tar -tzf "$pack_dir/$plugin_tarball")"
+          for member in package/dist/manifest.js package/dist/worker.js package/dist/ui/ui.js; do
+            if ! grep -qx "$member" <<<"$plugin_files"; then
+              echo "::error::$plugin_tarball is missing $member"
+              exit 1
+            fi
+          done
