@@ -717,21 +717,39 @@ describe("supervisor", () => {
     }
   }, 30_000);
 
-  it("emits a content-free omp.tool_call event for the worker's tool frames", async () => {
+  it("emits a bounded, redacted omp.tool_call event for the worker's tool frames", async () => {
     const { client } = await runFixture("run-tools", "toolframes");
     try {
       const payloads = client.frames
         .filter((frame): frame is Extract<HostReply, { type: "run.event" }> =>
           frame.type === "run.event" && frame.kind === "omp.tool_call")
         .map((frame) => frame.payload);
-      expect(payloads).toEqual([
-        { phase: "tool_call", toolName: "bash", toolCallId: "tc-1" },
-        { phase: "tool_result", toolName: "bash", toolCallId: "tc-1" },
-      ]);
-      // The worker's args and result never cross the boundary.
-      const wire = JSON.stringify(client.frames);
-      expect(wire).not.toContain("ARG-SENTINEL");
-      expect(wire).not.toContain("RESULT-SENTINEL");
+      expect(payloads).toHaveLength(2);
+      const [start, result] = payloads;
+      // The card needs something to show, but only a bounded, redacted summary
+      // of the arguments: the raw args never cross.
+      expect(start).toMatchObject({ phase: "tool_call", toolName: "bash", toolCallId: "tc-1" });
+      const summary = start?.argsSummary;
+      expect(typeof summary).toBe("string");
+      expect(summary).toContain("ARG-SENTINEL");
+      expect(summary).toContain("[redacted]");
+      expect(summary).not.toContain("abcdefghijklmnop");
+      expect((summary as string).length).toBeLessThanOrEqual(200);
+      expect(result).toEqual({ phase: "tool_result", toolName: "bash", toolCallId: "tc-1" });
+      // The worker's result never crosses the boundary.
+      expect(JSON.stringify(client.frames)).not.toContain("RESULT-SENTINEL");
+
+      // Turn lifecycle frames and a text-less message_end never reach the
+      // board: only a message_end carrying assistant text is a transcript turn.
+      const turns = client.frames
+        .filter((frame): frame is Extract<HostReply, { type: "run.event" }> =>
+          frame.type === "run.event" && frame.kind === "omp.turn")
+        .map((frame) => frame.payload);
+      expect(turns).toEqual([{ messageId: "m1", text: "working" }]);
+      for (const payload of turns) {
+        expect(payload).not.toHaveProperty("event");
+        expect(typeof payload.text).toBe("string");
+      }
     } finally {
       client.close();
     }

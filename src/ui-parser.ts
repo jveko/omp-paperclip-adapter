@@ -15,9 +15,11 @@ import type { TranscriptEntry } from "@paperclipai/adapter-utils";
  *   {"eventType":"omp.log","payload":{"stream":"stderr","chunk":"..."}} -> stderr / stdout
  *
  * Everything else — an unknown event type, a JSON object that is not an event,
- * a malformed line, or plain text — is passed through verbatim as a `stdout`
- * entry. A parser that throws would take the whole transcript down with one bad
- * line.
+ * a malformed line, or plain text — becomes ONE `system` line, never a
+ * `stdout` dump: the board's transcript is a conversation, and a raw frame is
+ * at most a diagnostic note. Control-only frames (agent/turn/message
+ * lifecycle, a bare message id) carry no content and produce nothing. A parser
+ * that throws would take the whole transcript down with one bad line.
  */
 
 /** The label for a tool event that carries no usable name. */
@@ -44,9 +46,45 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value as Record<string, unknown>;
 }
 
-function stdout(line: string, ts: string): TranscriptEntry[] {
-  return [{ kind: "stdout", ts, text: line }];
+/** Cap on one rendered fallback line: a raw frame must not dump the board. */
+const FALLBACK_TEXT_CAP = 1_000;
+
+/**
+ * A line the parser cannot read is one `system` note, never a `[stdout]` dump:
+ * the board's transcript is a conversation, and a raw frame rendered as stdout
+ * is exactly the wall of `[stdout] {...}` this parser exists to prevent.
+ */
+function system(line: string, ts: string): TranscriptEntry[] {
+  const text = line.length > FALLBACK_TEXT_CAP ? `${line.slice(0, FALLBACK_TEXT_CAP - 1)}…` : line;
+  return [{ kind: "system", ts, text }];
 }
+
+/** Frames omp emits around a turn; they carry no content a board can show. */
+const CONTROL_FRAMES: Record<string, true> = {
+  agent_start: true,
+  agent_end: true,
+  turn_start: true,
+  turn_end: true,
+  message_start: true,
+  message_end: true,
+  message_update: true,
+};
+
+/** Raw omp frames the board may still see from an older relay. */
+const RAW_FRAME_TYPES: Record<string, true> = {
+  ...CONTROL_FRAMES,
+  tool_execution_start: true,
+  tool_execution_end: true,
+  tool_execution_update: true,
+  tool_stream_update: true,
+  session_settled: true,
+  prompt_result: true,
+  rpc_chunk: true,
+  extension_ui_request: true,
+  subagent_lifecycle: true,
+  subagent_progress: true,
+  subagent_event: true,
+};
 
 /** Wrappers to skip when looking for the real command in a shell line. */
 const SHELL_WRAPPERS: Record<string, true> = {
@@ -121,18 +159,19 @@ function toolEntries(
       isError: false,
     }];
   }
+  const summary = asString(payload.argsSummary);
   return [{
     kind: "tool_call",
     ts,
     name,
     ...(toolUseId !== null ? { toolUseId } : {}),
-    input: {},
+    input: summary !== null ? { summary } : {},
   }];
 }
 
 export function parseStdoutLine(line: string, ts: string): TranscriptEntry[] {
   const event = parseJson(line);
-  if (event === null) return stdout(line, ts);
+  if (event === null) return system(line, ts);
   const payload = asRecord(event.payload);
   switch (asString(event.eventType)) {
     case "omp.turn": {
@@ -162,7 +201,21 @@ export function parseStdoutLine(line: string, ts: string): TranscriptEntry[] {
         text: chunk.replace(/\r?\n$/, ""),
       }];
     }
+    case null:
+      break;
     default:
-      return stdout(line, ts);
+      // An adapter event this parser does not read still names itself.
+      return system(`${asString(event.eventType) ?? "event"}${asString(event.message) === null ? "" : `: ${asString(event.message)}`}`, ts);
   }
+  // A raw worker control frame (`{"event":"agent_start"}`) and a bare message
+  // id are lifecycle noise from the pre-v0.20 relay: no content, no line.
+  const control = asString(event.event);
+  if (control !== null) return CONTROL_FRAMES[control] === true ? [] : system(line, ts);
+  if (Object.keys(event).length === 1 && typeof event.messageId === "string") return [];
+  // A raw omp frame (`{"type":"message_update",...}`) is not an adapter event.
+  // Name its type rather than dump the whole object on the board; an unknown
+  // object is shown whole, because it may be the only useful diagnostic left.
+  const rawType = asString(event.type);
+  if (rawType !== null && RAW_FRAME_TYPES[rawType] === true) return system(rawType, ts);
+  return system(line, ts);
 }

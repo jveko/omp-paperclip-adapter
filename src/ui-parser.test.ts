@@ -28,6 +28,19 @@ describe("parseStdoutLine", () => {
     ]);
   });
 
+  it("maps the tool-call argsSummary to the entry input", () => {
+    const line = toolEvent("tool_call", { argsSummary: "echo ARG-SENTINEL" });
+    expect(parseStdoutLine(line, "t0")).toEqual([
+      {
+        kind: "tool_call",
+        ts: "t0",
+        name: "bash",
+        toolUseId: "call_1",
+        input: { summary: "echo ARG-SENTINEL" },
+      },
+    ]);
+  });
+
   it("maps a tool-result line to the paired tool_result entry", () => {
     expect(parseStdoutLine(toolEvent("tool_result"), "t0")).toEqual([
       { kind: "tool_result", ts: "t0", toolUseId: "call_1", toolName: "bash", content: "", isError: false },
@@ -66,30 +79,54 @@ describe("parseStdoutLine", () => {
     expect(parseStdoutLine(line, "t0")).toEqual([]);
   });
 
-  it("passes an unknown event line through as stdout", () => {
+  it.each([
+    '{"event":"agent_start"}',
+    '{"event":"turn_end"}',
+    '{"messageId":"msg-2"}',
+  ])("drops the control frame %s", (line) => {
+    expect(parseStdoutLine(line, "t0")).toEqual([]);
+  });
+
+  it("renders a raw message_update frame as one system entry, never stdout", () => {
+    const line = JSON.stringify({
+      type: "message_update",
+      messageId: "msg-2",
+      message: { role: "assistant", content: [] },
+      assistantMessageEvent: { type: "start", partial: { role: "assistant", content: [] } },
+    });
+    const entries = parseStdoutLine(line, "t0");
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      kind: "system",
+      ts: "t0",
+      text: expect.stringContaining("message_update"),
+    });
+  });
+
+  it("renders an unknown adapter event type as one system entry naming it", () => {
     const line = event("omp.usage", { payload: { complete: true } });
+    const entries = parseStdoutLine(line, "t0");
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      kind: "system",
+      ts: "t0",
+      text: expect.stringContaining("omp.usage"),
+    });
+  });
+
+  it.each([
+    ["malformed JSON", '{"eventType":"omp.turn","message":"unterminated'],
+    ["plain text", "just some output"],
+    ["a non-event JSON object", JSON.stringify({ type: "notice", text: "not an adapter event" })],
+  ])("renders %s as one system entry, never stdout", (_label, line) => {
     expect(parseStdoutLine(line, "t0")).toEqual([
-      { kind: "stdout", ts: "t0", text: line },
+      { kind: "system", ts: "t0", text: line },
     ]);
   });
 
-  it("passes a non-event JSON line through as stdout", () => {
-    const line = JSON.stringify({ type: "notice", text: "not an adapter event" });
+  it.each(["glob", "bash"])("renders a bare %s line as one system entry", (line) => {
     expect(parseStdoutLine(line, "t0")).toEqual([
-      { kind: "stdout", ts: "t0", text: line },
-    ]);
-  });
-
-  it("passes a malformed JSON line through as stdout", () => {
-    const line = '{"eventType":"omp.turn","message":"unterminated';
-    expect(parseStdoutLine(line, "t0")).toEqual([
-      { kind: "stdout", ts: "t0", text: line },
-    ]);
-  });
-
-  it("leaves ordinary stdout untouched", () => {
-    expect(parseStdoutLine("just some output", "t0")).toEqual([
-      { kind: "stdout", ts: "t0", text: "just some output" },
+      { kind: "system", ts: "t0", text: line },
     ]);
   });
 });

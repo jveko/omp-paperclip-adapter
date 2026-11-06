@@ -77,7 +77,7 @@ const CREDENTIAL_PATTERNS: RegExp[] = [
  * Redact credential shapes, collapse control/whitespace runs, then cap. The
  * redaction runs before the cap so a token cut in half cannot leave its prefix.
  */
-function boundedText(value: unknown, cap = SUBAGENT_TEXT_CAP): string | null {
+export function boundedEventText(value: unknown, cap = SUBAGENT_TEXT_CAP): string | null {
   if (typeof value !== "string") return null;
   const collapsed = value.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
   if (collapsed === "") return null;
@@ -110,15 +110,15 @@ export function normalizeSubagentStatus(value: unknown): SubagentStatus | null {
 
 function readAgentEvent(value: unknown): { type: string; summary: string } | null {
   if (!isRecord(value)) return null;
-  const type = boundedText(value.type, SUBAGENT_EVENT_CAP);
+  const type = boundedEventText(value.type, SUBAGENT_EVENT_CAP);
   if (type === null) return null;
   let summary = type;
   if (type.startsWith("tool_")) {
-    const tool = boundedText(value.toolName, SUBAGENT_AGENT_CAP);
+    const tool = boundedEventText(value.toolName, SUBAGENT_AGENT_CAP);
     if (tool !== null) summary = `${type}: ${tool}`;
     if (value.isError === true) summary = `${summary} (error)`;
   }
-  return { type, summary: boundedText(summary, SUBAGENT_EVENT_CAP) ?? type };
+  return { type, summary: boundedEventText(summary, SUBAGENT_EVENT_CAP) ?? type };
 }
 
 /**
@@ -130,36 +130,36 @@ export function readSubagentFrame(frame: RpcFrame): SubagentFrameRead | null {
   if (!isRecord(frame.payload)) return null;
   const payload = frame.payload;
   if (frame.type === "subagent_lifecycle") {
-    const id = boundedText(payload.id, SUBAGENT_ID_CAP);
+    const id = boundedEventText(payload.id, SUBAGENT_ID_CAP);
     if (id === null) return null;
     return {
       id,
       index: boundedIndex(payload.index),
-      agent: boundedText(payload.agent, SUBAGENT_AGENT_CAP),
+      agent: boundedEventText(payload.agent, SUBAGENT_AGENT_CAP),
       status: normalizeSubagentStatus(payload.status),
-      description: boundedText(payload.description),
-      parentToolCallId: boundedText(payload.parentToolCallId, SUBAGENT_ID_CAP),
+      description: boundedEventText(payload.description),
+      parentToolCallId: boundedEventText(payload.parentToolCallId, SUBAGENT_ID_CAP),
       event: null,
       summary: null,
     };
   }
   if (frame.type === "subagent_progress") {
     const progress = isRecord(payload.progress) ? payload.progress : null;
-    const id = boundedText(progress?.id, SUBAGENT_ID_CAP);
+    const id = boundedEventText(progress?.id, SUBAGENT_ID_CAP);
     if (id === null) return null;
     return {
       id,
       index: boundedIndex(payload.index),
-      agent: boundedText(payload.agent, SUBAGENT_AGENT_CAP),
+      agent: boundedEventText(payload.agent, SUBAGENT_AGENT_CAP),
       status: normalizeSubagentStatus(progress?.status),
-      description: boundedText(progress?.description),
-      parentToolCallId: boundedText(payload.parentToolCallId, SUBAGENT_ID_CAP),
+      description: boundedEventText(progress?.description),
+      parentToolCallId: boundedEventText(payload.parentToolCallId, SUBAGENT_ID_CAP),
       event: null,
       summary: null,
     };
   }
   if (frame.type === "subagent_event") {
-    const id = boundedText(payload.id, SUBAGENT_ID_CAP);
+    const id = boundedEventText(payload.id, SUBAGENT_ID_CAP);
     if (id === null) return null;
     const event = readAgentEvent(payload.event);
     return {
@@ -179,15 +179,15 @@ export function readSubagentFrame(frame: RpcFrame): SubagentFrameRead | null {
 /** Read one `get_subagents` roster entry; the roster is untrusted shape. */
 export function readSubagentSnapshot(value: unknown): SubagentObservation | null {
   if (!isRecord(value)) return null;
-  const id = boundedText(value.id, SUBAGENT_ID_CAP);
+  const id = boundedEventText(value.id, SUBAGENT_ID_CAP);
   if (id === null) return null;
   return {
     id,
     index: boundedIndex(value.index) ?? 0,
-    agent: boundedText(value.agent, SUBAGENT_AGENT_CAP) ?? "subagent",
+    agent: boundedEventText(value.agent, SUBAGENT_AGENT_CAP) ?? "subagent",
     status: normalizeSubagentStatus(value.status) ?? "running",
-    description: boundedText(value.description),
-    parentToolCallId: boundedText(value.parentToolCallId, SUBAGENT_ID_CAP),
+    description: boundedEventText(value.description),
+    parentToolCallId: boundedEventText(value.parentToolCallId, SUBAGENT_ID_CAP),
     lastUpdate: boundedIndex(value.lastUpdate) ?? Date.now(),
   };
 }

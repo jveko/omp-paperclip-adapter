@@ -352,17 +352,33 @@ rl.on("line", (line) => {
         return;
       }
       if (mode === "toolframes") {
+        // A full turn lifecycle around the tool pair: after the turn-lifecycle
+        // fix only the content-bearing message_end may reach the board, so the
+        // fixture has to actually carry the frames that must be dropped.
+        send({ type: "agent_start" });
+        send({ type: "turn_start" });
         send({
           type: "tool_execution_start", toolCallId: "tc-1", toolName: "bash",
-          args: { command: "echo ARG-SENTINEL" },
+          args: { command: "echo ARG-SENTINEL", token: "Bearer abcdefghijklmnop" },
         });
         send({
           type: "tool_execution_end", toolCallId: "tc-1", toolName: "bash", isError: false,
           result: { output: "RESULT-SENTINEL" },
         });
+        // A message_end with no assistant text is not a transcript turn either.
+        send({ type: "message_end", messageId: "m-empty" });
+        send({ type: "turn_end" });
+        send({ type: "agent_end" });
       }
       pendingPrompt = { id };
-      send({ type: "message_end", messageId: "m1", text: "working" });
+      // The RPC wire reports the assistant message under `message.content`;
+      // keep the flat `text` too so the fixture models both field spellings.
+      send({
+        type: "message_end",
+        messageId: "m1",
+        text: "working",
+        message: { role: "assistant", content: [{ type: "text", text: "working" }] },
+      });
       emitSubagentWork();
       settlePrompt("completed");
       return;

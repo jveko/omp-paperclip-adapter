@@ -5,8 +5,11 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
-import type { AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import type {
+  AdapterExecutionResult, AdapterRuntimeEvent, TranscriptEntry,
+} from "@paperclipai/adapter-utils";
 import { HostClient } from "./client.js";
+import { parseStdoutLine } from "../ui-parser.js";
 import { readLedgerRecords, type LedgerRecord } from "./ledger.js";
 import type {
   HostReply, RunAcceptedFrame, RunBeginFrame, RunSettledFrame,
@@ -54,8 +57,13 @@ const LEASE_RETRY_MS = 100;
 const COMPANY_ID = "smoke-co";
 const AGENT_ID = "smoke-agent";
 const SESSION_KEY = `paperclip:${COMPANY_ID}:${AGENT_ID}:smoke`;
-const PROMPT_1 = "reply with the single word: pong";
+const PROMPT_1 = "Run the shell command `echo pong`, then reply with the single word: pong";
 const PROMPT_2 = "reply with the single word: ping";
+
+/** `OMP_SMOKE_SCOPE=profile` also proves the named-profile fence end to end. */
+const SMOKE_SCOPE = process.env.OMP_SMOKE_SCOPE ?? "";
+const profileName = SMOKE_SCOPE === "profile" ? `pc-smoke-${Date.now()}` : null;
+const profileDir = profileName === null ? null : path.join(os.homedir(), ".omp", "profiles", profileName);
 
 const hostScript = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)), "../../dist/omp-host.js",
@@ -388,6 +396,36 @@ function unpricedWarning(turn: Turn): string | null {
 }
 
 /**
+ * Render a turn's relayed events the way the adapter hands them to the board:
+ * one `AdapterRuntimeEvent` JSON line per `run.event` frame, parsed with the
+ * shipped `parseStdoutLine`. The `message` field mirrors the adapter relay's
+ * choice per kind, so the parser sees exactly the shape production sends.
+ */
+function renderTranscript(turn: Turn): { lines: string[]; entries: TranscriptEntry[] } {
+  const lines: string[] = [];
+  const entries: TranscriptEntry[] = [];
+  for (const frame of turn.events) {
+    if (frame.type !== "run.event") continue;
+    const payload = frame.payload;
+    const message = typeof payload.text === "string"
+      ? payload.text
+      : typeof payload.message === "string"
+        ? payload.message
+        : typeof payload.toolName === "string"
+          ? payload.toolName
+          : undefined;
+    const line = JSON.stringify({
+      eventType: frame.kind,
+      ...(message === undefined ? {} : { message }),
+      payload,
+    } satisfies AdapterRuntimeEvent);
+    lines.push(line);
+    entries.push(...parseStdoutLine(line, frame.at));
+  }
+  return { lines, entries };
+}
+
+/**
  * The scenario. Split from the `it` so a failure can be recorded before the
  * test unwinds: a failed run keeps its temp root, because the journal and the
  * worker's stderr are the evidence the operator needs.
@@ -449,6 +487,36 @@ async function scenario(deadlineAt: number): Promise<void> {
   expect(promptTokens, "the run reports non-zero prompt tokens").toBeGreaterThan(0);
   expect(result1.usage?.outputTokens, "the run reports non-zero output tokens").toBeGreaterThan(0);
   expect(result1.summary?.toLowerCase(), "the model answered the prompt").toContain("pong");
+
+  // The board's view of turn 1, reconstructed from the relayed frames. The
+  // prompt forces a bash call, so the transcript must prove both halves of a
+  // real turn (tool activity + the model's reply) and must never render a
+  // lifecycle-only turn as a line.
+  const transcript = renderTranscript(turn1);
+  expect(
+    transcript.entries.some((entry) => entry.kind === "assistant" && entry.text.toLowerCase().includes("pong")),
+    "the transcript shows the model's pong reply",
+  ).toBe(true);
+  expect(
+    transcript.entries.some((entry) => entry.kind === "tool_call"),
+    "the transcript shows the required bash tool call",
+  ).toBe(true);
+  for (const line of transcript.lines) {
+    expect(line, "a lifecycle-only turn never reaches the board").not.toContain('"event":');
+  }
+  console.log(`  transcript   ${transcript.entries
+    .map((entry) => entry.kind === "assistant"
+      ? `assistant "${entry.text.replace(/\s+/g, " ").slice(0, 60)}"`
+      : entry.kind === "tool_call"
+        ? `tool_call ${entry.name}`
+        : null)
+    .filter((row): row is string => row !== null)
+    .join(" | ")}`);
+
+  if (profileDir !== null) {
+    await access(profileDir);
+    console.log(`  profile      ${profileDir}`);
+  }
 
   const cost1 = result1.costUsd;
   const unpriced1 = unpricedWarning(turn1);

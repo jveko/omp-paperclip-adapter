@@ -27,6 +27,7 @@ import {
 import { McpHttpClient } from "./mcp.js";
 import {
   SUBAGENT_EVENT_FRAME_CAP,
+  boundedEventText,
   buildSubagentSnapshot,
   readSubagentFrame,
   readSubagentSnapshot,
@@ -289,7 +290,11 @@ function delta(base: StatsSnapshot, top: StatsSnapshot): StatsSnapshot {
 function assistantText(frame: RpcFrame): string | null {
   const message = frame.message;
   if (typeof message !== "object" || message === null || Array.isArray(message)) return null;
-  const content = (message as Record<string, unknown>).content;
+  const record = message as Record<string, unknown>;
+  // A user message's content is text too; only an assistant message is turn
+  // content (a prompt echoed as assistant text would leak the operator's text).
+  if (record.role !== undefined && record.role !== "assistant") return null;
+  const content = record.content;
   if (!Array.isArray(content)) return null;
   const text = content
     .map((block) => (typeof block === "object" && block !== null && !Array.isArray(block)
@@ -1107,23 +1112,29 @@ class Supervisor {
         return;
       // The RPC lane's tool events are `tool_execution_start`/`_end`
       // (rpc-wire.generated.ts:3790-3870); `tool_call`/`tool_result` are the
-      // retired engine's frame names and never arrive on this wire. Only the
-      // identity is forwarded: args and results stay on the worker.
+      // retired engine's frame names and never arrive on this wire. The card
+      // gets the tool identity plus a bounded, credential-redacted argument
+      // summary; the result never crosses.
       case "tool_execution_start":
       case "tool_execution_end": {
+        const argsSummary = frame.type === "tool_execution_start" && frame.args !== undefined
+          ? boundedEventText(JSON.stringify(frame.args))
+          : null;
         this.emitEvent(run, "omp.tool_call", {
           phase: frame.type === "tool_execution_start" ? "tool_call" : "tool_result",
           toolName: typeof frame.toolName === "string" ? frame.toolName : null,
           toolCallId: typeof frame.toolCallId === "string" ? frame.toolCallId : null,
+          ...(argsSummary !== null ? { argsSummary } : {}),
         });
         return;
       }
       case "message_end": {
         const text = assistantText(frame);
-        if (text !== null) run.lastAssistantText = text;
+        if (text === null) return;
+        run.lastAssistantText = text;
         this.emitEvent(run, "omp.turn", {
-          messageId: typeof frame.messageId === "string" ? frame.messageId : null,
-          ...(text !== null ? { text } : {}),
+          ...(typeof frame.messageId === "string" ? { messageId: frame.messageId } : {}),
+          text,
         });
         return;
       }
@@ -1131,7 +1142,8 @@ class Supervisor {
       case "agent_end":
       case "turn_start":
       case "turn_end":
-        this.emitEvent(run, "omp.turn", { event: frame.type });
+        // Lifecycle only: there is no content to show, and relaying it put raw
+        // control frames on the board. The settle facts carry this.
         return;
       case "subagent_lifecycle":
       case "subagent_progress":
